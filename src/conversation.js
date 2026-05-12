@@ -2,7 +2,9 @@ const OpenAI = require('openai');
 const { query } = require('./db');
 const { ts } = require('./log');
 const exchange = require('./exchange');
+const erpnext = require('./erpnext');
 const erpSync = require('./erp-sync');
+const erpQuery = require('./erp-query');
 
 // Account resolvers, customer/item resolvers, naming helpers, and ERP_CODE_MAP
 // all live in src/erp-sync/ — see imports at the top of this file.
@@ -106,9 +108,9 @@ const TOOLS = [
             type: 'string',
             description: 'When goods/services were/will be delivered (often ≠ transaction_date for invoices). ISO date YYYY-MM-DD.',
           },
-          parent_transaction_id: {
-            type: 'number',
-            description: 'For payment transactions only: the ID of the invoice/bill being settled, if known. Optional.',
+          parent_invoice_ref: {
+            type: 'string',
+            description: 'For transaction_type=payment ONLY: the ERPNext name of the invoice/bill being settled (e.g. "ACC-SINV-2026-00001" for AR, "ACC-PINV-2026-00001" for AP). Get this from query_open_invoices.invoices[N].erpnext_name. Required for payment transactions.',
           },
           invoice_number: {
             type: 'string',
@@ -176,6 +178,33 @@ const TOOLS = [
           date: {
             type: 'string',
             description: 'ISO YYYY-MM-DD; the transaction_date works best. Defaults to today if omitted. Frankfurter may return the previous business day for weekends.',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_open_invoices',
+      description:
+        'List unpaid invoices (Sales Invoice for AR / Purchase Invoice for AP) from ERPNext. Call BEFORE setting transaction_type=payment, so you can pick the right invoice to settle. Returns each invoice\'s ERPNext name (e.g. ACC-SINV-2026-00001), counterparty, currency, grand_total, and outstanding_amount. Use the ERPNext name as parent_invoice_ref on the payment draft.',
+      parameters: {
+        type: 'object',
+        required: ['direction'],
+        properties: {
+          direction: {
+            type: 'string',
+            enum: ['receivable', 'payable'],
+            description: '"receivable" = invoices we issued (customer owes us). "payable" = bills from suppliers (we owe).',
+          },
+          counterparty_search: {
+            type: 'string',
+            description: 'Optional. Filter to invoices for this customer/supplier (exact match by ERPNext name). Omit to list all open invoices.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Optional. Max rows to return; default 20.',
           },
         },
       },
@@ -380,21 +409,24 @@ TRANSACTION TYPE DETECTION (set transaction_type explicitly):
 - "I sent invoice to X", "I invoiced X", "I issued bill to X for ..." → transaction_type=invoice_issued, direction=income
 - "got a bill from X", "X invoiced me", "received invoice from X" → transaction_type=bill_received, direction=expense
 - Receipt of money from a named counterparty: "X paid me Y", "received Y from X", "X transferred Y", "Jameel paid 45000" → BEFORE setting transaction_type, call query_open_invoices(direction='receivable', counterparty_search='<X>'):
-  * Exactly 1 open invoice for that counterparty with amount matching (exact or within ~1% of) Y → transaction_type='payment', parent_transaction_id=<invoice id>, direction='income'. Confirmation Account line: "Cash → Receivable from <counterparty>". Add a "Settles:" line: "Settles: Invoice #N (YYYY/MM/DD, original amount)".
-  * Multiple open invoices → present a NUMBERED LIST of up to 5 (newest first by id) and ask the user to pick by number. Format example:
+  * The tool result has invoices[]; each row has erpnext_name (e.g. "ACC-SINV-2026-00001"), counterparty, currency, grand_total, outstanding_amount, posting_date.
+  * Exactly 1 open invoice for that counterparty whose amount matches Y (exact OR within ~1%) → transaction_type='payment', parent_invoice_ref=<that erpnext_name>, direction='income'. Confirmation Account line: "Receivable from <counterparty> → <wallet_name>". Add a "Settles:" line: "Settles: <erpnext_name> (YYYY/MM/DD, outstanding X,XXX CCY)".
+  * Partial payment — amount Y is LESS than outstanding: still pick the matching invoice and proceed; the bot will record a partial settlement. Confirmation Settles line: "Settles: <erpnext_name> (partial: paying X of Y outstanding; Z left open)".
+  * Overpayment — amount Y is MORE than outstanding: pick the matching invoice; the excess will be recorded as a customer advance. Confirmation Settles line: "Settles: <erpnext_name> in full + Z CCY recorded as advance from <counterparty>".
+  * Multiple open invoices → present a NUMBERED LIST of up to 5 (newest first) and ask the user to pick by number. Format example:
        "Multiple open invoices from Jameel Crest Gems — which to settle?
-        1. Invoice #4 — 45,000 USD, dated 2026/05/03
-        2. Invoice #7 — 22,000 USD, dated 2026/04/12
-        3. Invoice #9 — 15,000 USD, dated 2026/03/28
+        1. ACC-SINV-2026-00001 — 45,000 USD outstanding, dated 2026/05/12
+        2. ACC-SINV-2026-00007 — 22,000 USD outstanding, dated 2026/04/12
+        3. ACC-SINV-2026-00009 — 15,000 USD outstanding, dated 2026/03/28
         Reply with a number (1-3)."
        If there are MORE than 5 open: show top 5 and add "(plus N more — reply 'show more' or filter by amount/date)". On 'show more', present the next batch.
-       Once user picks a number, set parent_transaction_id to that invoice's id and proceed to request_confirmation.
+       Once user picks a number, set parent_invoice_ref to that invoice's erpnext_name and proceed to request_confirmation.
   * No open invoices → SEE MISSED-SALE FLOW BELOW (do NOT silently save as cash income if the user mentioned "for a sale" / "for an invoice" / "settling" / similar settlement language).
 - Outgoing money to a named counterparty/vendor: "I paid X", "paid Y to X", "sent Y to X" → similarly call query_open_invoices(direction='payable', counterparty_search='<X>'):
-  * Exactly 1 open bill matching → transaction_type='payment', parent_transaction_id=<bill id>, direction='expense'. Account line: "Payable to <counterparty> → Cash". Add Settles line.
+  * Exactly 1 open bill matching → transaction_type='payment', parent_invoice_ref=<erpnext_name>, direction='expense'. Account line: "<wallet_name> → Payable to <counterparty>". Add Settles line.
   * Multiple → numbered list, same pattern as above.
   * No open bills + missed-bill language → mirror the missed-sale flow below (gather bill details, then payment).
-- Explicit reference like "X paid invoice #N" → use that invoice id directly as parent_transaction_id, no lookup needed.
+- Explicit reference like "X paid invoice ACC-SINV-2026-00001" → use that ERPNext name directly as parent_invoice_ref, no lookup needed.
 - Payment currency: the payment should typically be in the SAME currency as the parent invoice. If user pays in a different currency, ASK to clarify before confirming.
 
 CASH MOVEMENT WITH A COUNTERPARTY (simple journal entry — no goods/services exchanged):
@@ -424,7 +456,7 @@ Confirmation card examples:
    Note: deposit for upcoming work
 
 SETTLEMENT (when the open balance is squared):
-- "Jackie returned my 5000" / "Jackie paid back" → query_open_invoices(direction='receivable', counterparty_search='Jackie') finds the advance_given → transaction_type='payment', parent_transaction_id=<advance id>, direction='income'.
+- "Jackie returned my 5000" / "Jackie paid back" → query_open_invoices(direction='receivable', counterparty_search='Jackie') finds the advance_given → transaction_type='payment', parent_invoice_ref=<advance id>, direction='income'.
 - "I returned Mike's 10k" / "paid back Mike" → query for advance_received from Mike → settle with direction='expense'.
 
 If the user prefers a generic "Type: Money Out / Money In" label instead of "Advance Out/In", that's also fine — pick whichever reads cleaner for the situation.
@@ -442,9 +474,9 @@ DO NOT trigger missed-sale flow just because lookup_counterparty returns 0 — t
         2) Payment received today — 20,000 USD, settles the invoice above
         Confirm to save both, or tell me what to fix."
 3. On user Confirm, perform a CHAINED SAVE in the same turn:
-   a) Call update_draft with the INVOICE fields (transaction_type='invoice_issued', back-dated transaction_date, etc.). Then save_transaction. The tool result returns the invoice's transaction_id.
-   b) Then call update_draft for the PAYMENT (transaction_type='payment', transaction_date=today, parent_transaction_id=<id from step a>, same currency/amount). Then save_transaction.
-4. Reply: "Saved ✓ Invoice #<a> + Payment #<b>" (single line).
+   a) Call update_draft with the INVOICE fields (transaction_type='invoice_issued', back-dated transaction_date, etc.). Then save_transaction. The tool result returns erpnext_name (e.g. "ACC-SINV-2026-00007").
+   b) Then call update_draft for the PAYMENT (transaction_type='payment', transaction_date=today, parent_invoice_ref=<erpnext_name from step a>, same currency/amount). Then save_transaction.
+4. Reply: "Saved ✓ Invoice <a> + Payment <b>" (single line, using the two erpnext_names).
 The system clears the draft after each save_transaction, so chained saves in one turn work cleanly.
 
 COUNTERPARTY DISAMBIGUATION (avoid duplicate records):
@@ -466,24 +498,17 @@ Process the result:
 
 If the user types a name that doesn't disambiguate further (e.g. they say "1" for Jack SG) — proceed with that id. Don't keep asking.
 
-WALLET PICKER (for transactions that move money in/out of a real cash/bank/card pot) — MANDATORY:
-For ANY transaction with transaction_type IN ('cash', 'payment', 'advance_given', 'advance_received') you MUST call list_user_accounts BEFORE request_confirmation. This is non-negotiable — without payment_account_id linked, the transaction won't reflect in cash balance and the books won't tie out. Skipping this is a bug, not a shortcut.
+WALLET (which cash/bank/card pot money moves in/out of):
+For transactions with transaction_type IN ('cash', 'payment', 'advance_given', 'advance_received') you MUST set payment_account_code in the draft. The code identifies the wallet category:
+   '1000' — Cash (default if user just says "cash" or doesn't specify)
+   '1100' — Bank (user says "bank", "transfer", "wire", "BBL", "DBS", names a bank)
+   '2100' — Credit card (user says "card", "credit card", "visa", "mastercard")
 
-Workflow:
-1. After extracting transaction fields (amount, currency, etc.) and BEFORE request_confirmation, call list_user_accounts(parentCodes=[<the parent_code>], currency=<tx currency>).
-2. Process the result:
-   - 1 match → call update_draft with payment_account_id=<that id>. Proceed to confirmation. No need to ask.
-   - Multiple matches → present a numbered picker:
-        "Which wallet?
-        1. BBL Savings THB
-        2. Bangkok Cash THB
-        3. Add new wallet
-        Reply with a number."
-     User picks 1-N → set payment_account_id. User picks "Add new wallet" / last option → call create_user_account inline (ask for name + parent_code + currency).
-   - 0 matches → ask: "No <currency> wallet on file. Want to add one? Reply with the name (e.g. 'BBL THB') or 'skip' to save without linking." If user gives a name, call create_user_account, then set payment_account_id and proceed. If 'skip', proceed without payment_account_id (transaction won't show in cash balance).
-3. The Account line in the confirmation card should reference the WALLET NAME, not the generic type. Example: "Account: BBL Savings → Meals & Entertainment" instead of "Cash → Meals & Entertainment".
+The bot resolves the code → a specific ERPNext account at save time, auto-creating per-currency leaves as needed (e.g. paying a USD invoice from "cash" will resolve to a USD cash account, creating one if missing).
 
-This picker does NOT apply to invoice_issued / bill_received (those hit AR/AP, not cash). Only cash + payment transactions.
+The Account line in the confirmation card should reference the WALLET TYPE in friendly form: "Cash", "Bank", or "Card" (whichever the code maps to). Example: "Account: Receivable from Jameel Crest Gems → Cash" for receiving payment.
+
+(Future: when list_user_accounts is wired, the LLM will offer a numbered picker among the user's named wallets. For now, set payment_account_code directly.)
 
 WALLET-TO-WALLET TRANSFERS (between user's own wallets):
 Trigger phrases — "deposited X to Y", "moved X from cash to bank", "transferred X from BBL to DBS", "withdrew X from BBL" (cash withdrawal = transfer Bank → Cash), "took out X from BBL".
@@ -685,7 +710,7 @@ Type: <Expense | Income | Invoice Sent | Bill Received | Payment | Transfer>
 Account: <source_name> → <destination_name>
 Counterparty: <name>          (omit this line entirely if no counterparty)
 Due: YYYY/MM/DD (Net N)       (ONLY include for Invoice Sent or Bill Received; otherwise omit)
-Settles: Invoice #N from YYYY/MM/DD for X,XXX CCY    (ONLY include for Payment when parent_transaction_id is set; otherwise omit)
+Settles: <erpnext_name> from YYYY/MM/DD for X,XXX CCY    (ONLY include for Payment when parent_invoice_ref is set; otherwise omit. For partial/overpayment use the variants from "Receipt of money from..." rules above.)
 Note: <description>           (omit this line entirely if no description)
 
 Choose below or tell me what to fix.
@@ -846,8 +871,21 @@ async function executeTool(toolName, args, ctx) {
       return result;
     }
 
-
-
+    case 'query_open_invoices': {
+      try {
+        const erp = erpnext.forUser(ctx.user);
+        const rows = await erpQuery.listOpenInvoices(ctx.user, erp, {
+          direction: args?.direction,
+          counterpartyName: args?.counterparty_search || null,
+          limit: args?.limit || 20,
+        });
+        console.log(`• [conversation] [${ts()}] tool=query_open_invoices direction=${args?.direction} counterparty=${args?.counterparty_search || '*'} found=${rows.length}`);
+        return { ok: true, invoices: rows };
+      } catch (err) {
+        console.error('[conversation] query_open_invoices error:', err.message);
+        return { ok: false, error: err.message };
+      }
+    }
 
 
 

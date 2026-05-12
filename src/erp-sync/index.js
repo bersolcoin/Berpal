@@ -14,6 +14,7 @@
 const erpnext = require('../erpnext');
 const salesInvoice = require('./sales-invoice');
 const journalEntry = require('./journal-entry');
+const paymentEntry = require('./payment-entry');
 
 async function save(user, draft) {
   const erp = erpnext.forUser(user);
@@ -22,6 +23,9 @@ async function save(user, draft) {
   switch (tt) {
     case 'invoice_issued':
       return salesInvoice.save(user, erp, draft);
+
+    case 'payment':
+      return paymentEntry.save(user, erp, draft);
 
     case 'cash':
     default:
