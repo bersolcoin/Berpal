@@ -20,4 +20,4 @@ function msgOut(phone, body, channel) {
   console.log(`↑ [${shortPhone(phone)}] [${ts()}]${tag} ${flatten(body)}`);
 }
 
-module.exports = { msgIn, msgOut };
+module.exports = { msgIn, msgOut, ts };
