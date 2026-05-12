@@ -30,9 +30,85 @@
  * the diff; we just pass `source_exchange_rate` and let ERPNext handle it.
  */
 
-const { resolveErpAccount } = require('./account');
 const { resolvePartyAccount } = require('./party-account');
 const { ts } = require('../log');
+
+/**
+ * Find (or auto-create) a per-currency wallet leaf for the user.
+ * Symmetric to resolvePartyAccount for Receivable/Payable — same shape, but
+ * for Cash / Bank account types. Auto-creates "Cash USD - TTC" etc. on first use.
+ *
+ *   parentCode: '1000' (→ Cash) | '1100' (→ Bank). Anything else falls back to 'Cash'.
+ *   currency:   ISO code matching the desired wallet currency.
+ */
+const _walletCache = new Map();
+async function resolveWalletAccount(erp, parentCode, currency) {
+  const accountType = parentCode === '1100' ? 'Bank' : 'Cash';
+  const cacheKey = `${erp.company}|${accountType}|${currency}`;
+  if (_walletCache.has(cacheKey)) return _walletCache.get(cacheKey);
+
+  // Existing leaf?
+  const existing = await erp.listResource('Account', {
+    filters: [
+      ['company', '=', erp.company],
+      ['account_type', '=', accountType],
+      ['account_currency', '=', currency],
+      ['is_group', '=', 0],
+    ],
+    fields: ['name'],
+    limit: 1,
+  });
+  if (existing.data && existing.data.length > 0) {
+    _walletCache.set(cacheKey, existing.data[0].name);
+    return existing.data[0].name;
+  }
+
+  // Locate the parent group for this account type.
+  let parentAccount = null;
+  const groups = await erp.listResource('Account', {
+    filters: [
+      ['company', '=', erp.company],
+      ['account_type', '=', accountType],
+      ['is_group', '=', 1],
+    ],
+    fields: ['name'],
+    limit: 1,
+  });
+  if (groups.data && groups.data.length > 0) {
+    parentAccount = groups.data[0].name;
+  } else {
+    const anyLeaf = await erp.listResource('Account', {
+      filters: [
+        ['company', '=', erp.company],
+        ['account_type', '=', accountType],
+        ['is_group', '=', 0],
+      ],
+      fields: ['parent_account'],
+      limit: 1,
+    });
+    parentAccount = anyLeaf.data?.[0]?.parent_account || null;
+  }
+  if (!parentAccount) {
+    throw new Error(
+      `[erpnext] could not locate parent ${accountType} group account for company ${erp.company}`
+    );
+  }
+
+  // Create the per-currency leaf, e.g. "Cash USD" or "Bank USD".
+  const accountName = `${accountType} ${currency}`;
+  const result = await erp.createAccount({
+    account_name: accountName,
+    parent_account: parentAccount,
+    account_type: accountType,
+    account_currency: currency,
+  });
+  const erpName = result.data?.name;
+  console.log(
+    `• [conversation] [${ts()}] created ${accountType} account in ERPNext: ${erpName} (currency=${currency})`
+  );
+  _walletCache.set(cacheKey, erpName);
+  return erpName;
+}
 
 async function save(user, erp, draft) {
   if (!draft.parent_invoice_ref) {
@@ -74,15 +150,10 @@ async function save(user, erp, draft) {
     };
   }
 
-  // 2. Resolve the user's wallet ERPNext account.
-  //    Use draft.currency for the lookup so a USD-cash payment finds USD cash, not THB cash.
-  const walletAccount = await resolveErpAccount(user, erp, draft.payment_account_code, draft.currency);
-  if (!walletAccount) {
-    return {
-      ok: false,
-      error: `could not resolve wallet for code=${draft.payment_account_code} currency=${draft.currency}. The account may not exist yet — add it in ERPNext or via create_user_account when that tool is wired.`,
-    };
-  }
+  // 2. Resolve (or auto-create) a per-currency wallet leaf so paid_to / paid_from
+  //    has currency matching the payment. Without this, ERPNext rejects a USD
+  //    payment landing in a THB-only cash account.
+  const walletAccount = await resolveWalletAccount(erp, draft.payment_account_code, draft.currency);
 
   // 3. Resolve the party account (Debtors/Creditors in payment currency).
   //    For Receive: paid_from = Debtors <CCY> (where the receivable sits).
