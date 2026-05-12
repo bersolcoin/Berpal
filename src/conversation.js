@@ -913,13 +913,30 @@ async function executeTool(toolName, args, ctx) {
 
     case 'query_open_invoices': {
       try {
+        // Resolve user-facing short name (e.g. "Jameel") to the ERPNext party
+        // name (e.g. "Jameel Crest Gems") via counterparty_cache, so the
+        // ERPNext filter is an EXACT match against the right record.
+        let counterpartyErpName = null;
+        if (args?.counterparty_search) {
+          const wantedDoctype = args.direction === 'payable' ? 'Supplier' : 'Customer';
+          const r = await query(
+            `SELECT erpnext_name FROM counterparty_cache
+             WHERE owner_user_id = $1
+               AND erpnext_doctype = $2
+               AND LOWER(name) LIKE LOWER($3)
+             ORDER BY id DESC
+             LIMIT 1`,
+            [ctx.user.id, wantedDoctype, `%${args.counterparty_search}%`]
+          );
+          counterpartyErpName = r.rows[0]?.erpnext_name || null;
+        }
         const erp = erpnext.forUser(ctx.user);
         const rows = await erpQuery.listOpenInvoices(ctx.user, erp, {
           direction: args?.direction,
-          counterpartyName: args?.counterparty_search || null,
+          counterpartyName: counterpartyErpName,
           limit: args?.limit || 20,
         });
-        console.log(`• [conversation] [${ts()}] tool=query_open_invoices direction=${args?.direction} counterparty=${args?.counterparty_search || '*'} found=${rows.length}`);
+        console.log(`• [conversation] [${ts()}] tool=query_open_invoices direction=${args?.direction} counterparty=${args?.counterparty_search || '*'}${counterpartyErpName ? ` (resolved → ${counterpartyErpName})` : ''} found=${rows.length}`);
         return { ok: true, invoices: rows };
       } catch (err) {
         console.error('[conversation] query_open_invoices error:', err.message);
@@ -929,13 +946,18 @@ async function executeTool(toolName, args, ctx) {
 
     case 'query_balance_with_counterparty': {
       try {
-        // Resolve user-facing name → ERPNext party name via cache.
+        // Resolve user-facing name (potentially abbreviated, e.g. "Jameel")
+        // → ERPNext party name via cache. Uses LIKE so a short form matches
+        // a longer cached record. If multiple rows match, prefer the one
+        // whose erpnext_doctype matches the requested party_type, then by
+        // most-recent insertion (latest cached takes precedence on ties).
         const cached = await query(
           `SELECT erpnext_name, erpnext_doctype FROM counterparty_cache
-           WHERE owner_user_id = $1 AND LOWER(name) = LOWER($2)
+           WHERE owner_user_id = $1
+             AND LOWER(name) LIKE LOWER($2)
            ORDER BY (CASE WHEN erpnext_doctype = $3 THEN 0 ELSE 1 END), id DESC
            LIMIT 1`,
-          [ctx.user.id, args?.counterparty_name || '', args?.party_type]
+          [ctx.user.id, `%${args?.counterparty_name || ''}%`, args?.party_type]
         );
         if (!cached.rowCount || !cached.rows[0].erpnext_name) {
           return {
