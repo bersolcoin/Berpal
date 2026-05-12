@@ -2,13 +2,7 @@ const OpenAI = require('openai');
 const { query } = require('./db');
 const { ts } = require('./log');
 const exchange = require('./exchange');
-const erpnext = require('./erpnext');
-
-const { resolveErpAccount } = require('./erp-sync/account');
-const { resolvePartyAccount } = require('./erp-sync/party-account');
-const { resolveOrCreateCustomer } = require('./erp-sync/customer');
-const { ensureGenericSalesItem } = require('./erp-sync/item');
-const { friendlyAccountName, buildJournalTitle } = require('./erp-sync/naming');
+const erpSync = require('./erp-sync');
 
 // Account resolvers, customer/item resolvers, naming helpers, and ERP_CODE_MAP
 // all live in src/erp-sync/ — see imports at the top of this file.
@@ -827,140 +821,14 @@ async function executeTool(toolName, args, ctx) {
         return { ok: false, error: `Cannot save; missing required fields: ${missing.join(', ')}.` };
       }
       try {
-        const erp = erpnext.forUser(ctx.user);
-        const { draft } = ctx;
-        const tt = draft.transaction_type || 'cash';
-
-        // ── INVOICE_ISSUED → ERPNext Sales Invoice ────────────────────
-        if (tt === 'invoice_issued') {
-          if (!draft.counterparty_name) {
-            return { ok: false, error: 'invoice requires counterparty_name' };
-          }
-
-          const customerName = await resolveOrCreateCustomer(ctx.user, erp, draft.counterparty_name, {
-            currency: draft.currency,
-            phone: draft.counterparty_phone,
-            email: draft.counterparty_email,
-          });
-
-          const itemCode = await ensureGenericSalesItem(erp);
-
-          // Resolve income account from category_code (4000 → 4110 - Sales - TTC)
-          const incomeAccount = await resolveErpAccount(
-            ctx.user, erp, draft.category_code, ctx.user.reporting_currency
-          );
-
-          // Compute due_date from payment_terms if not set
-          const postingDate = draft.transaction_date;
-          let dueDate = draft.due_date;
-          if (!dueDate && typeof draft.payment_terms === 'string' && draft.payment_terms.startsWith('net_')) {
-            const days = parseInt(draft.payment_terms.slice(4), 10);
-            if (!isNaN(days)) {
-              const d = new Date(postingDate);
-              d.setDate(d.getDate() + days);
-              dueDate = d.toISOString().slice(0, 10);
-            }
-          }
-          if (!dueDate) dueDate = postingDate;
-
-          const invoicePayload = {
-            customer: customerName,
-            posting_date: postingDate,
-            due_date: dueDate,
-            currency: draft.currency,
-            items: [
-              {
-                item_code: itemCode,
-                qty: 1,
-                rate: draft.amount,
-                description: draft.description || `${customerName} invoice`,
-                ...(incomeAccount ? { income_account: incomeAccount } : {}),
-              },
-            ],
-            docstatus: 1, // submit on create
-          };
-
-          // Multi-currency: if invoice currency != company currency, ERPNext needs
-          //   (a) conversion_rate so it can compute base totals, AND
-          //   (b) a Receivable account in the invoice's currency (debit_to).
-          //       Without (b), ERPNext rejects with "Party Account currency and
-          //       document currency should be same".
-          if (draft.currency !== ctx.user.reporting_currency) {
-            invoicePayload.conversion_rate = draft.exchange_rate || 1;
-            invoicePayload.debit_to = await resolvePartyAccount(erp, 'Receivable', draft.currency);
-          }
-
-          const result = await erp.createSalesInvoice(invoicePayload);
-          const erpName = result.data?.name;
-
-          ctx.saved = { erpnext_name: erpName };
-          ctx.savedIds = [...(ctx.savedIds || []), erpName];
+        const result = await erpSync.save(ctx.user, ctx.draft);
+        if (result.ok) {
+          ctx.saved = { erpnext_name: result.erpnext_name };
+          ctx.savedIds = [...(ctx.savedIds || []), result.erpnext_name];
           ctx.draft = {};
           ctx.confirmationRequested = false;
-
-          console.log(
-            `• [conversation] [${ts()}] saved Sales Invoice to ERPNext: ${erpName} ` +
-              `(${draft.amount} ${draft.currency} for ${customerName}, due ${dueDate})`
-          );
-          return { ok: true, erpnext_name: erpName, doctype: 'Sales Invoice' };
         }
-
-        // ── CASH (income/expense) → ERPNext Journal Entry ─────────────
-        // Resolve cash-side account (defaults to '1000' Cash)
-        const cashCode = draft.payment_account_code || '1000';
-        const cashAccount = await resolveErpAccount(ctx.user, erp, cashCode, draft.currency);
-
-        const categoryAccount = await resolveErpAccount(
-          ctx.user, erp, draft.category_code, draft.currency
-        );
-
-        if (!cashAccount || !categoryAccount) {
-          return {
-            ok: false,
-            error: `Could not find ERPNext accounts (cash=${cashCode}→${cashAccount}, category=${draft.category_code}→${categoryAccount})`,
-          };
-        }
-
-        const entries =
-          draft.direction === 'expense'
-            ? [
-                { account: categoryAccount, debit_in_account_currency: draft.amount },
-                { account: cashAccount, credit_in_account_currency: draft.amount },
-              ]
-            : [
-                { account: cashAccount, debit_in_account_currency: draft.amount },
-                { account: categoryAccount, credit_in_account_currency: draft.amount },
-              ];
-
-        // For the title, follow the money: expense flows cash→category;
-        // income flows category→cash. (Transfers, when wired, pass source→dest directly.)
-        const fromAccount = draft.direction === 'expense' ? cashAccount : categoryAccount;
-        const toAccount   = draft.direction === 'expense' ? categoryAccount : cashAccount;
-
-        const result = await erp.createJournalEntry({
-          voucher_type: 'Journal Entry',
-          posting_date: draft.transaction_date,
-          title: buildJournalTitle({
-            currency: draft.currency,
-            fromAccount,
-            toAccount,
-          }),
-          user_remark: draft.description || 'Bot entry',
-          accounts: entries,
-          docstatus: 1,
-        });
-
-        const erpName = result.data?.name;
-        ctx.saved = { erpnext_name: erpName };
-        ctx.savedIds = [...(ctx.savedIds || []), erpName];
-        ctx.draft = {};
-        ctx.confirmationRequested = false;
-
-        console.log(
-          `• [conversation] [${ts()}] saved JE to ERPNext: ${erpName} ` +
-            `(${draft.direction} ${draft.amount} ${draft.currency})`
-        );
-        return { ok: true, erpnext_name: erpName, doctype: 'Journal Entry' };
+        return result;
       } catch (err) {
         console.error('[conversation] save error:', err.message);
         return { ok: false, error: `Save failed: ${err.message}` };
