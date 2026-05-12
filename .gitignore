@@ -1,0 +1,25 @@
+node_modules/
+
+# Secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+
+# Logs
+npm-debug.log*
+*.log
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Local Claude Code config / transcripts
+.claude/
+
+# Legacy SQLite data dir (pre-pivot)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
