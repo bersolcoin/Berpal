@@ -186,6 +186,29 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'query_balance_with_counterparty',
+      description:
+        'Compute a counterparty\'s net balance in ERPNext: outstanding open invoices MINUS advances on file. Returns per-currency net (positive = they owe us / we owe them; negative = advance sitting on their account in our favor / our favor for supplier). Use when the user asks "what does X owe me", "X\'s balance", "do I owe X anything", "balance with X". Resolves the natural-language counterparty name to its ERPNext record via the local counterparty_cache.',
+      parameters: {
+        type: 'object',
+        required: ['counterparty_name', 'party_type'],
+        properties: {
+          counterparty_name: {
+            type: 'string',
+            description: 'Natural-language counterparty name as the user said it (e.g. "Jameel Crest Gems"). The bot resolves this to the ERPNext party name internally.',
+          },
+          party_type: {
+            type: 'string',
+            enum: ['Customer', 'Supplier'],
+            description: 'Customer for AR balance, Supplier for AP balance.',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'query_open_invoices',
       description:
         'List unpaid invoices (Sales Invoice for AR / Purchase Invoice for AP) from ERPNext. Call BEFORE setting transaction_type=payment, so you can pick the right invoice to settle. Returns each invoice\'s ERPNext name (e.g. ACC-SINV-2026-00001), counterparty, currency, grand_total, and outstanding_amount. Use the ERPNext name as parent_invoice_ref on the payment draft.',
@@ -293,30 +316,47 @@ QUERY PAGINATION (for query_open_invoices results):
 - For "soonest" / "next due" queries: sort='due_date_asc', limit=1.
 - For "show all" follow-ups: re-call with limit=50.
 
-PER-COUNTERPARTY QUERY DISAMBIGUATION:
+PER-COUNTERPARTY QUERIES:
 When user asks about a SPECIFIC counterparty ("what's my receivable with Jack", "how much does Jameel owe", "show Acme's bills"):
-1. ALWAYS call lookup_counterparty(search='<name>') FIRST.
-2. 0 matches → "I don't have any record of <name>. Want to log a transaction with them?"
-3. 1 EXACT-name match → call the relevant query tool with counterparty_id=<that id>.
-4. Multiple matches OR fuzzy match → present a NUMBERED PICKER (same format as the disambiguation rule above), wait for user to pick a number, then call the query tool with counterparty_id=<picked id>.
-5. NEVER call query_open_invoices/query_balance_with_counterparty using counterparty_search when there are multiple potential matches — that returns combined results across all matching people, which misleads the user.
+- Pass the user's natural-language name as counterparty_name to the query tool. The bot resolves it to the ERPNext party record via the local counterparty_cache.
+- If the tool returns ok:false with a "not in counterparty_cache" error → "I don't have any record of <name>. Want to log a transaction with them first?"
+- If the user says "Mike" and there are multiple Mikes, the bot will pick the latest cached one — if the user disputes, ask them to clarify with a fuller name. (Picker tool coming later.)
 
 WHICH TOOL FOR PER-COUNTERPARTY QUERIES — pick based on what user asked, not what's "more complete":
-- "how much does X owe me" / "how much do I owe X" / "what's X's balance" / "where do I stand with X" → query_balance_with_counterparty (totals per currency, NO per-invoice list). Default for "how much" questions.
-- "show X's invoices" / "list X's bills" / "what bills are outstanding from X" / "details of X's receivables" → query_open_invoices with counterparty_id (per-invoice list). Use when user asked to SEE/LIST/SHOW the invoices.
-- When in doubt → balance (totals). Only list invoices when user explicitly asks to see them. The user can follow up with "show me the invoices" if they want detail.
+- "how much does X owe me" / "how much do I owe X" / "what's X's balance" / "where do I stand with X" → query_balance_with_counterparty (totals per currency, NO per-invoice list).
+- "show X's invoices" / "list X's bills" / "what bills are outstanding from X" / "details of X's receivables" → query_open_invoices (per-invoice list).
+- When in doubt → balance (totals). Only list invoices when user explicitly asks to see them.
 
-QUERY ANSWER EXAMPLE — balance question (clean total, no per-invoice list):
-(query_balance_with_counterparty for Jameel Crest Gems, 2 unpaid invoices totaling 90,000 USD)
-"Jameel owes you 90,000 USD across 2 invoices."
+QUERY ANSWER FORMAT — balance question:
+The query_balance_with_counterparty result has these fields:
+  • netByCurrency: per-currency net (positive = they owe us; negative = advance on file with us, i.e. we hold their money)
+  • totals.outstandingByCurrency and totals.advancesByCurrency
+  • invoiceCount, advanceCount
 
-If they also owe him something:
+Render the answer based on what's in netByCurrency:
+
+CASE A — single currency, only outstanding (no advances):
+"Jameel owes you 45,000 USD across 1 invoice."
+
+CASE B — single currency, with both outstanding AND advances (net is what they owe minus what's on file):
 "With Jameel Crest Gems:
-• Owes you: 90,000 USD (2 invoices)
-• You owe: 5,000 USD (1 bill)"
+• Open invoices: 12,000 USD (1)
+• Advance on file: 5,000 USD (1)
+• Net: Jameel owes 7,000 USD"
 
-If nothing:
+CASE C — single currency, only advances (we hold money, no open invoices):
+"Jameel has 5,000 USD on advance with you — no open invoices."
+
+CASE D — net is exactly zero:
 "Nothing outstanding with Jameel."
+
+CASE E — multi-currency (rare; e.g. owes USD AND THB):
+"With Jameel Crest Gems:
+• Owes you: 12,000 USD + 50,000 THB
+• Advance on file: 5,000 USD
+• Net: 7,000 USD + 50,000 THB owed"
+
+For Suppliers, swap the language ("You owe Acme…" / "You have 5,000 USD on advance with Acme…").
 
 QUERY ANSWER EXAMPLES:
 
@@ -883,6 +923,36 @@ async function executeTool(toolName, args, ctx) {
         return { ok: true, invoices: rows };
       } catch (err) {
         console.error('[conversation] query_open_invoices error:', err.message);
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case 'query_balance_with_counterparty': {
+      try {
+        // Resolve user-facing name → ERPNext party name via cache.
+        const cached = await query(
+          `SELECT erpnext_name, erpnext_doctype FROM counterparty_cache
+           WHERE owner_user_id = $1 AND LOWER(name) = LOWER($2)
+           ORDER BY (CASE WHEN erpnext_doctype = $3 THEN 0 ELSE 1 END), id DESC
+           LIMIT 1`,
+          [ctx.user.id, args?.counterparty_name || '', args?.party_type]
+        );
+        if (!cached.rowCount || !cached.rows[0].erpnext_name) {
+          return {
+            ok: false,
+            error: `Counterparty "${args?.counterparty_name}" not in counterparty_cache. They may not exist as a ${args?.party_type} in ERPNext yet — try creating an invoice/bill first, or check the spelling.`,
+          };
+        }
+        const erpName = cached.rows[0].erpnext_name;
+        const erp = erpnext.forUser(ctx.user);
+        const balance = await erpQuery.getBalanceWithCounterparty(ctx.user, erp, {
+          partyType: args.party_type,
+          partyName: erpName,
+        });
+        console.log(`• [conversation] [${ts()}] tool=query_balance_with_counterparty ${args.party_type}=${erpName} net=${JSON.stringify(balance.netByCurrency)}`);
+        return { ok: true, ...balance };
+      } catch (err) {
+        console.error('[conversation] query_balance_with_counterparty error:', err.message);
         return { ok: false, error: err.message };
       }
     }

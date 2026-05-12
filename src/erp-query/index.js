@@ -6,7 +6,9 @@
  */
 
 const openInvoices = require('./open-invoices');
+const balanceWithCounterparty = require('./balance-with-counterparty');
 
 module.exports = {
   listOpenInvoices: openInvoices.listOpenInvoices,
+  getBalanceWithCounterparty: balanceWithCounterparty.getBalanceWithCounterparty,
 };
