@@ -253,6 +253,7 @@ export default function LoginPage() {
       {info && <p className="mt-4 text-sm text-emerald-700">{info}</p>}
       {error && <p className="mt-4 text-sm text-red-700">{error}</p>}
 
+      {step === STEPS.PHONE && (
       <div className="mt-6 sm:mt-12">
         <p className="text-xs text-slate-500 mb-2 sm:mb-3">
           First time? Join the WhatsApp sandbox.
@@ -266,6 +267,7 @@ export default function LoginPage() {
           Join Twilio sandbox →
         </a>
       </div>
+      )}
     </main>
   );
 }
