@@ -1,56 +1,108 @@
 /**
  * Resolve an ERPNext account name from our internal category code.
  *
- * Why a mapping exists: ERPNext's "Standard with Numbers" CoA template uses
- * different codes than the codes we expose to the LLM (which were designed
- * pre-pivot, before we knew we'd back onto ERPNext). Rather than break the
- * LLM-facing API, we translate our codes to ERPNext codes here.
+ * ERPNext's chart-of-accounts numbering varies wildly by country
+ * (Australia, India, US, etc. each have their own scheme), so we can't
+ * rely on hardcoded code prefixes. Instead we resolve by the
+ * standardized fields:
  *
- * Cache strategy: `account_cache` table in Postgres (persists across restarts,
- * shared across instances).
- *   1. Look up cache row (user_id, name=ourCode, currency).
- *   2. Hit → return ERPNext account name immediately. No API call.
- *   3. Miss → query ERPNext for the account, write to cache, return.
+ *   account_type  — Cash, Bank, Credit Card, Receivable, Payable,
+ *                   Cost of Goods Sold, Tax, ...  (standardized)
+ *   root_type     — Asset, Liability, Equity, Income, Expense
+ *                   (always present)
  *
- * Manual refresh: just DELETE rows from account_cache for the user.
+ * Each of our internal codes maps to a resolver function that returns
+ * the first matching ERPNext account for the user's Company. Income /
+ * expense category codes also try a name-keyword match first (so
+ * "Sales Revenue" lands on an account containing "Sales") before
+ * falling back to any leaf with the right root_type.
+ *
+ * Cache strategy: same as before — once resolved, the (user, code,
+ * currency) → erpnext_account_name pair is stored in account_cache PG.
+ * Wipe the cache row to force a re-lookup after CoA changes.
  */
 
 const { query } = require('../db');
 const { ts } = require('../log');
 
-// Maps OUR internal category code → ERPNext account code prefix.
-const ERP_CODE_MAP = {
-  // Income
-  '4000': '4110', // Sales Revenue → Sales
-  '4100': '4120', // Service Revenue → Service
-  '4900': '4210', // Other Income → Interest Income (closest)
-  // COGS
-  '5000': '5111', // Cost of Goods Sold
-  // Expenses
-  '5100': '5204', // Meals & Entertainment → Entertainment Expenses
-  '5200': '5216', // Travel
-  '5210': '5216', // Vehicle → Travel (no specific)
-  '5300': '5211', // Office Supplies → Print and Stationery
-  '5350': '5223', // Insurance → Misc
-  '5400': '5209', // Rent → Office Rent
-  '5500': '5217', // Utilities
-  '5550': '5215', // Telephone & Internet
-  '5600': '5223', // Software → Misc
-  '5700': '5206', // Professional Services → Legal
-  '5800': '5207', // Marketing
-  '5900': '5223', // Other Expenses → Misc
-  '5950': '5221', // Bank Charges
-  // Wallets / assets
-  '1000': '1110', // Cash → Cash
-  // (1100 Bank requires picking a specific bank account; handled via wallet picker)
-  '1200': '1310', // Accounts Receivable → Debtors
-  // Liabilities
-  '2000': '2110', // Accounts Payable → Creditors
-  // Equity
-  '3000': '3100', // Owner's Equity → Capital Stock
-  '3100': '3400', // Retained Earnings
-  '3200': '3300', // Opening Balance Equity
+/**
+ * Each code → an array of resolution attempts. Each attempt returns the
+ * filters (and optional name-keyword preference) to feed listAccounts.
+ * The first attempt that yields a leaf wins.
+ *
+ * Order matters — more specific attempts first, broader fallback last.
+ */
+const CODE_RESOLVERS = {
+  // ── Assets ────────────────────────────────────────────────────────
+  '1000': [{ account_type: 'Cash' }],
+  '1100': [{ account_type: 'Bank' }],
+  '1200': [{ account_type: 'Receivable' }],
+  '1300': [{ root_type: 'Asset', namePrefer: ['Prepaid', 'Prepayment'] }],
+  '1400': [{ root_type: 'Asset', namePrefer: ['Other Receivable', 'Other Asset'] }],
+
+  // ── Liabilities ───────────────────────────────────────────────────
+  '2000': [{ account_type: 'Payable' }],
+  '2100': [{ account_type: 'Credit Card' }],
+  '2200': [{ root_type: 'Liability', namePrefer: ['Other Payable', 'Other Liability'] }],
+
+  // ── Equity ────────────────────────────────────────────────────────
+  '3000': [{ root_type: 'Equity', namePrefer: ['Capital', "Owner's Equity", 'Owners Equity'] }],
+  '3100': [{ root_type: 'Equity', namePrefer: ['Retained', 'Retained Earnings'] }],
+  '3200': [{ root_type: 'Equity', namePrefer: ['Opening', 'Opening Balance Equity'] }],
+
+  // ── Income ────────────────────────────────────────────────────────
+  '4000': [{ root_type: 'Income', namePrefer: ['Sales', 'Revenue'] }],
+  '4100': [{ root_type: 'Income', namePrefer: ['Service', 'Consulting', 'Fees'] }],
+  '4900': [{ root_type: 'Income', namePrefer: ['Other Income', 'Interest', 'Misc'] }, { root_type: 'Income' }],
+
+  // ── COGS ──────────────────────────────────────────────────────────
+  '5000': [{ account_type: 'Cost of Goods Sold' }, { root_type: 'Expense', namePrefer: ['Cost of Goods', 'COGS'] }],
+
+  // ── Expenses ──────────────────────────────────────────────────────
+  '5100': [{ root_type: 'Expense', namePrefer: ['Meals', 'Entertainment'] }],
+  '5200': [{ root_type: 'Expense', namePrefer: ['Travel'] }],
+  '5210': [{ root_type: 'Expense', namePrefer: ['Vehicle', 'Fuel', 'Travel'] }],
+  '5300': [{ root_type: 'Expense', namePrefer: ['Office', 'Supplies', 'Stationery'] }],
+  '5350': [{ root_type: 'Expense', namePrefer: ['Insurance'] }],
+  '5400': [{ root_type: 'Expense', namePrefer: ['Rent'] }],
+  '5500': [{ root_type: 'Expense', namePrefer: ['Utilities', 'Electricity'] }],
+  '5550': [{ root_type: 'Expense', namePrefer: ['Telephone', 'Internet', 'Communication'] }],
+  '5600': [{ root_type: 'Expense', namePrefer: ['Software', 'Subscription'] }],
+  '5700': [{ root_type: 'Expense', namePrefer: ['Professional', 'Legal', 'Consulting'] }],
+  '5800': [{ root_type: 'Expense', namePrefer: ['Marketing', 'Advertising'] }],
+  '5900': [{ root_type: 'Expense', namePrefer: ['Other', 'Misc'] }, { root_type: 'Expense' }],
+  '5950': [{ root_type: 'Expense', namePrefer: ['Bank Charges', 'Bank Fee', 'Bank'] }],
 };
+
+/**
+ * Try one resolution attempt. Returns the ERPNext account name or null.
+ */
+async function tryAttempt(erp, attempt) {
+  const filters = [
+    ['company', '=', erp.company],
+    ['is_group', '=', 0],
+    ['disabled', '=', 0],
+  ];
+  if (attempt.account_type) filters.push(['account_type', '=', attempt.account_type]);
+  if (attempt.root_type) filters.push(['root_type', '=', attempt.root_type]);
+
+  const r = await erp.listAccounts({ filters, limit: 100 });
+  const accounts = r.data || [];
+  if (accounts.length === 0) return null;
+
+  // Name-keyword preference: pick the first account whose name contains
+  // any of the preferred keywords. Falls back to the first account.
+  if (attempt.namePrefer?.length) {
+    for (const kw of attempt.namePrefer) {
+      const hit = accounts.find((a) =>
+        (a.account_name || '').toLowerCase().includes(kw.toLowerCase()) ||
+        (a.name || '').toLowerCase().includes(kw.toLowerCase())
+      );
+      if (hit) return hit.name;
+    }
+  }
+  return accounts[0].name;
+}
 
 async function resolveErpAccount(user, erp, ourCode, currency = null) {
   const cur = currency || user.reporting_currency || 'THB';
@@ -66,20 +118,24 @@ async function resolveErpAccount(user, erp, ourCode, currency = null) {
     return cached.rows[0].erpnext_account_name;
   }
 
-  // Cache miss — query ERPNext
-  const erpCodePrefix = ERP_CODE_MAP[ourCode];
-  if (!erpCodePrefix) return null;
+  const attempts = CODE_RESOLVERS[ourCode];
+  if (!attempts) {
+    console.warn(`× [account] [${ts()}] no resolver for code "${ourCode}"`);
+    return null;
+  }
 
-  const r = await erp.listAccounts({
-    filters: [
-      ['name', 'like', `${erpCodePrefix} - %`],
-      ['company', '=', erp.company],
-      ['is_group', '=', 0],
-    ],
-    limit: 1,
-  });
-  const erpName = r.data?.[0]?.name || null;
-  if (!erpName) return null;
+  let erpName = null;
+  for (const attempt of attempts) {
+    erpName = await tryAttempt(erp, attempt);
+    if (erpName) break;
+  }
+  if (!erpName) {
+    console.warn(
+      `× [account] [${ts()}] could not resolve code "${ourCode}" for company "${erp.company}" ` +
+        `(tried ${attempts.length} attempt${attempts.length === 1 ? '' : 's'})`
+    );
+    return null;
+  }
 
   // Write to cache (idempotent via ON CONFLICT)
   const now = new Date().toISOString();
@@ -93,8 +149,8 @@ async function resolveErpAccount(user, erp, ourCode, currency = null) {
     [user.id, ourCode, cur, erpName, now]
   );
 
-  console.log(`• [conversation] [${ts()}] account_cache miss → wrote ${ourCode}/${cur} = "${erpName}"`);
+  console.log(`• [account] [${ts()}] resolved ${ourCode}/${cur} = "${erpName}"`);
   return erpName;
 }
 
-module.exports = { resolveErpAccount, ERP_CODE_MAP };
+module.exports = { resolveErpAccount, CODE_RESOLVERS };
