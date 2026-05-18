@@ -274,11 +274,14 @@ async function migrate() {
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS erpnext_company_abbr TEXT`);
   await query(`
     DO $$ BEGIN
-      ALTER TABLE users
-        ADD CONSTRAINT users_erpnext_company_abbr_unique
-        UNIQUE (erpnext_company_abbr);
-    EXCEPTION
-      WHEN duplicate_object THEN NULL;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'users_erpnext_company_abbr_unique'
+      ) THEN
+        ALTER TABLE users
+          ADD CONSTRAINT users_erpnext_company_abbr_unique
+          UNIQUE (erpnext_company_abbr);
+      END IF;
     END $$;
   `);
 
