@@ -74,6 +74,10 @@ class ErpAdminClient {
     return this._fetch('PUT', `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}`, data);
   }
 
+  deleteResource(doctype, name) {
+    return this._fetch('DELETE', `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}`);
+  }
+
   callMethod(methodPath, args = {}) {
     // POST body form for whitelisted methods that mutate.
     return this._fetch('POST', `/api/method/${methodPath}`, args);
