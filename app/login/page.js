@@ -162,7 +162,11 @@ export default function LoginPage() {
 
       {step === STEPS.PHONE && (
         <form onSubmit={submitPhone} className="space-y-4">
-          <label className="block">
+          {/* Not a <label> wrapper — the country trigger is a <button>, and
+              implicit label association causes browsers to forward the
+              click to the input, which prevents the popover from opening.
+              Heading is a sibling span. */}
+          <div className="block">
             <span className="block text-sm font-medium text-slate-700 mb-1.5">Phone number</span>
             <div className="flex">
               <CountrySelect value={country} onChange={setCountry} />
@@ -187,7 +191,7 @@ export default function LoginPage() {
                 className="flex-1 min-w-0 px-3 py-3 border-y border-r border-slate-300 rounded-r-lg outline-none focus:border-slate-400 text-base tabular"
               />
             </div>
-          </label>
+          </div>
           <button
             type="submit"
             disabled={busy || !national}
