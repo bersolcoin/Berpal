@@ -38,6 +38,7 @@ export default async function OnboardingPage({ searchParams }) {
         </div>
       )}
 
+      <img src="/logo.svg" alt="Berpal" className="w-9 h-9 mb-8" />
       <h1 className="text-2xl font-semibold tracking-tight mb-1">Set up your business</h1>
       <p className="text-sm text-slate-600 mb-2">
         A few quick questions to set up your accounting workspace. Most fields are optional and editable later.

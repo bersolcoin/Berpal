@@ -129,7 +129,8 @@ export default function LoginPage() {
 
   return (
     <main className="max-w-md mx-auto px-6 py-16">
-      <h1 className="text-2xl font-semibold tracking-tight mb-2">Sign in to Berpal</h1>
+      <img src="/logo.svg" alt="Berpal" className="w-9 h-9 mb-8" />
+      <h1 className="text-2xl font-semibold tracking-tight mb-2">Sign in</h1>
       <p className="text-sm text-slate-600 mb-8">
         {step === STEPS.PHONE
           ? 'Enter your WhatsApp number — we’ll text you a one-time code.'

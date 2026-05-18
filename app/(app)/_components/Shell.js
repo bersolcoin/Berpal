@@ -71,7 +71,7 @@ export default function Shell({ user, pendingInboxCount = 0, children }) {
         >
           <List size={20} weight={ICON_WEIGHT} />
         </button>
-        <div className="text-base font-semibold tracking-tight">Berpal</div>
+        <img src="/logo.svg" alt="Berpal" className="w-6 h-6" />
         <div className="w-10" /> {/* Spacer to balance hamburger */}
       </header>
 
@@ -95,8 +95,8 @@ export default function Shell({ user, pendingInboxCount = 0, children }) {
       >
         <div className="px-5 py-5 border-b border-[var(--color-border)] flex items-center justify-between">
           <div>
-            <div className="text-xl font-semibold tracking-tight">Berpal</div>
-            <div className="text-xs text-[var(--color-ink-muted)] mt-0.5 truncate max-w-[160px]">
+            <img src="/logo.svg" alt="Berpal" className="w-6 h-6" />
+            <div className="text-xs text-[var(--color-ink-muted)] mt-2 truncate max-w-[160px]">
               {user.erpnext_company}
             </div>
           </div>
