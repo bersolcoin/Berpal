@@ -557,9 +557,47 @@ Today: ${today}
 User reporting currency: ${user.reporting_currency}
 User default currency: ${user.default_currency}
 User country: ${user.country}
-
+${businessTypeContext(user)}
 CURRENT DRAFT (in progress, may be empty):
 ${draftJson}`;
+}
+
+/**
+ * Per-business-type guidance for the LLM. Shaped as a context block, not
+ * a hard rule, so the model can override on clearly-mixed phrasing
+ * ("Acme paid for consulting hours" from a product user is still a service
+ * line — don't force item_code).
+ */
+function businessTypeContext(user) {
+  const t = user.business_type || null;
+  if (t === 'service') {
+    return `Business type: SERVICE (no physical inventory).
+  - Sales/purchases describe deliverables, not stocked goods.
+  - When recording a transaction, EXPECT: description + amount + counterparty.
+  - DON'T ask for item codes, SKUs, or quantities unless the user
+    volunteers them — that pattern doesn't apply here.
+
+`;
+  }
+  if (t === 'product') {
+    return `Business type: PRODUCT (physical inventory).
+  - Sales/purchases move stocked items.
+  - When recording a sale: EXPECT item code + qty + rate (or unit price).
+  - When the user says "sold pa2293 for 1400 usd", treat pa2293 as the
+    item code (or description if no separate code exists) and qty=1.
+  - When the user says "sold 5 pa2293 at 280", qty=5, rate=280.
+
+`;
+  }
+  if (t === 'both') {
+    return `Business type: BOTH (services + physical inventory).
+  - Infer per transaction from the user's wording.
+  - "sold 5 of pa2293" → product line (item + qty + rate).
+  - "consulting fee for X" → service line (description + amount, no item code).
+
+`;
+  }
+  return '';
 }
 
 async function loadConversation(userId) {
