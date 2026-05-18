@@ -208,10 +208,20 @@ export default function LoginPage() {
       {info && <p className="mt-4 text-sm text-emerald-700">{info}</p>}
       {error && <p className="mt-4 text-sm text-red-700">{error}</p>}
 
-      <p className="mt-12 text-xs text-slate-500 leading-relaxed">
-        Sandbox mode: you must first join the Twilio WhatsApp sandbox by
-        messaging the join code to <code className="font-mono">+1 415 523 8886</code>.
-      </p>
+      <div className="mt-12">
+        <p className="text-xs text-slate-500 leading-relaxed mb-3">
+          Sandbox mode — first time? Join the Twilio WhatsApp sandbox.
+          Opens WhatsApp with the join code pre-filled.
+        </p>
+        <a
+          href="https://wa.me/14155238886?text=join%20explore-individual"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center justify-center gap-2 w-full py-3 bg-orange-500 hover:bg-orange-600 text-white rounded-lg text-sm font-medium transition"
+        >
+          Join Twilio sandbox →
+        </a>
+      </div>
     </main>
   );
 }
