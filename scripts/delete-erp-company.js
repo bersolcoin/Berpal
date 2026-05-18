@@ -1,18 +1,28 @@
 /**
- * Delete an ERPNext Company including all its dependent records
- * (Customers, Suppliers, Items, Invoices, Payments, Stock, Accounts).
+ * Delete an ERPNext Company including all its company-scoped records.
  *
- * Uses ERPNext's built-in delete_company_transactions to wipe all
- * transactional + master records bound to that company, then deletes
- * the Company doctype itself.
+ * What is company-scoped (gets deleted):
+ *   Sales Invoice, Purchase Invoice, Payment Entry, Journal Entry,
+ *   Stock Entry, GL Entry, Stock Ledger Entry,
+ *   Account (leaf-first), Warehouse,
+ *   Bank Account, Cost Center,
+ *   then Company itself.
  *
- * DESTRUCTIVE AND IRREVERSIBLE. Triple-check the name before confirming.
+ * What is GLOBAL (NOT deleted):
+ *   Customer, Supplier, Item, Item Group, Address, Contact —
+ *   these live at the site level and may be reused by other companies.
+ *   ERPNext also stores per-company defaults in child tables on these
+ *   docs (Customer.accounts, Item.item_defaults, etc.). Those child
+ *   rows become orphans when the parent Company is deleted, which is
+ *   harmless.
  *
- *   node scripts/delete-erp-company.js "DS Gems"
- *   node scripts/delete-erp-company.js "KruZn Co" --yes  # skip confirm
+ * Cancel-then-delete: ERPNext doesn't let you delete submitted docs
+ * (docstatus=1). We PUT docstatus=2 first to cancel, then DELETE.
  *
- * Reserved names blocklisted to prevent accidents:
- *   "Test Trading Company"  (TTC — the dev tenant)
+ * DESTRUCTIVE AND IRREVERSIBLE. Triple-check the name.
+ *
+ *   node scripts/delete-erp-company.js "KruZn Co"
+ *   node scripts/delete-erp-company.js "DS Gems" --yes  # skip confirm
  */
 
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
@@ -20,6 +30,23 @@ const readline = require('readline');
 const { getAdminClient } = require('../src/erp-admin');
 
 const PROTECTED = new Set(['Test Trading Company']);
+
+// Doctypes that have a `company` field (filterable). Order: transactional
+// first (depend on accounts/warehouses), then masters, then accounts +
+// warehouses, then the Company itself.
+const COMPANY_SCOPED_TXN = [
+  'Stock Entry',
+  'Payment Entry',
+  'Sales Invoice',
+  'Purchase Invoice',
+  'Journal Entry',
+  'Delivery Note',
+  'Purchase Receipt',
+  'Sales Order',
+  'Purchase Order',
+];
+const COMPANY_SCOPED_LEDGER = ['GL Entry', 'Stock Ledger Entry'];
+const COMPANY_SCOPED_LATE = ['Cost Center', 'Bank Account', 'Account', 'Warehouse'];
 
 (async () => {
   const args = process.argv.slice(2);
@@ -31,13 +58,12 @@ const PROTECTED = new Set(['Test Trading Company']);
     process.exit(1);
   }
   if (PROTECTED.has(company)) {
-    console.error(`× "${company}" is in the protected list. Edit PROTECTED in this script if you really mean to delete it.`);
+    console.error(`× "${company}" is protected. Edit PROTECTED in this script to override.`);
     process.exit(1);
   }
 
   const admin = getAdminClient();
 
-  // 1. Confirm the Company exists.
   try {
     await admin.getResource('Company', company);
   } catch (err) {
@@ -48,20 +74,18 @@ const PROTECTED = new Set(['Test Trading Company']);
     throw err;
   }
 
-  // 2. Surface dependent counts so the user sees blast radius.
   console.log(`\nAbout to delete Company: "${company}"`);
   console.log('Counting dependent records…');
   const counts = await tallyDependents(admin, company);
   for (const [dt, n] of Object.entries(counts)) {
-    if (n > 0) console.log(`  ${dt.padEnd(20)} ${n}`);
+    if (n > 0) console.log(`  ${dt.padEnd(22)} ${n}`);
   }
-  console.log('\nThis will DELETE all of the above + the Company itself.');
-  console.log('IRREVERSIBLE.\n');
+  console.log('\nIRREVERSIBLE. Customer / Supplier / Item are GLOBAL — they stay.');
 
   if (!autoConfirm) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     const answer = await new Promise((resolve) =>
-      rl.question(`Type the company name exactly to confirm: `, (a) => { rl.close(); resolve(a.trim()); })
+      rl.question(`\nType the company name exactly to confirm: `, (a) => { rl.close(); resolve(a.trim()); })
     );
     if (answer !== company) {
       console.log('Aborted — name didn\'t match.');
@@ -69,39 +93,49 @@ const PROTECTED = new Set(['Test Trading Company']);
     }
   }
 
-  // 3. Call ERPNext's bulk-transaction-erase method. This nukes
-  //    invoices, payments, journal entries, stock entries, ledger,
-  //    etc. — everything the standard "Erase Transactions" Company
-  //    button does.
-  console.log('\nErasing transactions + dependent docs…');
-  try {
-    const r = await admin.callMethod(
-      'erpnext.setup.doctype.company.delete_company_transactions.delete_company_transactions',
-      { company_name: company }
-    );
-    console.log('  done:', r?.message || 'ok');
-  } catch (err) {
-    console.warn('  warn:', err.message);
+  // 1. Cancel + delete transactional docs (most-dependent first).
+  for (const dt of COMPANY_SCOPED_TXN) {
+    await cancelAndDeleteByCompany(admin, dt, company);
   }
 
-  // 4. Some doctypes aren't covered above. Delete the most-likely
-  //    leftovers manually so the final Company delete doesn't choke
-  //    on LinkExistsError.
-  for (const dt of ['Customer', 'Supplier', 'Item', 'Warehouse', 'Item Group', 'Address', 'Contact']) {
-    await bulkDeleteByCompany(admin, dt, company);
+  // 2. Delete ledger entries. These are usually auto-removed when the
+  //    parent transaction is cancelled, but mop up any stragglers.
+  for (const dt of COMPANY_SCOPED_LEDGER) {
+    await deleteByCompany(admin, dt, company);
   }
 
-  // 5. Delete Accounts in leaf-first order (children before parents)
-  //    so each delete doesn't fail with "linked with child account".
+  // 3. Late-stage company-scoped masters (accounts leaf-first, then the rest).
   await deleteAccountsLeafFirst(admin, company);
+  await deleteByCompany(admin, 'Warehouse', company);
+  await deleteByCompany(admin, 'Cost Center', company);
+  await deleteByCompany(admin, 'Bank Account', company);
 
-  // 6. Finally, delete the Company itself.
+  // 4. Per-company Item Group we created during provisioning ("Items - <ABBR>").
+  //    Item Group is global, but our naming convention is unique per company.
+  try {
+    const companyInfo = await admin.getResource('Company', company).catch(() => null);
+    const abbr = companyInfo?.data?.abbr;
+    if (abbr) {
+      const grp = `Items - ${abbr}`;
+      try {
+        await admin.deleteResource('Item Group', grp);
+        console.log(`  deleted Item Group "${grp}"`);
+      } catch {
+        /* might not exist */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // 5. Delete the Company itself.
   try {
     await admin.deleteResource('Company', company);
     console.log(`\n✓ Company "${company}" deleted from ERPNext.`);
   } catch (err) {
     console.error(`\n× Company delete failed: ${err.message}`);
-    console.error('  Some dependents may still be linked. Check ERPNext UI.');
+    console.error('  Likely something is still linked. Check ERPNext UI for what\'s blocking,');
+    console.error('  delete it manually, then re-run this script with --yes.');
     process.exit(1);
   }
   process.exit(0);
@@ -113,12 +147,7 @@ const PROTECTED = new Set(['Test Trading Company']);
 
 async function tallyDependents(admin, company) {
   const counts = {};
-  const doctypes = [
-    'Customer', 'Supplier', 'Item',
-    'Sales Invoice', 'Purchase Invoice', 'Payment Entry', 'Journal Entry',
-    'Account', 'Warehouse', 'Address',
-  ];
-  for (const dt of doctypes) {
+  for (const dt of [...COMPANY_SCOPED_TXN, ...COMPANY_SCOPED_LEDGER, 'Account', 'Warehouse', 'Cost Center', 'Bank Account']) {
     try {
       const r = await admin.callMethod('frappe.client.get_count', {
         doctype: dt,
@@ -132,30 +161,94 @@ async function tallyDependents(admin, company) {
   return counts;
 }
 
-async function bulkDeleteByCompany(admin, doctype, company) {
-  let total = 0;
+/**
+ * Pull rows in batches, cancel submitted ones (PUT docstatus=2), then
+ * delete them all.
+ */
+async function cancelAndDeleteByCompany(admin, doctype, company) {
+  let totalCancelled = 0;
+  let totalDeleted = 0;
+  let totalSkipped = 0;
   while (true) {
-    const r = await admin.listResource(doctype, {
-      filters: [['company', '=', company]],
-      fields: ['name'],
-      limit: 100,
-    });
-    const docs = r.data || [];
-    if (docs.length === 0) break;
-    for (const doc of docs) {
+    let r;
+    try {
+      r = await admin.listResource(doctype, {
+        filters: [['company', '=', company]],
+        fields: ['name', 'docstatus'],
+        limit: 100,
+      });
+    } catch (err) {
+      console.warn(`  ${doctype}: list failed (${err.message}) — skipping`);
+      return;
+    }
+    const rows = r.data || [];
+    if (rows.length === 0) break;
+    for (const row of rows) {
       try {
-        await admin.deleteResource(doctype, doc.name);
-        total += 1;
+        if (row.docstatus === 1) {
+          await admin.updateResource(doctype, row.name, { docstatus: 2 });
+          totalCancelled += 1;
+        }
+        await admin.deleteResource(doctype, row.name);
+        totalDeleted += 1;
       } catch (err) {
-        console.warn(`    skip ${doctype} "${doc.name}": ${err.message}`);
+        totalSkipped += 1;
+        if (totalSkipped <= 3) {
+          console.warn(`    ${doctype} "${row.name}": ${err.message.slice(0, 120)}`);
+        }
       }
     }
   }
-  if (total > 0) console.log(`  deleted ${total} ${doctype}`);
+  if (totalDeleted || totalSkipped) {
+    console.log(
+      `  ${doctype.padEnd(20)} deleted=${totalDeleted} cancelled=${totalCancelled} skipped=${totalSkipped}`
+    );
+  }
 }
 
+/**
+ * Delete rows directly (no cancel step). For doctypes that don't have
+ * a docstatus / submission concept (GL Entry, Stock Ledger Entry, etc.).
+ */
+async function deleteByCompany(admin, doctype, company) {
+  let totalDeleted = 0;
+  let totalSkipped = 0;
+  while (true) {
+    let r;
+    try {
+      r = await admin.listResource(doctype, {
+        filters: [['company', '=', company]],
+        fields: ['name'],
+        limit: 100,
+      });
+    } catch (err) {
+      console.warn(`  ${doctype}: list failed (${err.message}) — skipping`);
+      return;
+    }
+    const rows = r.data || [];
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      try {
+        await admin.deleteResource(doctype, row.name);
+        totalDeleted += 1;
+      } catch (err) {
+        totalSkipped += 1;
+        if (totalSkipped <= 3) {
+          console.warn(`    ${doctype} "${row.name}": ${err.message.slice(0, 120)}`);
+        }
+      }
+    }
+  }
+  if (totalDeleted || totalSkipped) {
+    console.log(`  ${doctype.padEnd(20)} deleted=${totalDeleted} skipped=${totalSkipped}`);
+  }
+}
+
+/**
+ * Accounts have a parent_account chain — delete leaf-first so each
+ * delete doesn't choke on "linked with child account".
+ */
 async function deleteAccountsLeafFirst(admin, company) {
-  // Sort accounts by depth (parent_account chain length) descending — leaves first.
   const r = await admin.listResource('Account', {
     filters: [['company', '=', company]],
     fields: ['name', 'parent_account', 'is_group'],
@@ -164,7 +257,6 @@ async function deleteAccountsLeafFirst(admin, company) {
   const accounts = r.data || [];
   if (accounts.length === 0) return;
 
-  // Depth calc: walk parent_account links.
   const byName = new Map(accounts.map((a) => [a.name, a]));
   function depth(a, seen = new Set()) {
     if (!a.parent_account || seen.has(a.name)) return 0;
@@ -175,13 +267,17 @@ async function deleteAccountsLeafFirst(admin, company) {
   accounts.sort((a, b) => depth(b) - depth(a));
 
   let total = 0;
+  let skipped = 0;
   for (const a of accounts) {
     try {
       await admin.deleteResource('Account', a.name);
       total += 1;
     } catch (err) {
-      console.warn(`    skip Account "${a.name}": ${err.message}`);
+      skipped += 1;
+      if (skipped <= 3) {
+        console.warn(`    Account "${a.name}": ${err.message.slice(0, 120)}`);
+      }
     }
   }
-  if (total > 0) console.log(`  deleted ${total} Account(s)`);
+  console.log(`  Account              deleted=${total} skipped=${skipped}`);
 }
