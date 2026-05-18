@@ -45,36 +45,46 @@ function placeholderFor(country) {
 export default function LoginPage() {
   const router = useRouter();
   const [step, setStep] = useState(STEPS.PHONE);
-  const [country, setCountry] = useState(DEFAULT_COUNTRY);
+  // Country starts empty — we wait on IP geolocation before populating so
+  // the user never sees a flash of the wrong country (US default → TH).
+  // detecting=true gates the form render while we await IP (with a hard
+  // 2.5s ceiling so a slow / blocked lookup doesn't strand the user).
+  const [country, setCountry] = useState('');
+  const [detecting, setDetecting] = useState(true);
   const [national, setNational] = useState('');
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [busy, setBusy] = useState(false);
-  const [ipDetected, setIpDetected] = useState(false);
 
-  // Best-effort IP geolocation. Don't override if the user has already
-  // touched the country picker (we infer that from `ipDetected`).
   useEffect(() => {
     let cancelled = false;
+    const finish = (cc) => {
+      if (cancelled) return;
+      setCountry(cc || DEFAULT_COUNTRY);
+      setDetecting(false);
+    };
+
+    // Hard ceiling so blocked / slow IP lookups don't strand the user.
+    const timeout = setTimeout(() => finish(null), 2500);
+
     (async () => {
       try {
         const r = await fetch('https://ipapi.co/json/', { cache: 'no-store' });
-        if (!r.ok) return;
+        if (!r.ok) return finish(null);
         const data = await r.json();
-        if (!cancelled && data.country_code && !ipDetected) {
-          setCountry(data.country_code);
-          setIpDetected(true);
-        }
+        clearTimeout(timeout);
+        finish(data.country_code || null);
       } catch {
-        /* swallow — IP lookup is a nice-to-have */
+        clearTimeout(timeout);
+        finish(null);
       }
     })();
+
     return () => {
       cancelled = true;
+      clearTimeout(timeout);
     };
-    // Intentional: only on first mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function buildE164() {
@@ -160,7 +170,17 @@ export default function LoginPage() {
           : 'Enter the 6-digit code we just sent you.'}
       </p>
 
-      {step === STEPS.PHONE && (
+      {step === STEPS.PHONE && detecting && (
+        <div className="space-y-4 animate-pulse">
+          <div>
+            <div className="h-4 w-24 bg-slate-200 rounded mb-1.5" />
+            <div className="h-12 bg-slate-100 rounded-lg" />
+          </div>
+          <div className="h-12 bg-slate-200/60 rounded-lg" />
+        </div>
+      )}
+
+      {step === STEPS.PHONE && !detecting && (
         <form onSubmit={submitPhone} className="space-y-4">
           {/* Not a <label> wrapper — the country trigger is a <button>, and
               implicit label association causes browsers to forward the
