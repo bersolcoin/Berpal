@@ -161,26 +161,16 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="max-w-md mx-auto px-6 py-16">
-      <img src="/logo.svg" alt="Berpal" className="w-9 h-9 mb-8" />
+    <main className="max-w-md mx-auto px-6 py-8 sm:py-16">
+      <img src="/logo.svg" alt="Berpal" className="w-9 h-9 mb-6 sm:mb-8" />
       <h1 className="text-2xl font-semibold tracking-tight mb-2">Sign in</h1>
-      <p className="text-sm text-slate-600 mb-8">
+      <p className="text-sm text-slate-600 mb-6">
         {step === STEPS.PHONE
           ? 'Enter your WhatsApp number — we’ll text you a one-time code.'
           : 'Enter the 6-digit code we just sent you.'}
       </p>
 
-      {step === STEPS.PHONE && detecting && (
-        <div className="space-y-4 animate-pulse">
-          <div>
-            <div className="h-4 w-24 bg-slate-200 rounded mb-1.5" />
-            <div className="h-12 bg-slate-100 rounded-lg" />
-          </div>
-          <div className="h-12 bg-slate-200/60 rounded-lg" />
-        </div>
-      )}
-
-      {step === STEPS.PHONE && !detecting && (
+      {step === STEPS.PHONE && (
         <form onSubmit={submitPhone} className="space-y-4">
           {/* Not a <label> wrapper — the country trigger is a <button>, and
               implicit label association causes browsers to forward the
@@ -214,10 +204,10 @@ export default function LoginPage() {
           </div>
           <button
             type="submit"
-            disabled={busy || !national}
+            disabled={busy || !national || !country}
             className="w-full py-3 bg-slate-900 text-white rounded-lg text-sm font-medium hover:bg-slate-800 disabled:opacity-50 transition"
           >
-            {busy ? 'Sending…' : 'Send code'}
+            {busy ? 'Sending…' : detecting ? 'Detecting country…' : 'Send code'}
           </button>
         </form>
       )}
@@ -265,7 +255,7 @@ export default function LoginPage() {
       {info && <p className="mt-4 text-sm text-emerald-700">{info}</p>}
       {error && <p className="mt-4 text-sm text-red-700">{error}</p>}
 
-      <div className="mt-12">
+      <div className="mt-8 sm:mt-12">
         <p className="text-xs text-slate-500 leading-relaxed mb-3">
           Sandbox mode — first time? Join the Twilio WhatsApp sandbox.
           Opens WhatsApp with the join code pre-filled.
