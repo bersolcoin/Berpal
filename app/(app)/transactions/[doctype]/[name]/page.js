@@ -12,6 +12,7 @@ import { getAppContext } from '../../../_lib/context';
 import PageHeader from '../../../_components/PageHeader';
 import Card from '../../../_components/Card';
 import { money, date, friendlyAccountName, friendlyPartyName } from '../../../_components/format';
+import DeleteButton from './DeleteButton';
 
 export const dynamic = 'force-dynamic';
 
@@ -48,6 +49,7 @@ export default async function TransactionDetail({ params }) {
             <span className="font-mono text-xs">{name}</span>
           </span>
         }
+        right={<DeleteButton doctype={doctype} name={name} />}
       />
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
