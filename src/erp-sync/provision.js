@@ -157,6 +157,12 @@ async function provisionTenant({
       default_currency: currency,
       country: erpCountry,
       enable_perpetual_inventory: 1, // always on — UX gating happens in the web app
+      // Force the numbered chart template so accounts are uniformly named
+      // "1110 - Cash - <ABBR>", "4110 - Sales - <ABBR>", etc. across every
+      // tenant. Without this, ERPNext picks the country default which for
+      // most countries is "Standard" (no number prefixes), making
+      // account-resolution less predictable.
+      chart_of_accounts: 'Standard with Numbers',
       ...(tax_id ? { tax_id } : {}),
     });
     companyName = r.data?.name;
