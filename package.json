@@ -12,6 +12,7 @@
     "reset": "node scripts/reset-conversations.js"
   },
   "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
     "bcryptjs": "^3.0.3",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

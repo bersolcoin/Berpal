@@ -12,6 +12,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { Check } from '@phosphor-icons/react';
 import CountryPicker from './CountryPicker';
 import CurrencyPicker from './CurrencyPicker';
 
@@ -325,7 +326,7 @@ function Stepper({ current }) {
                   : 'bg-slate-200 text-slate-500'
               }`}
             >
-              {done ? '✓' : s.num}
+              {done ? <Check size={14} weight="bold" /> : s.num}
             </div>
             <span className={`text-xs ${active ? 'text-slate-900 font-medium' : 'text-slate-500'} hidden sm:inline truncate`}>
               {s.label}

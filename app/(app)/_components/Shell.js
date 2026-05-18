@@ -9,6 +9,20 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import {
+  House,
+  Tray,
+  ArrowsLeftRight,
+  Wallet,
+  Receipt,
+  Package,
+  Briefcase,
+  UsersThree,
+  ListBullets,
+  Gear,
+  List,
+  X,
+} from '@phosphor-icons/react';
 import LogoutButton from './LogoutButton';
 
 /**
@@ -20,17 +34,20 @@ import LogoutButton from './LogoutButton';
  *   both    → has both
  *   null/undefined (legacy) → show both as fallback
  */
+const ICON_SIZE = 18;
+const ICON_WEIGHT = 'regular';
+
 const NAV = [
-  { href: '/dashboard', label: 'Overview', icon: '◉' },
-  { href: '/inbox', label: 'Inbox', icon: '✉', badgeKey: 'pendingInboxCount' },
-  { href: '/transactions', label: 'Transactions', icon: '⇅' },
-  { href: '/wallets', label: 'Wallets', icon: '⊙' },
-  { href: '/expenses', label: 'Expenses', icon: '↓' },
-  { href: '/inventory', label: 'Inventory', icon: '⊟', showFor: new Set(['product', 'both', null]) },
-  { href: '/services', label: 'Services', icon: '◍', showFor: new Set(['service', 'both', null]) },
-  { href: '/contacts', label: 'Contacts', icon: <PeopleIcon /> },
-  { href: '/accounts', label: 'Accounts', icon: '☰' },
-  { href: '/settings', label: 'Settings', icon: '⚙' },
+  { href: '/dashboard', label: 'Overview', Icon: House },
+  { href: '/inbox', label: 'Inbox', Icon: Tray, badgeKey: 'pendingInboxCount' },
+  { href: '/transactions', label: 'Transactions', Icon: ArrowsLeftRight },
+  { href: '/wallets', label: 'Wallets', Icon: Wallet },
+  { href: '/expenses', label: 'Expenses', Icon: Receipt },
+  { href: '/inventory', label: 'Inventory', Icon: Package, showFor: new Set(['product', 'both', null]) },
+  { href: '/services', label: 'Services', Icon: Briefcase, showFor: new Set(['service', 'both', null]) },
+  { href: '/contacts', label: 'Contacts', Icon: UsersThree },
+  { href: '/accounts', label: 'Accounts', Icon: ListBullets },
+  { href: '/settings', label: 'Settings', Icon: Gear },
 ];
 
 export default function Shell({ user, pendingInboxCount = 0, children }) {
@@ -52,7 +69,7 @@ export default function Shell({ user, pendingInboxCount = 0, children }) {
           onClick={() => setDrawerOpen(true)}
           className="p-2 -ml-2 rounded hover:bg-slate-100 text-slate-700"
         >
-          <Hamburger />
+          <List size={20} weight={ICON_WEIGHT} />
         </button>
         <div className="text-base font-semibold tracking-tight">Berpal</div>
         <div className="w-10" /> {/* Spacer to balance hamburger */}
@@ -88,7 +105,7 @@ export default function Shell({ user, pendingInboxCount = 0, children }) {
             onClick={() => setDrawerOpen(false)}
             className="md:hidden p-2 -mr-2 rounded hover:bg-slate-100 text-slate-500"
           >
-            <Close />
+            <X size={18} weight={ICON_WEIGHT} />
           </button>
         </div>
 
@@ -97,6 +114,7 @@ export default function Shell({ user, pendingInboxCount = 0, children }) {
             {visibleNav.map((item) => {
               const active = isActive(pathname, item.href);
               const badgeCount = item.badgeKey ? badges[item.badgeKey] : 0;
+              const Icon = item.Icon;
               return (
                 <li key={item.href}>
                   <Link
@@ -108,13 +126,11 @@ export default function Shell({ user, pendingInboxCount = 0, children }) {
                         : 'text-slate-700 hover:bg-slate-100'
                     }`}
                   >
-                    <span
-                      className={`w-4 text-center ${
-                        active ? 'text-white' : 'text-slate-400'
-                      }`}
-                    >
-                      {item.icon}
-                    </span>
+                    <Icon
+                      size={ICON_SIZE}
+                      weight={active ? 'fill' : ICON_WEIGHT}
+                      className={active ? 'text-white' : 'text-slate-500'}
+                    />
                     <span className="flex-1">{item.label}</span>
                     {badgeCount > 0 && (
                       <span
@@ -157,29 +173,3 @@ function isActive(pathname, href) {
   return pathname === href || pathname.startsWith(href + '/');
 }
 
-function PeopleIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="6" cy="5" r="2.5" />
-      <path d="M2 13.5c.5-2.5 2-4 4-4s3.5 1.5 4 4" />
-      <circle cx="11" cy="4" r="1.8" />
-      <path d="M10 9c1.8 0 3.4 1.4 4 4" />
-    </svg>
-  );
-}
-
-function Hamburger() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-      <path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function Close() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
-      <path d="M5 5l10 10M15 5L5 15" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
-  );
-}

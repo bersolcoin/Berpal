@@ -10,6 +10,7 @@
  */
 
 import { useState, useEffect, useRef, useMemo } from 'react';
+import { CaretDown } from '@phosphor-icons/react';
 
 const CURRENCIES = [
   { code: 'USD', name: 'US Dollar' },
@@ -116,9 +117,7 @@ export default function CurrencyPicker({ value, onChange, placeholder = 'Currenc
         ) : (
           <span className="text-sm text-slate-400 flex-1">{placeholder}</span>
         )}
-        <svg width="10" height="6" viewBox="0 0 10 6" className="text-slate-400 shrink-0">
-          <path d="M1 1l4 4 4-4" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" />
-        </svg>
+        <CaretDown size={12} weight="regular" className="text-slate-400 shrink-0" />
       </button>
 
       {open && (

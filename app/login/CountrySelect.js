@@ -14,6 +14,7 @@
 
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { getCountries, getCountryCallingCode } from 'libphonenumber-js';
+import { CaretDown } from '@phosphor-icons/react';
 
 const DISPLAY_NAMES = typeof Intl !== 'undefined' && Intl.DisplayNames
   ? new Intl.DisplayNames(['en'], { type: 'region' })
@@ -97,9 +98,7 @@ export default function CountrySelect({ value, onChange }) {
         ) : (
           <span className="text-sm text-slate-400">Country</span>
         )}
-        <svg width="10" height="6" viewBox="0 0 10 6" className="ml-auto text-slate-400">
-          <path d="M1 1l4 4 4-4" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" />
-        </svg>
+        <CaretDown size={12} weight="regular" className="ml-auto text-slate-400" />
       </button>
 
       {open && (
