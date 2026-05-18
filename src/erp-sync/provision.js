@@ -68,16 +68,43 @@ function buildUserEmail({ phone, email }) {
  * ERPNext's `Country` doctype is keyed on the full English name
  * ("Australia", "United States", "Hong Kong"), not the ISO 3166-1
  * alpha-2 code we get from libphonenumber-js. Convert before sending.
- * Falls through to the original value if Intl.DisplayNames isn't
- * available or can't resolve the code (we'd rather try the raw input
- * than crash).
+ *
+ * Intl.DisplayNames returns BCP-47-style names that don't always match
+ * ERPNext's Country defaults (e.g. "Hong Kong SAR China" vs ERPNext's
+ * "Hong Kong"; "Macao SAR China" vs "Macao"). Apply a small override
+ * map first; fall back to Intl.DisplayNames; fall back to raw input.
  */
+const COUNTRY_NAME_OVERRIDES = {
+  HK: 'Hong Kong',
+  MO: 'Macao',
+  TW: 'Taiwan',
+  KR: 'South Korea',
+  KP: 'North Korea',
+  RU: 'Russia',
+  VN: 'Vietnam',
+  IR: 'Iran',
+  SY: 'Syria',
+  VE: 'Venezuela',
+  BO: 'Bolivia',
+  LA: 'Laos',
+  CD: 'Congo, Democratic Republic of',
+  CG: 'Congo',
+  TZ: 'Tanzania',
+  MD: 'Moldova',
+  PS: 'Palestine',
+  TL: 'Timor-Leste',
+  CV: 'Cape Verde',
+  CI: "Cote d'Ivoire",
+};
+
 function isoToCountryName(iso) {
   if (!iso) return iso;
   if (typeof iso === 'string' && iso.length > 2) return iso; // already a name
+  const code = String(iso).toUpperCase();
+  if (COUNTRY_NAME_OVERRIDES[code]) return COUNTRY_NAME_OVERRIDES[code];
   try {
     const dn = new Intl.DisplayNames(['en'], { type: 'region' });
-    const name = dn.of(String(iso).toUpperCase());
+    const name = dn.of(code);
     return name || iso;
   } catch {
     return iso;
@@ -149,6 +176,8 @@ async function provisionTenant({
         }
       }
     } else {
+      console.error(`× [provision] [${ts()}] Company create failed for "${business_name}" (abbr=${abbr}, country=${country}→${erpCountry}, currency=${currency}):`);
+      console.error(err);
       return { ok: false, error: `Company create failed: ${err.message}`, partial };
     }
   }
@@ -182,6 +211,8 @@ async function provisionTenant({
       partial.user = userEmail;
       console.log(`• [provision] [${ts()}] created User "${userEmail}"`);
     } catch (createErr) {
+      console.error(`× [provision] [${ts()}] User create failed for "${userEmail}":`);
+      console.error(createErr);
       return { ok: false, error: `User create failed: ${createErr.message}`, partial };
     }
   }
@@ -199,6 +230,8 @@ async function provisionTenant({
     partial.api_key = apiKey;
     console.log(`• [provision] [${ts()}] generated API key for "${userEmail}"`);
   } catch (err) {
+    console.error(`× [provision] [${ts()}] API key generation failed for "${userEmail}":`);
+    console.error(err);
     return { ok: false, error: `API key generation failed: ${err.message}`, partial };
   }
 

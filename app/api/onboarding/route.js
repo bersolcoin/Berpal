@@ -139,11 +139,15 @@ export async function POST(request) {
       wallets,
     });
   } catch (err) {
-    console.error('[onboarding] provisionTenant threw:', err);
+    // Full stack + ERPNext response (if any) for backend debugging.
+    console.error('[onboarding] provisionTenant threw:');
+    console.error(err);
+    if (err.response) console.error('[onboarding] err.response:', JSON.stringify(err.response).slice(0, 800));
     return Response.json({ ok: false, error: `Provisioning failed: ${err.message}` }, { status: 500 });
   }
 
   if (!result.ok) {
+    console.error(`[onboarding] provisionTenant returned ok=false: ${result.error} (partial=${JSON.stringify(result.partial)})`);
     return Response.json({ ok: false, error: result.error, partial: result.partial }, { status: 500 });
   }
 
