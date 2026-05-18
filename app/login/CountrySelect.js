@@ -93,10 +93,10 @@ export default function CountrySelect({ value, onChange }) {
         {selected ? (
           <>
             <span className={`fi fi-${selected.code.toLowerCase()} fis rounded-sm shrink-0 w-5 h-5`} aria-hidden="true" />
-            <span className="text-sm font-medium text-slate-700">{selected.dialCode}</span>
+            <span className="text-base font-medium text-slate-700 tabular">{selected.dialCode}</span>
           </>
         ) : (
-          <span className="text-sm text-slate-400">Country</span>
+          <span className="text-base text-slate-400">Country</span>
         )}
         <CaretDown size={12} weight="regular" className="ml-auto text-slate-400" />
       </button>
