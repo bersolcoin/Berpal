@@ -11,13 +11,36 @@
  * joined the Twilio sandbox by sending the join code to +1 415 523 8886.
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
-import { getCountryCallingCode, isValidPhoneNumber, parsePhoneNumberFromString } from 'libphonenumber-js';
+import {
+  getCountryCallingCode,
+  isValidPhoneNumber,
+  parsePhoneNumberFromString,
+  getExampleNumber,
+} from 'libphonenumber-js';
+import examples from 'libphonenumber-js/examples.mobile.json';
 import CountrySelect from './CountrySelect';
 
 const STEPS = { PHONE: 'phone', CODE: 'code' };
 const DEFAULT_COUNTRY = 'US';
+
+/**
+ * National-formatted example number for the selected country, e.g.
+ *   US → "(201) 555-0123"
+ *   TH → "081 234 5678"
+ *   HK → "5123 4567"
+ * Falls back to a generic placeholder if the country has no example.
+ */
+function placeholderFor(country) {
+  try {
+    const ex = getExampleNumber(country, examples);
+    if (ex) return ex.formatNational();
+  } catch {
+    /* fall through */
+  }
+  return '818-8888';
+}
 
 export default function LoginPage() {
   const router = useRouter();
@@ -145,11 +168,21 @@ export default function LoginPage() {
               <CountrySelect value={country} onChange={setCountry} />
               <input
                 type="tel"
-                inputMode="tel"
+                inputMode="numeric"
+                pattern="[0-9]*"
                 autoFocus
-                placeholder="818-8888"
+                placeholder={placeholderFor(country)}
                 value={national}
-                onChange={(e) => setNational(e.target.value.replace(/[^\d\s]/g, ''))}
+                onKeyDown={(e) => {
+                  // Allow control keys + digits only. Blocks letters,
+                  // symbols, paste of mixed content, etc.
+                  if (
+                    e.metaKey || e.ctrlKey || e.altKey ||
+                    ['Backspace', 'Delete', 'Tab', 'Enter', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)
+                  ) return;
+                  if (!/^[0-9]$/.test(e.key)) e.preventDefault();
+                }}
+                onChange={(e) => setNational(e.target.value.replace(/[^\d]/g, ''))}
                 disabled={busy}
                 className="flex-1 min-w-0 px-3 py-3 border-y border-r border-slate-300 rounded-r-lg outline-none focus:border-slate-400 text-base tabular"
               />
