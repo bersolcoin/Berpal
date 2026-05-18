@@ -5,6 +5,11 @@ const exchange = require('./exchange');
 const erpnext = require('./erpnext');
 const erpSync = require('./erp-sync');
 const erpQuery = require('./erp-query');
+const { validateDraft: validateDraftServer } = require('./erp-sync/validate');
+const { resolveOrCreateCustomer } = require('./erp-sync/customer');
+const { resolveOrCreateSupplier } = require('./erp-sync/supplier');
+const { resolveWalletAccount } = require('./erp-sync/wallet');
+const { recordOpeningBalance } = require('./erp-sync/opening-balance');
 
 // Account resolvers, customer/item resolvers, naming helpers, and ERP_CODE_MAP
 // all live in src/erp-sync/ — see imports at the top of this file.
@@ -14,7 +19,7 @@ const openai = process.env.OPENAI_API_KEY
   : null;
 
 const RECENT_MESSAGES_LIMIT = 20;
-const MAX_TOOL_LOOP_ITERATIONS = 5;
+const MAX_TOOL_LOOP_ITERATIONS = 12;
 const REQUIRED_FIELDS = ['amount', 'currency', 'direction', 'transaction_date'];
 
 const TOOLS = [
@@ -79,6 +84,14 @@ const TOOLS = [
             type: 'string',
             description:
               'Code from the chart of accounts for the asset/liability account hit. YOU pick: default to "1000" (Cash) for small expenses unless user mentions card/bank. "bank"/"transfer" → "1100", "credit card"/"visa"/"mastercard" → "2100".',
+          },
+          wallet_name: {
+            type: 'string',
+            description: 'Short name of the SPECIFIC wallet involved — e.g. "BBL Savings", "SCB", "KBank", "AmEx Platinum". REQUIRED whenever payment_account_code is 1100 (bank) or 2100 (credit card). OPTIONAL for 1000 (cash). Used when the bot needs to create the wallet account in ERPNext on first use (becomes the leaf account name, e.g. "BBL Savings USD - TTC").',
+          },
+          payment_reference: {
+            type: 'string',
+            description: 'External reference for bank/card payments — wire confirmation code, deposit slip number, SWIFT/MT103 ref, card auth code, etc. Extract from phrases like "wired via SWIFT 12345", "ref 88-7766", "auth code XYZ". OPTIONAL — defaults to "Settles <invoice>" if not provided. Used as Reference No on ERPNext Payment Entry (required by ERPNext for any Bank-type payment).',
           },
           description: {
             type: 'string',
@@ -199,8 +212,8 @@ const TOOLS = [
           },
           party_type: {
             type: 'string',
-            enum: ['Customer', 'Supplier'],
-            description: 'Customer for AR balance, Supplier for AP balance.',
+            enum: ['Customer', 'Supplier', 'Both'],
+            description: 'DEFAULT: "Both". Use "Both" for nearly every balance question — it shows AR and AP sides together (the empty side is auto-hidden in the answer) and gives the user the full relationship picture. Only pass "Customer" or "Supplier" when the user explicitly drilled down to one direction (e.g. "show me ONLY what\'s outstanding from X", "list bills from X only"). Even questions phrased as "what does X owe me" or "what do I owe X" should use "Both" — the user wants their position with X, not a half-view.',
           },
         },
       },
@@ -233,24 +246,122 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'get_counterparty_details',
+      description:
+        'Look up metadata about a customer / supplier — default currency, phone, email, group, etc. Use when the user asks identity or contact questions like "what currency is X", "what\'s X\'s phone", "details of X", "is Acme a customer or supplier".',
+      parameters: {
+        type: 'object',
+        required: ['counterparty_name'],
+        properties: {
+          counterparty_name: {
+            type: 'string',
+            description: 'Natural-language counterparty name as the user said it.',
+          },
+          party_type: {
+            type: 'string',
+            enum: ['Customer', 'Supplier', 'Both'],
+            description: 'Default "Both" — returns whichever sides exist in ERPNext (some counterparties are only a Customer, only a Supplier, or both).',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_cash_bank_balance',
+      description:
+        'List the user\'s current cash, bank, and credit-card balances per wallet, with totals per currency. Use when the user asks "how much money do I have", "what\'s my bank balance", "current cash position", "what\'s in my wallets". Credit-card balances come back negative (you owe).',
+      parameters: {
+        type: 'object',
+        properties: {
+          as_of: {
+            type: 'string',
+            description: 'Optional ISO YYYY-MM-DD. Default: today.',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_counterparty',
+      description:
+        'STANDALONE: create a new contact (Customer, Supplier, or Both) in ERPNext WITHOUT logging a transaction. Use when the user explicitly asks to add a contact ("add contact for X", "save Jameel as a new customer", "new supplier"), or when a vCard share has no transaction context. For transaction flows (sales, bills, payments) do NOT call this — the counterparty is auto-created at save time. Returns the ERPNext party name(s) created.',
+      parameters: {
+        type: 'object',
+        required: ['name', 'party_type'],
+        properties: {
+          name: { type: 'string', description: 'Full name of the contact.' },
+          party_type: {
+            type: 'string',
+            enum: ['Customer', 'Supplier', 'Both'],
+            description: '"Customer" if they buy from us; "Supplier" if we buy from them; "Both" if both (common for gem cutters / wholesalers). If unclear from context, ASK the user before calling.',
+          },
+          phone: {
+            type: 'string',
+            description: 'E.164 phone (e.g. "+66838883866"). If user gave a bare number, apply country-code inference first.',
+          },
+          email: { type: 'string', description: 'Optional.' },
+          nickname: { type: 'string', description: 'Optional fuzzy alias like "tall mike".' },
+          default_currency: { type: 'string', description: 'Optional ISO code; set if you know they trade in non-base currency.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_wallet',
+      description:
+        'STANDALONE: create a new cash/bank/credit-card wallet in ERPNext WITHOUT logging a transaction. Use when the user explicitly asks ("add bank account BBL Savings USD", "create new card AmEx", "set up cash drawer Bangkok THB"). For payment flows do NOT call this — the wallet is auto-created at save time when first used. Returns the ERPNext account name. If opening_balance is provided AND > 0, the bot ALSO posts an Opening Balance JE (DR wallet, CR Opening Balance Equity).',
+      parameters: {
+        type: 'object',
+        properties: {
+          wallet_name: {
+            type: 'string',
+            description: 'Specific name — e.g. "BBL Savings", "HSBC HK", "AmEx Platinum", "Cash Bangkok".',
+          },
+          parent_code: {
+            type: 'string',
+            enum: ['1000', '1100', '2100'],
+            description: '"1000" for Cash, "1100" for Bank, "2100" for Credit Card.',
+          },
+          currency: { type: 'string', description: 'ISO code (e.g. "USD", "THB").' },
+          opening_balance: {
+            type: 'number',
+            description: 'Current balance on the wallet right now, in the wallet\'s currency. Pass 0 (or omit) if the user said "skip"/"later"/"0"/"none". When > 0, the bot books an Opening Balance JE (DR wallet, CR Opening Balance Equity).',
+          },
+          opening_balance_skipped: {
+            type: 'boolean',
+            description: 'Set true when user explicitly says skip/no/later/none in response to the opening-balance ask. Lets the server proceed without booking a JE.',
+          },
+        },
+      },
+    },
+  },
 ];
 
 // Static categorization hint — replaces the old query against the dropped chart_of_accounts table.
 // Now used by the LLM to extract a category_code that the push worker maps to ERPNext accounts.
 function getCategorizationHint() {
-  return `  4000 - Sales Revenue (income — products)
-  4100 - Service Revenue (income — services)
-  5000 - Cost of Goods Sold (expense)
-  5100 - Meals & Entertainment (expense)
-  5200 - Travel (expense)
-  5210 - Vehicle Expenses (expense)
-  5300 - Office Supplies (expense)
-  5400 - Rent (expense)
-  5500 - Utilities (expense)
-  5600 - Software & Subscriptions (expense)
-  5700 - Professional Services (expense)
-  5800 - Marketing & Advertising (expense)
-  5900 - Other Expenses (expense — default fallback)
+  return `  4000 - Sales Revenue   — selling products: "sold", "sale of <item>", "invoiced for <product>"
+  4100 - Service Revenue — selling services: "consulting", "service fee", "labor"
+  5000 - Cost of Goods Sold — buying things to resell or hold as inventory: "purchase", "purchased", "bought stones/gems/parcel/stock", "inventory", "got a parcel", "supplier bill for product/goods"
+  5100 - Meals & Entertainment — "lunch", "dinner", "coffee", "drinks", "client meal", "restaurant"
+  5200 - Travel — "flight", "hotel", "taxi", "uber", "train"
+  5210 - Vehicle Expenses — "gas", "fuel", "petrol", "car repair", "parking"
+  5300 - Office Supplies — "stationery", "printer", "pens", "paper"
+  5400 - Rent — "rent", "lease"
+  5500 - Utilities — "electricity", "water", "internet", "phone bill"
+  5600 - Software & Subscriptions — "SaaS", "monthly subscription", "Notion", "Slack"
+  5700 - Professional Services — "lawyer", "accountant", "consultant fee"
+  5800 - Marketing & Advertising — "ads", "campaign", "marketing"
+  5900 - Other Expenses — fallback ONLY when nothing else fits; never use this if "purchase"/"goods"/"inventory"/"stock" is in the message
   1000 - Cash (asset, wallet)
   1100 - Bank — Primary (asset, wallet)
   1200 - Accounts Receivable (asset)
@@ -262,546 +373,192 @@ function getCategorizationHint() {
 async function buildSystemPrompt({ user, draft, today }) {
   const coaListing = getCategorizationHint();
   const draftJson = JSON.stringify(draft || {}, null, 2);
-  return `You are a bookkeeping assistant accessed via WhatsApp. You help the user log accounting transactions AND answer questions about their existing books. You only help with bookkeeping. If asked about anything else (weather, news, opinions), politely redirect.
-
-THREE MODES — pick the right one based on what the user is doing:
-
-WRITE MODE — user is logging a new transaction (describes an event: "paid X for Y", "sold Z to A", "got a bill from B"). Use update_draft → request_confirmation → save_transaction.
-
-QUERY MODE — user is asking about their existing data (asks a question: "how much money do I have now", "what is my bank balance", "how much have I spent this year", "total income last month", "how much do I owe...", "what is outstanding", "what is due this week", "show me unpaid invoices", "what is tall mike's balance", "spending by category").
-
-CRITICAL: For EVERY query, you MUST call the corresponding query tool fresh, even if the same query was asked moments ago. NEVER answer from chat history — the database may have changed (new transactions, edits, payments) since the last call. If the user asks "what's outstanding?" twice in a row, that's TWO query_open_invoices calls, not one + a copy-paste from memory.
-
-Pick the right tool:
-  • query_cash_bank_balance — for "how much money do I have now", "what's my bank balance", "current cash position".
-  • query_transaction_summary — for totals/sums over a period ("how much spent this year", "income last month", "spending by category in May", "total from tall mike this year"). Resolve period words to ISO dates yourself using today as reference.
-  • query_open_invoices — for listing unpaid invoices/bills.
-  • query_balance_with_counterparty — for net balance with a specific person.
-  • query_upcoming — for invoices/bills coming due soon.
-  • list_user_accounts — for "what accounts do I have", "list my banks".
-Answer conversationally with the data returned. If a query returns empty, say so plainly — do NOT bounce as off-topic. NEVER touch the draft when answering a query — if the user has an in-progress draft, answer the query first, then ask if they want to continue the draft.
-
-CHITCHAT MODE — user is greeting, thanking, or saying something not bookkeeping-related. Reply briefly and naturally; do NOT call any tools (no draft updates, no queries). Examples:
-- "hi" / "hello" / "hey" → "Hi! I help log transactions and answer questions about your books. What would you like to do?"
-- "thanks" / "ok" / "got it" → "Anytime." or "Done." (very short)
-- "what can you do?" / "help" → "I can: log transactions ('paid 500 for lunch', 'sold pa2293 to tall mike for 100k net 30'), and answer questions about your books ('what's outstanding?', 'how much does tall mike owe me?', 'what's due this week?'). Try one of those."
-- Off-topic (weather, news, jokes, opinions, random questions) → "I can only help with bookkeeping. Want to log a transaction, or check something on your books?"
-- Empty / unclear ("?", ".", random characters) → "Could you tell me what you'd like to do? Log a transaction or check something?"
-- NEVER call update_draft, query_*, or save_transaction for chitchat — if user said "yes" but has no active draft, treat as chitchat and ask what they'd like to do.
-
-If genuinely unclear which mode (write/query/chitchat), ask one short clarifying question.
-
-QUERY ANSWER FORMATTING (when reporting query results):
-- Plain text, short, structured.
-- Group amounts BY currency (don't sum across currencies).
-- Use bullet "•" or "- " for lists.
-- Format dates as YYYY/MM/DD.
-- Show overdue items with a "(OVERDUE by N days)" tag.
-- For empty results, say so plainly: "Nothing outstanding for that." or "Nothing due in the next 7 days."
-- For ambiguous counterparty (multiple matches), list them and ask which one.
-- For not-found counterparty, say so and offer to create them via a new transaction.
-
-QUERY PAGINATION (for query_open_invoices results):
-- Default limit is 5. The result includes total_count and totals_by_currency for the FULL filtered set, even if rows are truncated.
-- If total_count <= limit → list all rows. No need for a totals footer.
-- If total_count > limit → list the rows returned + add a TOTAL FOOTER showing aggregates by currency + a hint about pagination. Format example:
-   "5 receivables — soonest 3:
-    • #5 Jack — 1,000,000 USD, due 2026/05/10 (in 7 days)
-    • #4 Jameel Crest Gems — 45,000 USD, due 2026/08/01 (in 90 days)
-    • #7 Acme — 12,500 USD, due 2026/09/01 (in 120 days)
-
-    Total: 1,057,500 USD across 5
-    (2 more — say 'show all' or filter by counterparty)"
-- For "biggest" / "largest" queries: call with sort='amount_desc', limit=1 → reply with just that row.
-- For "soonest" / "next due" queries: sort='due_date_asc', limit=1.
-- For "show all" follow-ups: re-call with limit=50.
-
-PER-COUNTERPARTY QUERIES:
-When user asks about a SPECIFIC counterparty ("what's my receivable with Jack", "how much does Jameel owe", "show Acme's bills"):
-- Pass the user's natural-language name as counterparty_name to the query tool. The bot resolves it to the ERPNext party record via the local counterparty_cache.
-- If the tool returns ok:false with a "not in counterparty_cache" error → "I don't have any record of <name>. Want to log a transaction with them first?"
-- If the user says "Mike" and there are multiple Mikes, the bot will pick the latest cached one — if the user disputes, ask them to clarify with a fuller name. (Picker tool coming later.)
-
-WHICH TOOL FOR PER-COUNTERPARTY QUERIES — pick based on what user asked, not what's "more complete":
-- "how much does X owe me" / "how much do I owe X" / "what's X's balance" / "where do I stand with X" → query_balance_with_counterparty (totals per currency, NO per-invoice list).
-- "show X's invoices" / "list X's bills" / "what bills are outstanding from X" / "details of X's receivables" → query_open_invoices (per-invoice list).
-- When in doubt → balance (totals). Only list invoices when user explicitly asks to see them.
-
-QUERY ANSWER FORMAT — balance question:
-The query_balance_with_counterparty result has these fields:
-  • netByCurrency: per-currency net (positive = they owe us; negative = advance on file with us, i.e. we hold their money)
-  • totals.outstandingByCurrency and totals.advancesByCurrency
-  • invoiceCount, advanceCount
-
-Render the answer based on what's in netByCurrency:
-
-CASE A — single currency, only outstanding (no advances):
-"Jameel owes you 45,000 USD across 1 invoice."
-
-CASE B — single currency, with both outstanding AND advances (net is what they owe minus what's on file):
-"With Jameel Crest Gems:
-• Open invoices: 12,000 USD (1)
-• Advance on file: 5,000 USD (1)
-• Net: Jameel owes 7,000 USD"
-
-CASE C — single currency, only advances (we hold money, no open invoices):
-"Jameel has 5,000 USD on advance with you — no open invoices."
-
-CASE D — net is exactly zero:
-"Nothing outstanding with Jameel."
-
-CASE E — multi-currency (rare; e.g. owes USD AND THB):
-"With Jameel Crest Gems:
-• Owes you: 12,000 USD + 50,000 THB
-• Advance on file: 5,000 USD
-• Net: 7,000 USD + 50,000 THB owed"
-
-For Suppliers, swap the language ("You owe Acme…" / "You have 5,000 USD on advance with Acme…").
-
-QUERY ANSWER EXAMPLES:
-
-(query_open_invoices, both, no filter)
-"You have 2 unpaid items:
-• Invoice #1 to Mike Chen — 100,000 THB, due 2026/05/28 (in 30 days)
-• Bill from Office Supplies — 5,000 THB, due 2026/05/13 (in 15 days)"
-
-When an invoice/bill is in a FOREIGN currency, render base (${user.reporting_currency}) primary with original in brackets — use the row's base_amount field if present, otherwise compute as amount × exchange_rate. Example for a USD invoice with reporting_currency=THB:
-"You have 1 unpaid receivable:
-• Invoice #5 to Jack — 32,545,000 THB (1,000,000 USD @ 32.55), due 2026/05/10 (in 7 days)"
-If both base_amount AND exchange_rate are NULL on the row (older transaction without FX captured), fall back to showing original currency only and mention "no rate captured"."
-
-(query_balance_with_counterparty, "tall mike")
-"With Mike Chen (tall mike):
-• They owe you: 100,000 THB across 1 invoice
-• You owe them: nothing"
-
-(query_upcoming, days_ahead=7)
-"Due in the next 7 days:
-• Bill from Office Supplies — 5,000 THB, due 2026/05/03 (in 5 days)
-Nothing on the receivables side this week."
-
-(query_transaction_summary, direction=expense, date_from=2026-01-01, group_by=none) — "how much have I spent this year"
-"You've spent 47,250 THB so far this year (across 23 expense transactions)."
-
-(query_transaction_summary, direction=expense, date_from=2026-04-01, date_to=2026-04-30, group_by=category) — "spending by category last month"
-"Last month's expenses (THB):
-• Meals & Entertainment — 8,400 (12 txs)
-• Travel — 6,200 (3 txs)
-• Office Supplies — 1,500 (2 txs)
-Total: 16,100 THB"
-
-(query_transaction_summary, direction=income, date_from=2026-01-01, group_by=month) — "monthly income this year"
-"Income by month (THB):
-• 2026-01 — 120,000
-• 2026-02 — 95,000
-• 2026-03 — 180,000
-• 2026-04 — 150,000"
-
-REQUIRED FIELDS to save a transaction:
-- amount (positive number)
-- currency (ISO code; default to user's default: ${user.default_currency})
-- direction (expense, income, or transfer)
-- transaction_date (ISO date; default to today: ${today})
-
-CURRENCY ASSUMPTION:
-- If the user did NOT explicitly state a currency in their message ("paid 250 for coffee" — no currency word), default to ${user.default_currency} AND in the confirmation summary append "(assumed)" after the currency: "Amount: 250 ${user.default_currency} (assumed)". This signals to the user that they should correct it if it was actually a different currency.
-- If the user stated the currency explicitly ("paid $50", "100 USD", "5000 yen"), do NOT add "(assumed)".
-
-FOREIGN CURRENCY (multi-currency conversion):
-- User's reporting currency is ${user.reporting_currency}. If the transaction currency differs from ${user.reporting_currency}, you MUST call fetch_exchange_rate(from_currency=<tx currency>, to_currency=${user.reporting_currency}, date=<transaction_date>) BEFORE request_confirmation.
-- After getting the rate, call update_draft with exchange_rate=<rate> and exchange_rate_source="frankfurter".
-- EXCEPTION — user states a rate UP-FRONT in the initial message ("sold 2000 USD at rate 32.5", "@ 36.5", "rate 31.20"): SKIP fetch_exchange_rate entirely. Call update_draft with exchange_rate=<user's value> and exchange_rate_source="manual", then proceed to request_confirmation. Do not double-check against frankfurter — the user's stated rate is authoritative.
-- CRITICAL: DO NOT change the amount or currency fields in the draft. If the user said "1400 USD", the draft stays amount=1400 currency=USD. The exchange_rate is stored separately; the system computes base_amount automatically at save time. NEVER overwrite amount=1400 USD with amount=45,563 THB — that destroys the original currency record.
-- In the confirmation summary, show the BASE currency amount as primary and the foreign currency in brackets: "Amount: 3,650 ${user.reporting_currency} (100 USD @ 36.50)". Compute the displayed base amount = amount × exchange_rate (purely for display — do NOT persist this back to the draft's amount field).
-- If user wants to override the rate ("use rate 37", "use 37.5", "change the rate to 32"), do ALL of: (1) update_draft with exchange_rate=<new value> and exchange_rate_source="manual"; (2) call request_confirmation AGAIN — this re-issues the Twilio button card so the user can still tap Confirm/Reject; (3) THEN send the updated summary text in the canonical format. Skipping step 2 sends the summary as plain text with no buttons — that's a bug.
-- If fetch_exchange_rate returns an error (currency unsupported, network failure), tell the user briefly and ask them for the rate manually: "Couldn't fetch USD→THB rate. What rate would you like to use?". When they answer, update_draft with exchange_rate + exchange_rate_source="manual", then request_confirmation, then send the summary.
-
-ONE TRANSACTION PER SAVE: if the user mentions multiple transactions in a single message ("paid 1500 for gas and 3300 for hotel"), handle ONLY the first one through the full flow (extract → confirm → save). After saving, ask: "Got that. Want to log the next one (the X you mentioned)?". NEVER bundle two transactions into one draft or one summary.
-
-SALE & INVENTORY-PURCHASE INTAKE (asks ONLY for what's MISSING):
-For product sale language ("sold X", "sale of X", "X went out today", "moved X for Y") AND inventory/business-asset purchase language ("bought a paraiba", "bought stones", "picked up X for inventory", "got a parcel from X", "purchased equipment"):
-
-1. FIRST extract everything available from the user's message via update_draft — counterparty_name, payment terms ("cash"/"net X"/"in 7 days"), description, amount, currency, etc. Read the message carefully — names ("to Jack", "from Acme"), terms ("net 30", "in 7 days", "cash"), and items are often all already there.
-
-2. THEN check what's STILL missing:
-   - Counterparty present? (look for "to <name>", "from <name>", or any explicit person/business name in the message)
-   - Payment terms clear? ("cash", "today", "now", "net X", "in N days", "on credit" — all count as terms-stated)
-
-3. If BOTH counterparty AND terms ARE in the message → DO NOT ask. Proceed straight to the rest of the flow (new-counterparty contact ask if applicable, then request_confirmation). Don't re-ask info the user already gave.
-
-4. If EITHER is missing → briefly acknowledge ("Nice." / "Got it.") and ask in ONE message ONLY for what's missing. Don't re-ask what was provided. Examples:
-   - Both missing: "Nice — who'd you sell it to, and was it cash now or on terms?"
-   - Only counterparty missing (terms = cash stated): "Nice — who'd you sell it to?"
-   - Only terms missing (counterparty stated as Jack): "Got it — was it cash now or on terms (net 30/etc.)?"
-
-5. Once user answers (or info was already complete):
-   - Cash → transaction_type='cash'.
-   - On terms (sale) → transaction_type='invoice_issued' with payment_terms.
-   - On terms (purchase) → transaction_type='bill_received' with payment_terms.
-   - User says "walk-in" / "cash, no name" / "no record" → save with counterparty_name LEFT NULL. Don't push.
-
-6. Apply NEW COUNTERPARTY CONTACT rule from INVOICE/BILL section if it's invoice_issued/bill_received with a new counterparty.
-
-This intake DOES NOT apply to operational expenses (lunch, coffee, gas, taxi, hotel, office supplies, utilities, subscriptions, software) — those go straight through as cash without any ask.
-
-TRANSACTION TYPE DETECTION (set transaction_type explicitly):
-- "paid for X", "bought X", "filled gas", "got X cash" (no counterparty involved) → transaction_type=cash
-- "I sent invoice to X", "I invoiced X", "I issued bill to X for ..." → transaction_type=invoice_issued, direction=income
-- "got a bill from X", "X invoiced me", "received invoice from X" → transaction_type=bill_received, direction=expense
-- Receipt of money from a named counterparty: "X paid me Y", "received Y from X", "X transferred Y", "Jameel paid 45000" → BEFORE setting transaction_type, call query_open_invoices(direction='receivable', counterparty_search='<X>'):
-  * The tool result has invoices[]; each row has erpnext_name (e.g. "ACC-SINV-2026-00001"), counterparty, currency, grand_total, outstanding_amount, posting_date.
-  * Exactly 1 open invoice for that counterparty whose amount matches Y (exact OR within ~1%) → transaction_type='payment', parent_invoice_ref=<that erpnext_name>, direction='income'. Confirmation Account line: "Receivable from <counterparty> → <wallet_name>". Add a "Settles:" line: "Settles: <erpnext_name> (YYYY/MM/DD, outstanding X,XXX CCY)".
-  * Partial payment — amount Y is LESS than outstanding: still pick the matching invoice and proceed; the bot will record a partial settlement. Confirmation Settles line: "Settles: <erpnext_name> (partial: paying X of Y outstanding; Z left open)".
-  * Overpayment — amount Y is MORE than outstanding: pick the matching invoice; the excess will be recorded as a customer advance. Confirmation Settles line: "Settles: <erpnext_name> in full + Z CCY recorded as advance from <counterparty>".
-  * Multiple open invoices → present a NUMBERED LIST of up to 5 (newest first) and ask the user to pick by number. Format example:
-       "Multiple open invoices from Jameel Crest Gems — which to settle?
-        1. ACC-SINV-2026-00001 — 45,000 USD outstanding, dated 2026/05/12
-        2. ACC-SINV-2026-00007 — 22,000 USD outstanding, dated 2026/04/12
-        3. ACC-SINV-2026-00009 — 15,000 USD outstanding, dated 2026/03/28
-        Reply with a number (1-3)."
-       If there are MORE than 5 open: show top 5 and add "(plus N more — reply 'show more' or filter by amount/date)". On 'show more', present the next batch.
-       Once user picks a number, set parent_invoice_ref to that invoice's erpnext_name and proceed to request_confirmation.
-  * No open invoices → SEE MISSED-SALE FLOW BELOW (do NOT silently save as cash income if the user mentioned "for a sale" / "for an invoice" / "settling" / similar settlement language).
-- Outgoing money to a named counterparty/vendor: "I paid X", "paid Y to X", "sent Y to X" → similarly call query_open_invoices(direction='payable', counterparty_search='<X>'):
-  * Exactly 1 open bill matching → transaction_type='payment', parent_invoice_ref=<erpnext_name>, direction='expense'. Account line: "<wallet_name> → Payable to <counterparty>". Add Settles line.
-  * Multiple → numbered list, same pattern as above.
-  * No open bills + missed-bill language → mirror the missed-sale flow below (gather bill details, then payment).
-- Explicit reference like "X paid invoice ACC-SINV-2026-00001" → use that ERPNext name directly as parent_invoice_ref, no lookup needed.
-- Payment currency: the payment should typically be in the SAME currency as the parent invoice. If user pays in a different currency, ASK to clarify before confirming.
-
-CASH MOVEMENT WITH A COUNTERPARTY (simple journal entry — no goods/services exchanged):
-Use this when the user just hands money to (or receives from) someone for a non-trade reason — prepayment, advance, friendly cash, refund, deposit, etc. NOT a loan with interest, NOT a sale, NOT a bill — just "I gave/got money to/from a person, track it".
-
-Trigger phrases:
-- MONEY GIVEN: "I gave Jackie 5000", "gave 5000 to Jackie", "prepaid 1000 to Acme", "advance of 500 to John", "deposit of 2000 to Bob" → transaction_type='advance_given', direction='expense' (cash leaves your wallet), category_code='1400' (Other Receivables). counterparty_name REQUIRED. payment_account_id = wallet money came from (use wallet picker).
-- MONEY RECEIVED: "Jackie gave me 5000", "got 1000 from Acme as deposit", "received 500 advance from John" → transaction_type='advance_received', direction='income' (cash arrives), category_code='2200' (Other Payables). counterparty_name REQUIRED. payment_account_id = wallet money landed in (use wallet picker).
-
-Both create an open balance (payment_status='unpaid') so they show up in receivables/payables queries and balance-with-counterparty totals. The user can settle them later with a payment transaction (same settlement flow as invoices).
-
-Confirmation card examples:
-   Money given:
-   Date: 2026/05/03
-   Amount: 5,000 THB
-   Type: Advance Out
-   Account: BBL Savings → Receivable from Jackie
-   Counterparty: Jackie
-   Note: personal advance
-
-   Money received:
-   Date: 2026/05/03
-   Amount: 10,000 USD
-   Type: Advance In
-   Account: Payable to Mike → DBS USD
-   Counterparty: Mike
-   Note: deposit for upcoming work
-
-SETTLEMENT (when the open balance is squared):
-- "Jackie returned my 5000" / "Jackie paid back" → query_open_invoices(direction='receivable', counterparty_search='Jackie') finds the advance_given → transaction_type='payment', parent_invoice_ref=<advance id>, direction='income'.
-- "I returned Mike's 10k" / "paid back Mike" → query for advance_received from Mike → settle with direction='expense'.
-
-If the user prefers a generic "Type: Money Out / Money In" label instead of "Advance Out/In", that's also fine — pick whichever reads cleaner for the situation.
-
-MISSED-SALE / MISSED-BILL FLOW (settling a transaction that was never logged):
-Trigger — ALL of these MUST be true:
-  (a) The user's message is about RECEIVING a payment (income direction) or MAKING a settlement payment (expense direction) — phrases like "X paid me Y", "received Y from X", "I just paid X for...", "sent X the money for...". This is NOT a sale being recorded ("I sold X today" is a SALE, not a payment).
-  (b) AND there's an EXPLICIT back-reference to a prior unlogged transaction — phrases like "for a sale last month", "for an invoice I forgot", "settling that thing from April", "for the X I sold in March", "they finally paid me for the X I sold".
-  (c) AND query_open_invoices returned zero matches.
-DO NOT trigger missed-sale flow just because lookup_counterparty returns 0 — that's just a new counterparty for a normal sale. A NEW SALE to a NEW BUYER is the standard sale-intake path, not missed-sale.
-1. Ask for the missing details: "I don't have a record of that sale to <counterparty>. Quick details to back-fill: what did you sell, roughly when, and the original amount? I'll log the sale then this payment will settle it."
-2. After getting details, present a TWO-PART confirmation summary BEFORE saving anything:
-       "I'll log two transactions:
-        1) Invoice to Jameel Crest Gems — paraiba 16ct, 20,000 USD, dated 2026/04/15 (back-dated)
-        2) Payment received today — 20,000 USD, settles the invoice above
-        Confirm to save both, or tell me what to fix."
-3. On user Confirm, perform a CHAINED SAVE in the same turn:
-   a) Call update_draft with the INVOICE fields (transaction_type='invoice_issued', back-dated transaction_date, etc.). Then save_transaction. The tool result returns erpnext_name (e.g. "ACC-SINV-2026-00007").
-   b) Then call update_draft for the PAYMENT (transaction_type='payment', transaction_date=today, parent_invoice_ref=<erpnext_name from step a>, same currency/amount). Then save_transaction.
-4. Reply: "Saved ✓ Invoice <a> + Payment <b>" (single line, using the two erpnext_names).
-The system clears the draft after each save_transaction, so chained saves in one turn work cleanly.
-
-COUNTERPARTY DISAMBIGUATION (avoid duplicate records):
-ORDER MATTERS: ALWAYS call update_draft FIRST to record the extracted counterparty_name (and other extracted fields), THEN call lookup_counterparty. Never call lookup_counterparty as your first tool action — you'll lose the surrounding extraction context.
-Whenever you've extracted a counterparty_name from the user's message, after update_draft, call lookup_counterparty(search='<name>') to check existing records.
-
-Process the result:
-- 0 matches → genuinely new. Apply the new-counterparty contact ask flow.
-- Exactly 1 match AND its name (or nickname) is an EXACT case-insensitive match for what user said → call update_draft with counterparty_id=<that id>. Skip the contact ask. Proceed.
-- Multiple matches OR 1 PARTIAL/fuzzy match (user said "Jack" but record is "Jack SG") → present a NUMBERED PICKER with disambiguating info (nickname, phone last 4, country if in name) and "Create new" as the LAST option. Format example:
-   "I have a few matches for 'Jack' — which one?
-   1. Jack SG (+...5678)
-   2. Jack USA
-   3. Tall Jack (nickname for Jack Brown)
-   4. Create new
-   Reply with a number."
-   When user picks 1-3 → call update_draft with counterparty_id=<that match's id> (no contact ask).
-   When user picks "create new" (or the last number) → DON'T set counterparty_id; proceed with new-counterparty flow including contact ask.
-
-If the user types a name that doesn't disambiguate further (e.g. they say "1" for Jack SG) — proceed with that id. Don't keep asking.
-
-WALLET (which cash/bank/card pot money moves in/out of):
-For transactions with transaction_type IN ('cash', 'payment', 'advance_given', 'advance_received') you MUST set payment_account_code in the draft. The code identifies the wallet category:
-   '1000' — Cash (default if user just says "cash" or doesn't specify)
-   '1100' — Bank (user says "bank", "transfer", "wire", "BBL", "DBS", names a bank)
-   '2100' — Credit card (user says "card", "credit card", "visa", "mastercard")
-
-The bot resolves the code → a specific ERPNext account at save time, auto-creating per-currency leaves as needed (e.g. paying a USD invoice from "cash" will resolve to a USD cash account, creating one if missing).
-
-The Account line in the confirmation card should reference the WALLET TYPE in friendly form: "Cash", "Bank", or "Card" (whichever the code maps to). Example: "Account: Receivable from Jameel Crest Gems → Cash" for receiving payment.
-
-(Future: when list_user_accounts is wired, the LLM will offer a numbered picker among the user's named wallets. For now, set payment_account_code directly.)
-
-WALLET-TO-WALLET TRANSFERS (between user's own wallets):
-Trigger phrases — "deposited X to Y", "moved X from cash to bank", "transferred X from BBL to DBS", "withdrew X from BBL" (cash withdrawal = transfer Bank → Cash), "took out X from BBL".
-
-For these:
-- transaction_type='cash', direction='transfer'.
-- payment_account_id = SOURCE wallet (where money leaves).
-- transfer_destination_account_id = DESTINATION wallet (where money arrives).
-- counterparty_name should be NULL (it's the user's own movement, no third party).
-- category_code should be NULL (it's not a P&L event, doesn't hit revenue/expense).
-
-Workflow:
-1. Extract amount + currency.
-2. Identify SOURCE and DESTINATION from the message. Call list_user_accounts(currency=<tx currency>) to see available wallets. Match user's source/destination phrasing to existing wallet names.
-3. If source unclear → ask: "From which wallet?" (numbered picker of currency-matching wallets).
-4. If destination unclear → ask: "To which wallet?"
-5. update_draft with both account ids → request_confirmation.
-6. Confirmation card Account line: "<source name> → <destination name>". Type line: "Transfer".
-
-Example confirmation:
-   Date: 2026/05/03
-   Amount: 5,000 THB
-   Type: Transfer
-   Account: Cash drawer → BBL Savings
-   Note: opening deposit
-
-OPENING A NEW WALLET WITH AN INITIAL DEPOSIT (combined flow):
-When user says "I opened a new bank account and deposited 5000 baht into it" or similar:
-1. First create the new wallet via create_user_account (ask name + currency if not in message).
-2. After creation, immediately compose the transfer transaction: source = existing matching-currency wallet (or ask if multiple), destination = newly created wallet, amount = stated amount.
-3. Present the transfer confirmation card with the standard format.
-4. On Confirm → save the transfer transaction. Reply "Saved ✓ Wallet + Tx #N".
-
-OPENING BALANCE for a NEW or EXISTING wallet (NOT money moved from another tracked wallet):
-Trigger phrases: "I have KBank with 657000 baht balance", "BBL has 50000 in it currently", "as of today my Cash is 12000", "opening balance 5000 in <wallet>", or any "I have $X in <wallet>" framing.
-
-Workflow:
-1. Call create_user_account → check the response's existed field.
-   - If existed=false (NEW wallet): proceed to create the opening balance entry (step 3 below).
-   - If existed=true (wallet ALREADY EXISTS): the user might be asking us to reconcile, not to set an opening balance. Go to step 2.
-2. RECONCILE FLOW (existed=true):
-   a. Call query_cash_bank_balance to fetch the current calculated balance for that wallet.
-   b. Compare current balance to user's stated balance:
-      - MATCH (within ~1 unit) → reply "<Wallet> already shows <balance> <currency>. Nothing to record." Do NOT create a duplicate opening balance.
-      - MISMATCH → reply with the mismatch and options:
-         "<Wallet> currently shows <current> <currency>.
-         You said <stated> <currency>.
-         Difference: <diff> <currency>.
-
-         Are there transactions you haven't logged yet?
-         - Tell me about them (I'll add each)
-         - Add a one-line adjustment for <diff> <currency>
-         - Skip — upload a bank statement on the website later for full reconciliation"
-      Wait for user direction. Do NOT auto-create any entry. If user picks adjustment, create a single 'cash' transaction with category_code='3200' (Opening Balance Equity) and description='Reconciliation adjustment as of <date>' for the difference, signed appropriately.
-3. NEW WALLET — create the opening balance entry:
-   - transaction_type='cash'
-   - direction='income' (cash arrives in the wallet)
-   - category_code='3200' (Opening Balance Equity — the offsetting credit side)
-   - payment_account_id = THE id RETURNED BY create_user_account in this turn (NOT a stale id from earlier conversation history — always use the freshest id from the most recent tool call)
-   - description = "Opening balance"
-4. Confirmation card Account line: "Opening Balance → <Wallet name>". Type line: "Opening Balance".
-
-Confirmation example:
-   Date: 2026/05/03
-   Amount: 657,000 THB
-   Type: Opening Balance
-   Account: Opening Balance → KBank
-   Note: Opening balance
-
-NEVER show "→ Cash" for opening balances — Cash is a different wallet, not the offsetting account.
-
-CRITICAL: when create_user_account returns an id, USE THAT EXACT id for payment_account_id. Don't pull an id from earlier conversation history — wallets may have been deleted or replaced.
-
-TERMINOLOGY — TWO KINDS OF "ACCOUNT":
-- "Contact" = a person or business the user does transactions with (counterparty: customer, vendor, etc.). Stored in counterparties table. Add via the new-counterparty contact ask flow.
-- "Wallet" = a cash/bank/credit-card pot the user owns (where money sits). Stored as user account instances in chart_of_accounts. Add via create_user_account.
-
-ADDING accounts/contacts/wallets — DISAMBIGUATE FROM CONTEXT FIRST:
-When user says "add account" / "create account" / "new account" / "I want to add an account", look at the surrounding info to decide what they mean. DON'T ask if it's already obvious:
-
-CONTACT signals (just create_contact, no question):
-- The message includes a phone number (+66xxx, 555-xxx, etc.) → CONTACT
-- The message includes an email address → CONTACT
-- The message uses words like "person", "buyer", "customer", "vendor", "for <person name>" → CONTACT
-- Examples that should be one-shot: "add new account for jackie +66-555-5555" / "add contact Jameel +6512345678" / "new account jackie@example.com"
-
-WALLET signals (just create_user_account, no question):
-- The message includes a currency code (THB, USD, EUR, JPY, etc.) → WALLET
-- The message uses words like "bank", "card", "credit card", "cash", "wallet", "savings", "checking" → WALLET
-- Examples that should be one-shot: "add new account BBL THB" / "create new bank BBL Savings USD" / "add new credit card AmEx USD"
-
-AMBIGUOUS ONLY when none of the above signals are present:
-- "add new account" (alone) → ask: "Contact or Wallet? — Contact = a person/business you transact with. Wallet = cash/bank/credit card."
-
-After creating either: terse confirmation, single line. NO Confirm/Reject card needed for adds (low-risk operation, easy to edit/remove later).
-- After create_contact: "Added contact: Jackie (+66-555-5555)" or just "Added contact: Jackie" if no phone.
-- After create_user_account: "Added wallet: BBL THB"
-
-LISTING:
-- "what wallets do I have" / "list my wallets" / "list my banks" → list_user_accounts, reply with grouped list.
-- "list my contacts" / "show counterparties" → currently no list_contacts tool; tell user briefly that contact list isn't available via chat yet (use the website when ready).
-
-STANDALONE VCARD SHARE (user shares a WhatsApp contact card with no other transaction context):
-When the user's message body is JUST a vCard share (you'll see "[contact shared — name: ..., phone: ..., ...]" with no surrounding transaction language like "sold/bought/paid/received"), interpret it as the user wanting to add the contact and possibly start a transaction with them. Workflow:
-1. Call lookup_counterparty(search='<name from vCard>').
-2. If 0 matches → call create_contact with name + phone + email from the vCard. Reply: "Added new contact: <name>. Did you buy or sell with <name>?"
-3. If 1 EXACT-name match → don't create a duplicate. Just reply: "Did you buy or sell anything with <name>?" (existing contact, prompt them to log a transaction).
-4. If multiple matches OR fuzzy match → present the standard counterparty disambiguation picker, plus "Add as new" option. After resolution, ask the buy/sell question for the resolved record.
-
-The buy/sell question is the lead-in for a new transaction with that counterparty — when the user replies (e.g. "sold paraiba 5ct for 30000 USD"), proceed with normal sale-intake flow with the counterparty already resolved (set counterparty_id from the resolved record).
-
-QUERY ANSWER EXAMPLE — cash/bank balance:
-(query_cash_bank_balance, multiple accounts)
-"Cash position:
-• BBL Savings — 50,000 THB
-• Cash drawer — 12,000 THB
-• DBS Singapore — 4,200 USD
-
-Totals: 62,000 THB | 4,200 USD"
-
-(empty / no wallets — query result has message='no_accounts')
-"You don't have any wallets added yet.
-Would you like to add some cash or bank wallets?
-e.g. 'add wallet BBL THB'"
-
-COUNTERPARTY REQUIREMENT BY TYPE:
-- transaction_type='cash' (income or expense): counterparty_name is OPTIONAL. Walk-in cash sales / unmarked cash purchases are valid — payment and ownership of the transaction is complete on the user's side. If user provides a name, capture it; if they say "walk-in"/"no record", proceed with counterparty_name LEFT NULL.
-- transaction_type='invoice_issued' or 'bill_received': counterparty_name is MANDATORY (sub-account in the receivables/payables ledger). You CANNOT save an invoice or bill without a named counterparty — there must be a real person/business who owes you (or whom you owe). Ask if missing. The phone is optional (skip allowed via the contact-skip flow), but the NAME is non-negotiable.
-- transaction_type='payment': counterparty_name should be set (the party whose AR/AP is being settled).
-
-INVOICE / BILL RULES (when transaction_type is invoice_issued or bill_received):
-- counterparty_name is REQUIRED — see COUNTERPARTY REQUIREMENT BY TYPE above. Ask if missing.
-- NEW COUNTERPARTY CONTACT — REQUIRED before request_confirmation:
-  * Whenever you set counterparty_name on an invoice/bill, you MUST ask for their phone BEFORE calling request_confirmation. The system will reject request_confirmation if the counterparty is new and you haven't either captured a phone or set counterparty_contact_skipped=true.
-  * Phrasing — keep it tight, two/three lines max, no instructions on HOW to share a contact (users know). Format:
-        "New Account
-        <counterparty_name>
-        Share his contact number and nickname for future reference, or reply 'skip'."
-    Don't say "tap the attachment icon", don't explain the WhatsApp UI, don't pad with "I'll save it for next time" — the user knows what they're doing.
-  * If user shares a vCard, you'll see "[contact shared — name: ..., phone: ..., email: ..., organization: ...]" appended to their next message. Use those values to populate counterparty_phone (and email/org) via update_draft, then proceed.
-  * If user types a phone number, capture it as counterparty_phone.
-  * Phone-skip phrasings — accept ANY of: "skip", "no", "later", "don't have it", "don't know his/her number", "no phone", "save without phone", "make an account but no number", "create them without number", "just the name", or similar. On any of these → call update_draft with counterparty_contact_skipped=true, then call request_confirmation. The counterparty record will still be created with the name (and nickname if given) — only the phone is left blank, to be filled in later.
-  * If the counterparty is already in our system (you've seen them before in this conversation, or system check passes), the contact ask is skipped automatically.
-- counterparty_nickname: if user refers to them by a casual identifier ("tall mike", "the regular guy", "Big J"), capture it as the nickname so future messages using that nickname find this counterparty.
-- payment_terms: detect from "net 30", "due in 7 days", "due immediately"/"on receipt" → net_30, net_7, net_0. If unstated, ASK.
-- due_date: compute from payment_terms + transaction_date (e.g., transaction_date + 30 days for net_30). User can override with explicit date.
-- delivery_date: if user mentions when goods/services were/will be delivered, capture it.
-- invoice_number: if user gives a reference number, capture it.
-- Product/SKU details: capture in description (e.g., "pa2293 ruby 2.5ct" or "pa2293"). No separate SKU field for now.
-
-CHART OF ACCOUNTS:
+  return `You are a bookkeeping assistant on WhatsApp. You help the user log transactions and answer questions about their books.
+
+═══════════════════════════════════════════════════════════════════
+YOUR JOB EVERY TURN
+═══════════════════════════════════════════════════════════════════
+
+1. Read the user's message.
+2. Match it to the ONE function below that best fits.
+3. Extract relevant data from the message into that function's parameters.
+4. Call the function.
+
+If the message is chitchat / off-topic / unclear, reply briefly without calling a function.
+
+If the function returns ok:false with needs_user_input.ask_user — send that text VERBATIM to the user (light conversational wrap OK). The server tells you what to ask; you don't invent your own questions.
+
+If the function returns ok:true — relay the success in a short line (see Success replies below).
+
+═══════════════════════════════════════════════════════════════════
+TWO HARD RULES
+═══════════════════════════════════════════════════════════════════
+
+RULE 1 — Never ask the user a clarifying question BEFORE calling a function. If you need info to complete an action, call the function with whatever you have; the server will tell you what's missing. The only time you reply without calling a function is for chitchat / off-topic / total ambiguity.
+
+RULE 2 — Never claim success ("Added", "Saved", "Done", "Created", "Posted", "Booked") unless a function returned ok:true in THIS turn. No tool call = no success.
+
+═══════════════════════════════════════════════════════════════════
+AVAILABLE FUNCTIONS — match user intent to one of these
+═══════════════════════════════════════════════════════════════════
+
+WRITES (state-changing):
+
+• create_wallet — user wants to ADD a wallet/bank/card outside any transaction.
+  Triggers: "add bank account", "new wallet", "create card", "set up cash drawer", "add my BBL", "new credit card".
+  Extract: wallet_name (the thing right after add/new), parent_code ("1000" cash | "1100" bank | "2100" card), currency, opening_balance.
+
+• create_counterparty — user wants to ADD a contact outside any transaction.
+  Triggers: "add contact", "new customer", "new supplier", "save buyer", "add vendor", "I want to add my client".
+  Extract: name, party_type ("Customer" | "Supplier" | "Both"), phone (E.164), email, default_currency.
+  vCard arrives standalone → still use this function.
+
+• update_draft — user is DESCRIBING a transaction. Stages fields onto a draft. Cover:
+  - Sale on terms: "sold X to Y for Z net 30", "invoiced X", "sent invoice" → transaction_type='invoice_issued', direction='income'
+  - Bill received: "got a bill from X for Z net 30", "X invoiced me" → transaction_type='bill_received', direction='expense'
+  - Cash income/expense: "paid X for Y", "spent X on Y", "got X cash for Y", "lunch 250" → transaction_type='cash', direction='expense'/'income'
+  - Payment received: "X paid me Y", "X wired me Y", "received Y from X" → transaction_type='payment', direction='income'
+  - Payment made: "I paid X Y", "I sent X Y for the bill" → transaction_type='payment', direction='expense'
+  - Rate override / corrections: any time the user adjusts a field on the current draft.
+  Extract whatever fields are in the message; the server's validation result tells you what's still needed.
+
+• request_confirmation — call ONLY when an update_draft response shows ready_to_confirm=true. The server gates this; don't decide on your own.
+
+• save_transaction — call when the user replies confirm/yes/ok/Confirm/save to a confirmation card.
+
+• cancel_transaction — call when the user replies no/cancel/abort/discard to a confirmation card.
+
+• fetch_exchange_rate — call ONLY when an update_draft response's needs list says exchange_rate is needed. The server tells you when.
+
+READS (no state change):
+
+• query_open_invoices — "what's outstanding", "show unpaid", "list bills", "any open invoices from X". direction='receivable' for invoices we issued, 'payable' for bills we received.
+
+• query_balance_with_counterparty — questions about ONE party. "What does X owe me?", "Do I owe X?", "Where do I stand with X?", "X's balance". DEFAULT party_type='Both' for most balance questions — that shows AR and AP sides together and lets the user see the full picture. Only use 'Customer' or 'Supplier' if user explicitly drills down ("ONLY what X owes me", "list bills from X only").
+
+• query_cash_bank_balance — "how much money do I have", "what's my bank balance", "current cash position", "what's in my wallets".
+
+• get_counterparty_details — identity/contact lookup for ONE party. "What currency is X", "X's phone", "what's Acme's email", "is X a customer or supplier", "details of X". Returns name, default_currency, phone, email, group per side. Don't use for balance — use query_balance_with_counterparty for that.
+
+═══════════════════════════════════════════════════════════════════
+EXTRACTION HINTS
+═══════════════════════════════════════════════════════════════════
+
+CHART OF ACCOUNTS — pick a category_code for cash/invoice/bill drafts (NOT for payments or transfers):
+
 ${coaListing}
 
-CATEGORIZATION — MANDATORY field: every transaction (except transfer) MUST have category_code set in the draft. The system will REJECT request_confirmation without it. You decide the code from the message — pick the closest match from the chart above. NEVER ask the user for a "code" or "category" — that's your job. If nothing reasonably fits an expense, default to 5900 Other Expenses; for income, default to 4000 Sales Revenue.
+  Decision order — pick the FIRST match in this list:
+    1. If message contains "purchase", "purchased", "bought ... stones/gems/parcel/stock/inventory", or it's clearly a supplier bill for goods → 5000 (COGS).
+    2. If message clearly matches a specific category by its keywords above → that category.
+    3. Income default → 4000 (Sales Revenue).
+    4. Expense fallback → 5900 (Other Expenses) — ONLY when nothing above fits and the word "purchase"/"goods"/"stock" is NOT present.
 
-CATEGORIZATION RULES — YOU decide, NEVER ask the user for a "code" or "category":
-- "lunch" / "dinner" / "coffee" / "restaurant" → 5100 Meals & Entertainment
-- "gas" / "fuel" / "petrol" / "vehicle service" / "car repair" → 5210 Vehicle Expenses
-- "flight" / "hotel" / "taxi" / "uber" / "grab" → 5200 Travel
-- "office supplies" / "stationary" / "printer paper" → 5300 Office Supplies
-- "insurance" → 5350 Insurance
-- "rent" → 5400 Rent
-- "electric" / "water bill" → 5500 Utilities
-- "phone" / "internet" / "wifi" / "mobile" → 5550 Telephone & Internet
-- "software" / "subscription" / "saas" / "netflix" → 5600 Software & Subscriptions
-- "lawyer" / "accountant" / "consultant" → 5700 Professional Services
-- "ads" / "marketing" / "promotion" → 5800 Marketing & Advertising
-- "bank fee" / "transfer charge" / "atm fee" → 5950 Bank Charges & Fees
-- inventory / goods bought for resale → 5000 Cost of Goods Sold
-- "sold X" / "sale of X" / ANY tangible item sold (gemstones, goods, inventory, products) → 4000 Sales Revenue (THIS IS THE DEFAULT FOR INCOME)
-- ONLY use 4100 Service Revenue when the user explicitly mentions a service/consulting/advisory/design fee/labor (NOT tangible goods)
-- interest / rent received / unspecified income → 4900 Other Income
-- nothing reasonably fits expense → 5900 Other Expenses (silently)
+ENTITY PARSING:
+• Counterparty: word right after "to" / "from" (single name or multi-word like "Jameel Crest Gems"). NEVER ask "who?" when "to <name>" is in the message.
+• Wallet identifier: "BBL", "SCB", "HSBC", "KBank" → wallet_name, payment_account_code='1100' (bank). "AmEx", "Visa", "Mastercard" → wallet_name, payment_account_code='2100' (card). Bare "cash" → payment_account_code='1000' (no wallet_name needed).
+• Amount: number + currency. If user wrote "5000 us$" or "5000 USD", currency="USD", amount=5000. If currency missing, default to ${user.default_currency} and the server will mark "(assumed)".
+• Date: "today"="${today}", "yesterday"=date-1, "last X"=relative. Default transaction_date=today.
+• Terms: "net 30"→"net_30", "in 7 days"→"net_7", "cash now"→no terms (leave blank).
+• Settlement: "X paid me Y" / "I paid X Y" → transaction_type='payment', direction follows. Use query_open_invoices first to find which invoice to settle. Set parent_invoice_ref=<erpnext_name from the result>.
 
-ACCOUNT MAPPING BY TRANSACTION TYPE — YOU decide, never ask:
-- cash expense: payment_account_code = 1000 Cash (or 1100/2100 if user mentions bank/card); category_code = expense category
-- cash income: payment_account_code = 1000 Cash (or 1100); category_code = revenue category (4000/4100)
-- invoice_issued: payment_account_code = 1200 Accounts Receivable; category_code = revenue category
-- bill_received: payment_account_code = 2000 Accounts Payable; category_code = expense category
-- payment (income, settling AR): payment_account_code = whatever user paid INTO (Cash/Bank/Card); category_code = 1200 Accounts Receivable
-- payment (expense, settling AP): payment_account_code = 2000 Accounts Payable; category_code = whatever user paid FROM (Cash/Bank/Card)
+PHONE COUNTRY CODE INFERENCE:
+If user types a phone WITHOUT "+", infer from user.country (${user.country}). Common: TH→+66, IN→+91, US→+1, GB→+44, SG→+65, MY→+60, ID→+62, AE→+971, HK→+852, AU→+61. Strip leading 0 of the local part when prepending. Briefly confirm: "Got it — +66 83 888 3866?".
 
-PAYMENT METHOD KEYWORDS:
-- default to 1000 Cash unless user mentions otherwise
-- "bank" / "transfer" / "wire" → 1100 Bank — Primary
-- "credit card" / "visa" / "mastercard" / "amex" → 2100 Credit Card
+═══════════════════════════════════════════════════════════════════
+RESPONSE RENDERING
+═══════════════════════════════════════════════════════════════════
 
-NEVER expose codes (like "5210" or "1000") to the user. Show only the readable NAMES.
-
-WORKFLOW:
-1. Each user message → call update_draft with EVERY field you can extract or infer.
-2. If required fields are still missing after extraction, ask ONE concise question for what's missing (never bundle questions).
-3. Every time you send the confirmation summary text — INITIAL or RE-ISSUE after any edit (rate change, amount fix, wallet swap, terms update, anything) — you MUST call request_confirmation in the SAME turn, BEFORE the text. The tool call is what triggers the WhatsApp Confirm/Reject button card; without it, your text reply goes out plain and the user has no buttons to tap. This rule applies on every re-summary, no exceptions: edited draft → request_confirmation → summary text. Use plain newlines only — NO trailing spaces, NO markdown soft-breaks, NO asterisks. Do NOT compose a "confirm to save?" style summary in plain text without first calling the tool — that's a bug, not the workflow:
+CONFIRMATION CARD — when you call request_confirmation and it returns ok:true, send the user the canonical card text below. Plain newlines, no markdown, no asterisks, no trailing spaces:
 
 Date: YYYY/MM/DD
-Amount: X,XXX CCY                                                  (transaction currency = reporting currency)
-Amount: X,XXX ${user.reporting_currency} (Y,YYY <foreign_ccy> @ R.RR)   (foreign currency — base PRIMARY, original in brackets with rate; rate is REQUIRED, never omit)
+Amount: <pick ONE form>
+   Form A (transaction currency == ${user.reporting_currency}):   Amount: X,XXX ${user.reporting_currency}
+   Form B (foreign currency):                                    Amount: X,XXX ${user.reporting_currency} (Y,YYY <foreign_ccy> @ R.RR)
 Type: <Expense | Income | Invoice Sent | Bill Received | Payment | Transfer>
 Account: <source_name> → <destination_name>
-Counterparty: <name>          (omit this line entirely if no counterparty)
-Due: YYYY/MM/DD (Net N)       (ONLY include for Invoice Sent or Bill Received; otherwise omit)
-Settles: <erpnext_name> from YYYY/MM/DD for X,XXX CCY    (ONLY include for Payment when parent_invoice_ref is set; otherwise omit. For partial/overpayment use the variants from "Receipt of money from..." rules above.)
-Note: <description>           (omit this line entirely if no description)
+Counterparty: <name>            (omit entirely if no counterparty)
+Due: YYYY/MM/DD (Net N)         (only for Invoice Sent or Bill Received)
+{settles_preview.rendered}      (only for Payment, when present — drop the rendered string in VERBATIM, including its own line break)
+Note: <description>             (omit if no description)
 
 Choose below or tell me what to fix.
 
-ACCOUNT ARROW DIRECTIONS — convention: "<credit side> → <debit side>" (source flows to destination):
-- Income (cash):              Sales Revenue → <wallet_name>          (revenue recognized, money lands in wallet)
-- Expense (cash):             <wallet_name> → <expense_category>      (money leaves wallet, expense recorded)
-- Opening Balance:            Opening Balance → <wallet_name>
-- Invoice Sent:               Sales Revenue → Receivable from <counterparty_name>
-- Bill Received:              <expense_category> → Payable to <counterparty_name>
-- Payment (income):           Receivable from <counterparty_name> → <wallet_name>   (receivable cleared, cash in)
-- Payment (expense):          <wallet_name> → Payable to <counterparty_name>        (cash out, payable cleared)
-- Transfer (between wallets): <source_wallet> → <destination_wallet>
-- Advance Out (money given):  <wallet_name> → Receivable from <counterparty_name>   (cash out, receivable created)
-- Advance In (money received): Payable to <counterparty_name> → <wallet_name>       (payable created, cash in)
+ACCOUNT ARROW (convention: "<credit side> → <debit side>"):
+- Cash income:       Sales Revenue → <wallet_name>
+- Cash expense:      <wallet_name> → <expense_category>
+- Invoice Sent:      Sales Revenue → Receivable from <counterparty_name>
+- Bill Received:     <expense_category> → Payable to <counterparty_name>
+- Payment received:  Receivable from <counterparty_name> → <wallet_name>
+- Payment made:      <wallet_name> → Payable to <counterparty_name>
 
-The key principle: for ANY income, the revenue/receivable side comes FIRST, the wallet/asset increase comes SECOND. NEVER write "Cash → Sales Revenue" for an income transaction — that's backward.
+QUERY ANSWERS — short, scannable, currency-grouped:
 
-For invoice/bill/payment flows, ALWAYS include the counterparty name on the receivable/payable side of the arrow — never write the bare phrase "Accounts Receivable" or "Accounts Payable" alone. This makes it clear who owes whom. Example: "Account: Receivable from Jameel Crest Gems → Sales Revenue".
+(query_balance_with_counterparty with party_type='Both' — render only sides that have data)
 
-4. User replies yes/save/ok/confirm/Confirm (case-insensitive — they may have tapped a button) → call save_transaction. The tool now pushes to ERPNext and returns an erpnext_name field (e.g. "ACC-JV-2026-00001"). Reply with EXACTLY these two lines, using that name:
+Both sides:
+"With Jameel Crest Gems:
+• Jameel owes you: 12,000 USD (1 invoice)
+• You owe Jameel: 3,000 USD (1 bill)
+• Net: 9,000 USD in your favor"
 
-Saved ✓
-Ref: <erpnext_name>
+Only AR:
+"With Jameel Crest Gems:
+• Jameel owes you: 45,000 USD (1 invoice)"
 
-5. User wants to change something → call update_draft with corrections, re-issue the summary.
-6. User says cancel/forget it/never mind/reject/Reject (case-insensitive — they may have tapped a button) → call cancel_transaction, reply briefly: "Cancelled. Send me the next transaction whenever you're ready."
+Only AP:
+"With Acme Gems:
+• You owe Acme: 5,000 USD (1 bill)"
 
-CONVERSATION STYLE:
-- WhatsApp: short, plain text, no markdown asterisks/headers.
-- TERSE: Aim for the fewest words that convey the answer. The user is busy.
-- NO TRAILING PLEASANTRIES. Don't end replies with "Let me know if you need anything else", "Hope that helps", "Feel free to ask", etc. — these are noise. End on the answer.
-- NO "How to use WhatsApp" instructions. The user knows how to share contacts, tap buttons, etc. Don't explain UI.
-- NO FILLER WORDS. Skip "Sure!", "Of course!", "Great question!", "Absolutely!". Just answer.
-- Acknowledgments are OK but ONE word: "Got it." / "Saved." / "Done." Not full sentences.
-- LINE BREAKS: when a reply has multiple distinct ideas (a statement, a question, an example, a hint), put each on its OWN LINE using a real newline. Don't pack them into a single paragraph. Example:
-   BAD: "You don't have any wallets yet. Would you like to add some? Just say 'add wallet BBL THB' to start."
-   GOOD: "You don't have any wallets yet.
-   Would you like to add some?
-   e.g. 'add wallet BBL THB'"
-   This applies to ANY reply with multiple sentences — questions, examples, hints, follow-ups all go on their own line.
-- Never invent fields the user didn't provide. If a field is genuinely ambiguous, ask once.
-- Don't dump the chart of accounts at the user. Don't show codes.
+Advance only (no invoices):
+"Jameel has 5,000 USD on advance with you — no open invoices."
 
-CONTEXT:
-- Today's date: ${today}
-- User's default currency: ${user.default_currency}
-- User's country: ${user.country}
-- Default tax rate: ${user.default_tax_rate ?? 'none'}
+Empty:
+"Nothing outstanding with Jameel."
 
-CURRENT DRAFT (in progress):
+(query_cash_bank_balance)
+"Cash position:
+• Cash (THB) — 12,000 THB
+• BBL Savings Bank (THB) — 200,000 THB
+• HSBC HK Bank (USD) — 8,000 USD
+Totals: 212,000 THB + 8,000 USD"
+
+(query_open_invoices)
+"You have 2 unpaid receivables:
+• ACC-SINV-2026-00001 to Jameel Crest Gems — 45,000 USD (1,444,500 THB @ 32.10), due 2026/06/11
+• ACC-SINV-2026-00003 to Vicky FEI — 50,000 USD (1,620,750 THB @ 32.415), due 2026/08/10"
+
+Show overdue with "(OVERDUE by N days)" tag. Empty results: state plainly.
+
+AMBIGUOUS RESPONSES — when a function returns ambiguous_wallet or ambiguous_counterparty, list candidates one per line, no numbers, no "reply with a number". User can reply with any natural form (name, "the HK one", "first", "1") — you map their reply back to a candidate, then call the function again with the full name.
+
+"I have multiple HSBC USD accounts — which one?
+• HSBC Hong Kong Bank (USD)
+• HSBC Singapore Bank (USD)"
+
+SUCCESS REPLIES — ONLY after a function returned ok:true:
+• Sale/bill saved:        "Saved ✓\\nRef: <erpnext_name>"
+• Payment saved:          "Saved ✓\\nRef: <erpnext_name>"
+• Wallet created:         "Added <wallet_name> <currency> <type> ✓" (+ "(opening balance N CCY)" if a JE was booked)
+• Counterparty created:   "Added <name> as a <currency> <party_type> ✓ (<phone if any>)"
+
+CHITCHAT (no function called):
+• Greeting → "Hey! I help log transactions and answer questions about your books. What would you like to do?"
+• Thanks → "Anytime."
+• Help → "I can log transactions ('sold X to Y for Z net 30', 'paid 250 for lunch'), and answer questions ('what's outstanding?', 'how much does X owe me?', 'what's in my wallets?'). Try one."
+• Off-topic → "I can only help with bookkeeping. Want to log something or check your books?"
+• Unclear → "Could you tell me what you'd like to do?"
+
+═══════════════════════════════════════════════════════════════════
+CONTEXT
+═══════════════════════════════════════════════════════════════════
+
+Today: ${today}
+User reporting currency: ${user.reporting_currency}
+User default currency: ${user.default_currency}
+User country: ${user.country}
+
+CURRENT DRAFT (in progress, may be empty):
 ${draftJson}`;
 }
 
@@ -819,16 +576,17 @@ async function loadConversation(userId) {
   return result.rows[0];
 }
 
-async function saveConversationState(userId, { draft, recentMessages, state }) {
+async function saveConversationState(userId, { draft, recentMessages, state, pendingTool }) {
   const now = new Date().toISOString();
   await query(
     `UPDATE conversations
-     SET draft_transaction = $1, recent_messages = $2, state = $3, last_message_at = $4, updated_at = $5
-     WHERE user_id = $6`,
+     SET draft_transaction = $1, recent_messages = $2, state = $3, pending_tool_args = $4, last_message_at = $5, updated_at = $6
+     WHERE user_id = $7`,
     [
       draft ? JSON.stringify(draft) : null,
       JSON.stringify(recentMessages || []),
       state || 'idle',
+      pendingTool ? JSON.stringify(pendingTool) : null,
       now,
       now,
       userId,
@@ -837,7 +595,7 @@ async function saveConversationState(userId, { draft, recentMessages, state }) {
 }
 
 async function resetConversation(userId) {
-  await saveConversationState(userId, { draft: null, recentMessages: [], state: 'idle' });
+  await saveConversationState(userId, { draft: null, recentMessages: [], state: 'idle', pendingTool: null });
 }
 
 function validateDraft(draft) {
@@ -858,32 +616,201 @@ function validateDraft(draft) {
   return missing;
 }
 
+// Tools whose partial args are persisted across turns. The `identifier` field
+// is what uniquely names the thing being created — same identifier across
+// calls = continuation of the same flow (merge args). Different identifier =
+// user moved on to a different thing (drop pending, start fresh).
+// Add a new entry here when you want a future standalone tool to get the
+// same robustness — no other code changes needed.
+const STANDALONE_TOOLS_WITH_PENDING = {
+  create_wallet: { identifier: 'wallet_name' },
+  create_counterparty: { identifier: 'name' },
+};
+
 async function executeTool(toolName, args, ctx) {
+  const pendingConfig = STANDALONE_TOOLS_WITH_PENDING[toolName];
+
+  // Pending-args merge — only when the user is continuing the SAME flow.
+  if (pendingConfig && ctx.pendingTool?.name === toolName && ctx.pendingTool.args) {
+    const idField = pendingConfig.identifier;
+    const newId = args[idField];
+    const oldId = ctx.pendingTool.args[idField];
+    if (!newId || newId === oldId) {
+      // Same flow → merge. New args override pending.
+      const merged = { ...ctx.pendingTool.args, ...args };
+      console.log(
+        `• [conversation] [${ts()}] merged pending args for ${toolName} (same ${idField}): ${JSON.stringify(merged)}`
+      );
+      args = merged;
+    } else {
+      // Different identifier → user is creating a different thing. Drop the
+      // orphaned pending and start fresh with just the new args.
+      console.log(
+        `• [conversation] [${ts()}] pending ${toolName} cleared — ${idField} changed from "${oldId}" to "${newId}"`
+      );
+      ctx.pendingTool = null;
+    }
+  }
+
+  // Run the tool. Returns inside the switch propagate through this wrapper.
+  const result = await _runTool(toolName, args, ctx);
+
+  // Post-process pending state based on result.
+  if (pendingConfig) {
+    if (result?.ok === true) {
+      ctx.pendingTool = null;
+    } else if (result?.needs_user_input) {
+      ctx.pendingTool = { name: toolName, args };
+    }
+  } else if (toolName === 'cancel_transaction' || toolName === 'save_transaction') {
+    // User changed intent / completed a transaction — drop any orphaned pending.
+    ctx.pendingTool = null;
+  }
+
+  return result;
+}
+
+async function _runTool(toolName, args, ctx) {
   switch (toolName) {
-    case 'update_draft':
+    case 'update_draft': {
       ctx.draft = { ...ctx.draft, ...args };
-      console.log(`• [conversation] [${ts()}] tool=update_draft draft=${JSON.stringify(ctx.draft)}`);
-      return { ok: true, current_draft: ctx.draft };
+
+      // Counterparty short-form resolution. If the LLM passed counterparty_name
+      // and it fuzzy-matches an existing cached customer/supplier, swap the
+      // short form for the full name SO the confirmation card shows the
+      // resolved identity. If there are MULTIPLE candidates, don't pick — return
+      // them to the LLM so it can ask the user. Only acts when counterparty_name
+      // was part of THIS update (so we don't repeatedly re-resolve on every call).
+      // Also tags _counterparty_known on the draft so the validator can ask for
+      // a phone number when this is a NEW counterparty being created.
+      if (args && Object.prototype.hasOwnProperty.call(args, 'counterparty_name') && args.counterparty_name) {
+        const wantedDoctype =
+          ctx.draft.transaction_type === 'bill_received' ? 'Supplier' : 'Customer';
+        const fuzzy = await query(
+          `SELECT name, erpnext_name FROM counterparty_cache
+           WHERE owner_user_id = $1 AND erpnext_doctype = $2
+             AND (LOWER(name) LIKE LOWER($3) OR LOWER($4) LIKE LOWER('%' || name || '%'))
+           ORDER BY id DESC`,
+          [ctx.user.id, wantedDoctype, `%${args.counterparty_name}%`, args.counterparty_name]
+        );
+        if (fuzzy.rowCount === 1 && fuzzy.rows[0].name !== args.counterparty_name) {
+          const fullName = fuzzy.rows[0].name;
+          ctx.draft.counterparty_name = fullName;
+          console.log(`• [conversation] [${ts()}] counterparty resolved "${args.counterparty_name}" → "${fullName}" (1 cache match)`);
+        } else if (fuzzy.rowCount > 1) {
+          const candidates = fuzzy.rows.map((r) => r.name);
+          console.log(`• [conversation] [${ts()}] counterparty ambiguous "${args.counterparty_name}" → ${candidates.join(', ')}`);
+          return {
+            ok: false,
+            error: `Multiple ${wantedDoctype.toLowerCase()}s match "${args.counterparty_name}". Ask the user which one and call update_draft again with the full name.`,
+            candidates,
+          };
+        }
+        // Server-only flag for the validator. Never set by the LLM.
+        ctx.draft._counterparty_known = fuzzy.rowCount > 0;
+      }
+
+      // For payments: pre-compute the Settles line server-side so the LLM
+      // doesn't have to remember the invoice's outstanding amount across
+      // turns. Hands back a verbatim string ready to drop into the card.
+      let settles_preview = null;
+      if (
+        ctx.draft.transaction_type === 'payment' &&
+        ctx.draft.parent_invoice_ref &&
+        ctx.draft.amount &&
+        ctx.draft.currency
+      ) {
+        try {
+          const erp = erpnext.forUser(ctx.user);
+          const refDoctype = ctx.draft.direction === 'expense' ? 'Purchase Invoice' : 'Sales Invoice';
+          const invR = await erp.getResource(refDoctype, ctx.draft.parent_invoice_ref);
+          const inv = invR.data;
+          if (inv) {
+            const outstanding = Number(inv.outstanding_amount) || 0;
+            const pay = Number(ctx.draft.amount);
+            const allocated = Math.min(pay, outstanding);
+            const unallocated = Math.max(0, pay - outstanding);
+            const remaining = Math.max(0, outstanding - pay);
+            const ccy = inv.currency;
+            const fmt = (n) => Number(n).toLocaleString('en-US');
+            // Two-line, scannable. Line 1 always identifies the invoice;
+            // line 2 communicates the consequence in the invoice's own
+            // currency (NOT the payment's converted base currency).
+            let rendered;
+            let status;
+            if (pay >= outstanding && unallocated === 0) {
+              status = 'full';
+              rendered = `Settles: ${inv.name}\nFully Paid`;
+            } else if (pay < outstanding) {
+              status = 'partial';
+              rendered = `Settles: ${inv.name}\nOutstanding: ${fmt(remaining)} ${ccy}`;
+            } else {
+              status = 'overpayment';
+              rendered = `Settles: ${inv.name}\nFully Paid + ${fmt(unallocated)} ${ccy} advance`;
+            }
+            settles_preview = {
+              invoice: inv.name,
+              invoice_currency: ccy,
+              outstanding_before: outstanding,
+              payment_amount: pay,
+              allocated,
+              unallocated,
+              remaining_after: remaining,
+              status,
+              rendered,
+            };
+          }
+        } catch (err) {
+          console.warn(`[conversation] settles_preview lookup failed: ${err.message}`);
+        }
+      }
+
+      // Run the central validator. The LLM uses `needs` to drive its next
+      // action — ask the user if needs_user_input items exist, otherwise
+      // auto-fix (e.g. fetch_exchange_rate) or proceed to request_confirmation.
+      const validation = validateDraftServer(ctx.draft, ctx.user);
+      console.log(
+        `• [conversation] [${ts()}] tool=update_draft draft=${JSON.stringify(ctx.draft)} ` +
+          `needs=${validation.needs.length}${validation.next_user_question ? ` next_ask="${validation.next_user_question.ask_user}"` : ''}` +
+          `${settles_preview ? ` settles=${settles_preview.status}` : ''}`
+      );
+      return {
+        ok: true,
+        current_draft: ctx.draft,
+        ready_to_confirm: validation.ready_to_confirm,
+        needs: validation.needs,
+        next_user_question: validation.next_user_question,
+        settles_preview,
+      };
+    }
 
     case 'request_confirmation': {
-      const missing = validateDraft(ctx.draft);
-      if (missing.length) {
+      // Single source of truth: the validator. If anything is still needed,
+      // reject and hand back the structured needs[] — the LLM will either ask
+      // the user (needs_user_input items) or auto-fix (e.g. fetch_exchange_rate).
+      const validation = validateDraftServer(ctx.draft, ctx.user);
+      if (!validation.ready_to_confirm) {
         return {
           ok: false,
-          error: `Required fields still missing: ${missing.join(', ')}. Ask the user for them before requesting confirmation.`,
+          error: 'Cannot confirm yet — draft is missing required pieces.',
+          needs: validation.needs,
+          next_user_question: validation.next_user_question,
         };
       }
-      // ERPNEXT-PIVOT TEMP: counterparty + wallet checks were removed (they referenced dropped tables).
-      // Will be re-added as ERPNext-backed checks during incremental rebuild.
       ctx.confirmationRequested = true;
       console.log(`• [conversation] [${ts()}] tool=request_confirmation user_id=${ctx.user.id}`);
       return { ok: true };
     }
 
     case 'save_transaction': {
-      const missing = validateDraft(ctx.draft);
-      if (missing.length) {
-        return { ok: false, error: `Cannot save; missing required fields: ${missing.join(', ')}.` };
+      const validation = validateDraftServer(ctx.draft, ctx.user);
+      if (!validation.ready_to_save) {
+        return {
+          ok: false,
+          error: 'Cannot save yet — draft is missing required pieces.',
+          needs: validation.needs,
+          next_user_question: validation.next_user_question,
+        };
       }
       try {
         const result = await erpSync.save(ctx.user, ctx.draft);
@@ -896,6 +823,28 @@ async function executeTool(toolName, args, ctx) {
         return result;
       } catch (err) {
         console.error('[conversation] save error:', err.message);
+        // Surface ambiguity errors with structured candidates so the LLM can
+        // present a natural-language picker (not just a stringy error).
+        if (err.code === 'AMBIGUOUS_WALLET') {
+          return {
+            ok: false,
+            error: err.message,
+            ambiguous_wallet: {
+              search_term: ctx.draft.wallet_name || '',
+              candidates: err.candidates.map((c) => c.account_name),
+            },
+          };
+        }
+        if (err.code === 'AMBIGUOUS_COUNTERPARTY') {
+          return {
+            ok: false,
+            error: err.message,
+            ambiguous_counterparty: {
+              search_term: ctx.draft.counterparty_name || '',
+              candidates: err.candidates.map((c) => c.name),
+            },
+          };
+        }
         return { ok: false, error: `Save failed: ${err.message}` };
       }
     }
@@ -946,40 +895,382 @@ async function executeTool(toolName, args, ctx) {
 
     case 'query_balance_with_counterparty': {
       try {
-        // Resolve user-facing name (potentially abbreviated, e.g. "Jameel")
-        // → ERPNext party name via cache. Uses LIKE so a short form matches
-        // a longer cached record. If multiple rows match, prefer the one
-        // whose erpnext_doctype matches the requested party_type, then by
-        // most-recent insertion (latest cached takes precedence on ties).
-        const cached = await query(
-          `SELECT erpnext_name, erpnext_doctype FROM counterparty_cache
-           WHERE owner_user_id = $1
-             AND LOWER(name) LIKE LOWER($2)
-           ORDER BY (CASE WHEN erpnext_doctype = $3 THEN 0 ELSE 1 END), id DESC
-           LIMIT 1`,
-          [ctx.user.id, `%${args?.counterparty_name || ''}%`, args?.party_type]
-        );
-        if (!cached.rowCount || !cached.rows[0].erpnext_name) {
+        const erp = erpnext.forUser(ctx.user);
+        const search = args?.counterparty_name || '';
+        const wantedDoctypes = args?.party_type === 'Both' ? ['Customer', 'Supplier'] : [args?.party_type];
+
+        async function resolveErpName(doctype) {
+          const cached = await query(
+            `SELECT erpnext_name FROM counterparty_cache
+             WHERE owner_user_id = $1 AND erpnext_doctype = $2
+               AND LOWER(name) LIKE LOWER($3)
+             ORDER BY id DESC
+             LIMIT 1`,
+            [ctx.user.id, doctype, `%${search}%`]
+          );
+          return cached.rows[0]?.erpnext_name || null;
+        }
+
+        const sides = {};
+        for (const doctype of wantedDoctypes) {
+          const erpName = await resolveErpName(doctype);
+          if (!erpName) {
+            sides[doctype.toLowerCase()] = null;
+            continue;
+          }
+          sides[doctype.toLowerCase()] = await erpQuery.getBalanceWithCounterparty(ctx.user, erp, {
+            partyType: doctype,
+            partyName: erpName,
+          });
+        }
+
+        // For single-direction queries: return the existing flat shape (backwards-compatible)
+        if (args?.party_type !== 'Both') {
+          const side = sides.customer || sides.supplier;
+          if (!side) {
+            return {
+              ok: false,
+              error: `Counterparty "${search}" not in counterparty_cache as a ${args?.party_type}. They may not exist in ERPNext yet — try creating an invoice/bill first, or check the spelling.`,
+            };
+          }
+          console.log(`• [conversation] [${ts()}] tool=query_balance_with_counterparty ${args?.party_type}=${side.partyName} net=${JSON.stringify(side.netByCurrency)}`);
+          return { ok: true, ...side };
+        }
+
+        // Both: combine sides. Convention used everywhere in the bot:
+        //   positive net = party owes us (asset side wins)
+        //   negative net = we owe party (liability side wins)
+        // Combined = customer_net (they owe us) − supplier_net (we owe them).
+        if (!sides.customer && !sides.supplier) {
           return {
             ok: false,
-            error: `Counterparty "${args?.counterparty_name}" not in counterparty_cache. They may not exist as a ${args?.party_type} in ERPNext yet — try creating an invoice/bill first, or check the spelling.`,
+            error: `Counterparty "${search}" not found in counterparty_cache as Customer or Supplier. They may not exist in ERPNext yet, or the name doesn't match — check the spelling.`,
           };
         }
-        const erpName = cached.rows[0].erpnext_name;
-        const erp = erpnext.forUser(ctx.user);
-        const balance = await erpQuery.getBalanceWithCounterparty(ctx.user, erp, {
-          partyType: args.party_type,
-          partyName: erpName,
-        });
-        console.log(`• [conversation] [${ts()}] tool=query_balance_with_counterparty ${args.party_type}=${erpName} net=${JSON.stringify(balance.netByCurrency)}`);
-        return { ok: true, ...balance };
+        const customerNet = sides.customer?.netByCurrency || {};
+        const supplierNet = sides.supplier?.netByCurrency || {};
+        const allCcy = new Set([...Object.keys(customerNet), ...Object.keys(supplierNet)]);
+        const combinedNet = {};
+        for (const ccy of allCcy) {
+          const net = (customerNet[ccy] || 0) - (supplierNet[ccy] || 0);
+          combinedNet[ccy] = Math.abs(net) > 0.005 ? net : 0;
+        }
+        const partyName = sides.customer?.partyName || sides.supplier?.partyName || search;
+        console.log(`• [conversation] [${ts()}] tool=query_balance_with_counterparty Both=${partyName} combined=${JSON.stringify(combinedNet)}`);
+        return {
+          ok: true,
+          party_type: 'Both',
+          partyName,
+          customer_side: sides.customer,
+          supplier_side: sides.supplier,
+          combined: { netByCurrency: combinedNet },
+        };
       } catch (err) {
         console.error('[conversation] query_balance_with_counterparty error:', err.message);
         return { ok: false, error: err.message };
       }
     }
 
+    case 'get_counterparty_details': {
+      try {
+        const erp = erpnext.forUser(ctx.user);
+        const search = args?.counterparty_name || '';
+        const partyType = args?.party_type || 'Both';
+        const wantedDoctypes = partyType === 'Both' ? ['Customer', 'Supplier'] : [partyType];
 
+        // Resolve short name → full ERPNext name via cache for each side.
+        async function resolveErpName(doctype) {
+          const r = await query(
+            `SELECT erpnext_name FROM counterparty_cache
+             WHERE owner_user_id = $1 AND erpnext_doctype = $2
+               AND LOWER(name) LIKE LOWER($3)
+             ORDER BY id DESC LIMIT 1`,
+            [ctx.user.id, doctype, `%${search}%`]
+          );
+          return r.rows[0]?.erpnext_name || null;
+        }
+
+        const sides = {};
+        for (const dt of wantedDoctypes) {
+          const erpName = await resolveErpName(dt);
+          if (!erpName) {
+            sides[dt.toLowerCase()] = null;
+            continue;
+          }
+          const fetched = await erpQuery.getCounterpartyDetails(ctx.user, erp, {
+            partyName: erpName,
+            partyType: dt,
+          });
+          sides[dt.toLowerCase()] = fetched[dt.toLowerCase()];
+        }
+
+        if (!sides.customer && !sides.supplier) {
+          return {
+            ok: false,
+            error: `Counterparty "${search}" not in counterparty_cache. They may not exist in ERPNext yet — try logging a transaction with them first.`,
+          };
+        }
+
+        console.log(`• [conversation] [${ts()}] tool=get_counterparty_details search="${search}" found=${[sides.customer?'C':null,sides.supplier?'S':null].filter(Boolean).join('+') || 'none'}`);
+        return { ok: true, ...sides };
+      } catch (err) {
+        console.error('[conversation] get_counterparty_details error:', err.message);
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case 'query_cash_bank_balance': {
+      try {
+        const erp = erpnext.forUser(ctx.user);
+        const balance = await erpQuery.getCashBankBalance(ctx.user, erp, {
+          asOf: args?.as_of || null,
+        });
+        console.log(`• [conversation] [${ts()}] tool=query_cash_bank_balance wallets=${balance.wallets.length} totals=${JSON.stringify(balance.totals_by_currency)}`);
+        return { ok: true, ...balance };
+      } catch (err) {
+        console.error('[conversation] query_cash_bank_balance error:', err.message);
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case 'create_counterparty': {
+      try {
+        const erp = erpnext.forUser(ctx.user);
+        const name = args?.name;
+        const partyType = args?.party_type;
+        const currency = args?.default_currency;
+
+        // Collect ALL missing fields and ask in one batched question so the
+        // user isn't drip-fed prompts one at a time. Server still validates
+        // each so the LLM can't sneak past with a partial payload.
+        const missing = [];
+        if (!name) {
+          missing.push({
+            field: 'name',
+            short: "their name",
+            full: "What's their name?",
+          });
+        }
+        if (!partyType) {
+          missing.push({
+            field: 'party_type',
+            short: 'whether they\'re a customer, supplier, or both',
+            full: `Is ${name || 'this contact'} a customer (buys from you), a supplier (you buy from them), or both?`,
+          });
+        }
+        if (!currency) {
+          missing.push({
+            field: 'default_currency',
+            short: 'what currency you usually trade with them in',
+            full: `What currency do you usually trade with ${name || 'them'} in?`,
+            examples: 'e.g. USD, THB, EUR',
+          });
+        }
+        if (missing.length > 0) {
+          // Build one batched ask_user — joined naturally. Single-field
+          // missing reads as a normal question; multi-field reads as one
+          // compound sentence.
+          let batched;
+          if (missing.length === 1) {
+            batched = missing[0].full;
+          } else {
+            // "I need a couple of things: <short A>, and <short B>."
+            const last = missing[missing.length - 1].short;
+            const head = missing.slice(0, -1).map((m) => m.short).join(', ');
+            batched = `Sure — I just need ${head} and ${last}.`;
+          }
+          return {
+            ok: false,
+            error: `create_counterparty needs: ${missing.map((m) => m.field).join(', ')}`,
+            needs_user_input: {
+              missing_fields: missing.map((m) => m.field),
+              ask_user: batched,
+            },
+          };
+        }
+
+        // Block exact-name duplicates. The bot's resolve flow for sales/
+        // purchases silently reuses existing contacts (correct UX during a
+        // transaction), but explicit create_counterparty is meant to add a
+        // NEW contact. If the name already exists, the user almost
+        // certainly means a different person — surface so they can disambiguate.
+        const dup = await query(
+          `SELECT name, erpnext_doctype FROM counterparty_cache
+             WHERE owner_user_id = $1 AND LOWER(name) = LOWER($2)
+             LIMIT 1`,
+          [ctx.user.id, name]
+        );
+        if (dup.rowCount > 0) {
+          return {
+            ok: false,
+            error: `A contact named "${dup.rows[0].name}" already exists.`,
+            needs_user_input: {
+              missing_fields: ['name'],
+              ask_user: `There's already a contact called "${dup.rows[0].name}" on file. If this is a different person, please use a more specific name (e.g. "${name} Trading" or "${name} (HK)"). If it's the same person, no need to add them — they're already in your contacts.`,
+            },
+          };
+        }
+
+        // Phone-uniqueness guard. Phone is the load-bearing identifier
+        // for B2B linking; two contacts with the same phone would create
+        // routing ambiguity. Block before creation.
+        if (args?.phone) {
+          const { assertPhoneUnused } = require('./erp-sync/contact-guard');
+          const phoneCheck = await assertPhoneUnused(ctx.user.id, name, args.phone);
+          if (!phoneCheck.ok) {
+            const other = phoneCheck.conflictsWith;
+            return {
+              ok: false,
+              error: `Phone ${args.phone} is already used by contact "${other.name}".`,
+              needs_user_input: {
+                missing_fields: ['phone'],
+                ask_user: `That phone number is already on file under "${other.name}". A phone can only belong to one contact in your books. Double-check the number, or use the existing contact if it's the same person.`,
+              },
+            };
+          }
+        }
+
+        const created = {};
+        if (partyType === 'Customer' || partyType === 'Both') {
+          created.customer = await resolveOrCreateCustomer(ctx.user, erp, name, {
+            currency,
+            phone: args?.phone || null,
+            email: args?.email || null,
+          });
+        }
+        if (partyType === 'Supplier' || partyType === 'Both') {
+          created.supplier = await resolveOrCreateSupplier(ctx.user, erp, name, {
+            currency,
+            phone: args?.phone || null,
+            email: args?.email || null,
+          });
+        }
+        console.log(`• [conversation] [${ts()}] tool=create_counterparty name="${name}" type=${partyType} currency=${currency} created=${JSON.stringify(created)}`);
+        return { ok: true, name, party_type: partyType, default_currency: currency, created };
+      } catch (err) {
+        console.error('[conversation] create_counterparty error:', err.message);
+        if (err.code === 'AMBIGUOUS_COUNTERPARTY') {
+          return {
+            ok: false,
+            error: err.message,
+            ambiguous_counterparty: {
+              search_term: args?.name || '',
+              candidates: err.candidates.map((c) => c.name),
+            },
+          };
+        }
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case 'create_wallet': {
+      try {
+        const erp = erpnext.forUser(ctx.user);
+        const walletName = args?.wallet_name;
+        const parentCode = args?.parent_code ? String(args.parent_code) : null;
+        const currency = args?.currency;
+        const openingBalance = typeof args?.opening_balance === 'number' ? args.opening_balance : null;
+        const openingSkipped = args?.opening_balance_skipped === true;
+
+        // Batch missing — same UX pattern as create_counterparty. Ask for
+        // everything needed in one compound question rather than drip.
+        const missing = [];
+        if (!walletName) {
+          missing.push({
+            field: 'wallet_name',
+            short: 'the name (e.g. BBL Savings, HSBC HK, AmEx Platinum)',
+            full: 'What\'s the name of the wallet?',
+          });
+        }
+        if (!parentCode) {
+          missing.push({
+            field: 'parent_code',
+            short: 'whether it\'s cash, bank, or credit card',
+            full: `Is ${walletName || 'this wallet'} a cash, bank, or credit-card account?`,
+          });
+        }
+        if (!currency) {
+          missing.push({
+            field: 'currency',
+            short: 'the currency',
+            full: `What currency is ${walletName || 'it'} in?`,
+            examples: 'e.g. USD, THB, EUR',
+          });
+        }
+        if (openingBalance === null && !openingSkipped) {
+          missing.push({
+            field: 'opening_balance',
+            short: 'the current balance on the wallet (or "skip" / "0" if you\'ll add later)',
+            full: `What's the current balance on ${walletName || 'this wallet'}? Reply 0 or "skip" if you'll set it later.`,
+          });
+        }
+        if (missing.length > 0) {
+          let batched;
+          if (missing.length === 1) {
+            batched = missing[0].full;
+          } else {
+            const last = missing[missing.length - 1].short;
+            const head = missing.slice(0, -1).map((m) => m.short).join(', ');
+            batched = `Sure — I just need ${head} and ${last}.`;
+          }
+          return {
+            ok: false,
+            error: `create_wallet needs: ${missing.map((m) => m.field).join(', ')}`,
+            needs_user_input: {
+              missing_fields: missing.map((m) => m.field),
+              ask_user: batched,
+            },
+          };
+        }
+
+        // Create / find the wallet itself.
+        const erpName = await resolveWalletAccount(erp, parentCode, currency, walletName);
+        console.log(`• [conversation] [${ts()}] tool=create_wallet name="${walletName}" code=${parentCode} currency=${currency} → ${erpName}`);
+
+        // Opening balance: book a JE if the user gave one > 0.
+        let openingJe = null;
+        if (openingBalance && openingBalance > 0) {
+          let rate = null;
+          if (currency !== (ctx.user.reporting_currency || 'THB')) {
+            const fx = await exchange.fetchRate(currency, ctx.user.reporting_currency || 'THB', null);
+            if (!fx || !fx.rate) {
+              return {
+                ok: false,
+                error: `created wallet ${erpName} but couldn't fetch FX rate to book opening balance — try again or set opening balance later.`,
+              };
+            }
+            rate = fx.rate;
+          }
+          openingJe = await recordOpeningBalance(ctx.user, erp, {
+            walletErpName: erpName,
+            walletCurrency: currency,
+            amount: openingBalance,
+            exchangeRate: rate,
+          });
+        }
+
+        return {
+          ok: true,
+          wallet_name: walletName,
+          erpnext_account_name: erpName,
+          opening_balance: openingBalance || 0,
+          opening_balance_je: openingJe,
+        };
+      } catch (err) {
+        console.error('[conversation] create_wallet error:', err.message);
+        if (err.code === 'AMBIGUOUS_WALLET') {
+          return {
+            ok: false,
+            error: err.message,
+            ambiguous_wallet: {
+              search_term: args?.wallet_name || '',
+              candidates: err.candidates.map((c) => c.account_name),
+            },
+          };
+        }
+        return { ok: false, error: err.message };
+      }
+    }
 
     default:
       return { ok: false, error: `Unknown tool: ${toolName}` };
@@ -994,6 +1285,7 @@ async function handle(user, userMessage) {
   const conv = await loadConversation(user.id);
   const draft = conv.draft_transaction ? JSON.parse(conv.draft_transaction) : {};
   const history = JSON.parse(conv.recent_messages || '[]');
+  const pendingTool = conv.pending_tool_args ? JSON.parse(conv.pending_tool_args) : null;
   const today = new Date().toISOString().slice(0, 10);
 
   const systemPrompt = await buildSystemPrompt({ user, draft, today });
@@ -1010,18 +1302,70 @@ async function handle(user, userMessage) {
     saved: null,
     cancelled: false,
     confirmationRequested: false,
+    // In-flight args for standalone tools (create_wallet, create_counterparty)
+    // that have been started but are waiting on more info. Merged into the
+    // next matching tool call by executeTool — same robustness pattern as
+    // draft persistence for transactions.
+    pendingTool: pendingTool || null,
+    // Track which tools succeeded during this turn — used by the bluff
+    // detector below to catch LLM "Added/Saved" responses that weren't
+    // backed by an actual tool call.
+    toolsSucceeded: new Set(),
   };
+
+  // Intent forcing: regex-detect intents that map cleanly to a single tool
+  // so we can force tool_choice on the LLM's first iteration. Bypasses model
+  // judgment for the brittle cases — the LLM has to call the tool, extracts
+  // whatever it can, server drives the rest via needs_user_input.
+  const lc = userMessage.toLowerCase().trim();
+  const isCreateWalletIntent =
+    /\b(add|create|new|set\s*up)\b/.test(lc) &&
+    /\b(wallet|bank\s*account|bank|cash\s*drawer|card|credit\s*card)\b/.test(lc) &&
+    !/\b(receive|payment|transfer|paid|spent|got|sold|invoice|bill)\b/.test(lc);
+  const isCreateCounterpartyIntent =
+    /\b(add|create|new|save)\b/.test(lc) &&
+    /\b(contact|customer|supplier|buyer|vendor|client)\b/.test(lc) &&
+    !/\b(invoice|bill|payment|sale|sold|bought)\b/.test(lc);
+  // Confirm/cancel replies while a confirmation card is on screen — the LLM
+  // has been re-calling request_confirmation instead of save_transaction
+  // here, so force the right tool.
+  const inConfirmingState = conv.state === 'confirming';
+  const isConfirmReply =
+    inConfirmingState &&
+    /^(confirm|yes|ok|okay|sure|save|approve|go|do it|yep|yeah|👍|✅)\b[\s.!]*$/i.test(lc);
+  const isCancelReply =
+    inConfirmingState &&
+    /^(no|cancel|abort|discard|reject|nope|nvm|nevermind|stop|don'?t|❌)\b[\s.!]*$/i.test(lc);
 
   let finalText = null;
 
   try {
     for (let i = 0; i < MAX_TOOL_LOOP_ITERATIONS; i++) {
+      // On the very first iteration ONLY, if we detected a clear intent,
+      // force the LLM to call the matching tool. Subsequent iterations are
+      // 'auto' so the LLM can chain (e.g. fetch_exchange_rate after save).
+      let toolChoice = 'auto';
+      if (i === 0) {
+        if (isConfirmReply) {
+          toolChoice = { type: 'function', function: { name: 'save_transaction' } };
+        } else if (isCancelReply) {
+          toolChoice = { type: 'function', function: { name: 'cancel_transaction' } };
+        } else if (isCreateWalletIntent) {
+          toolChoice = { type: 'function', function: { name: 'create_wallet' } };
+        } else if (isCreateCounterpartyIntent) {
+          toolChoice = { type: 'function', function: { name: 'create_counterparty' } };
+        }
+      }
+
       const iterStart = Date.now();
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        // Model is configurable via OPENAI_MODEL env var. Default is gpt-4o
+        // (more reliable tool-call following than gpt-4o-mini for this
+        // multi-rule prompt). Override to 'gpt-4o-mini' for cheaper dev work.
+        model: process.env.OPENAI_MODEL || 'gpt-4o',
         messages: llmMessages,
         tools: TOOLS,
-        tool_choice: 'auto',
+        tool_choice: toolChoice,
         temperature: 0.2,
         max_tokens: 600,
       });
@@ -1051,11 +1395,34 @@ async function handle(user, userMessage) {
             args = {};
           }
           const result = await executeTool(tc.function.name, args, ctx);
+          if (result && result.ok === true) {
+            ctx.toolsSucceeded.add(tc.function.name);
+          }
           llmMessages.push({
             role: 'tool',
             tool_call_id: tc.id,
             content: JSON.stringify(result),
           });
+
+          // Server-driven short-circuit: when a tool returns a fully-formed
+          // user-facing question (needs_user_input.ask_user OR a draft
+          // validation's next_user_question), send that text DIRECTLY to the
+          // user with no further LLM rewriting. Eliminates a class of bugs
+          // where the LLM rewords the question and drifts.
+          const directAsk =
+            result?.needs_user_input?.ask_user ||
+            result?.next_user_question?.ask_user ||
+            null;
+          if (directAsk) {
+            ctx._directAsk = directAsk;
+          }
+        }
+        // If any tool surfaced a direct user question, short-circuit: send
+        // that text without burning another LLM round to rephrase it.
+        if (ctx._directAsk) {
+          finalText = ctx._directAsk;
+          console.log(`• [conversation] [${ts()}] direct-ask short-circuit: "${ctx._directAsk.slice(0, 100)}"`);
+          break;
         }
         continue;
       }
@@ -1070,6 +1437,52 @@ async function handle(user, userMessage) {
 
   if (!finalText) finalText = 'Got it. Anything else?';
 
+  // BLUFF SCRUBBER — last-line defense against the LLM claiming success
+  // without an actual tool call. If the reply uses success language but no
+  // corresponding write tool returned ok:true this turn, replace the reply.
+  // (Confirmation cards trigger the same "Saved" phrasing — only catch
+  // when the user message was clearly a create/save intent AND zero
+  // success-bearing tools ran.)
+  const succeeded = ctx.toolsSucceeded;
+  const writeTools = ['save_transaction', 'create_counterparty', 'create_wallet'];
+  const writeSucceeded = writeTools.some((t) => succeeded.has(t));
+  const claimsSuccess = /\b(added|created|saved|posted|booked|done)\b/i.test(finalText);
+  if (claimsSuccess && !writeSucceeded && !ctx.confirmationRequested && !ctx.saved) {
+    console.warn(
+      `[conversation] BLUFF DETECTED — reply claimed success without any successful write tool. Scrubbing. tools_succeeded=${[...succeeded].join(',')} reply="${finalText.slice(0, 120)}"`
+    );
+    finalText =
+      "I started on that but didn't actually save anything — looks like I skipped a step. Could you say it once more so I can run it cleanly?";
+  }
+
+  // UNHANDLED-REQUEST LOG — when no tool succeeded this turn AND the reply
+  // looks like a fallback ("I can only help with bookkeeping" / "Could you
+  // tell me what you'd like to do"), capture the user's message into the
+  // unhandled_requests table. Drives the feature backlog and enables
+  // "we built it" notifications later.
+  const FALLBACK_PATTERNS = [
+    /i can only help with bookkeeping/i,
+    /could you tell me what you'?d like to do/i,
+    /i'?m not sure what to do/i,
+    /not sure how to help/i,
+  ];
+  const isFallback = FALLBACK_PATTERNS.some((p) => p.test(finalText));
+  if (isFallback && succeeded.size === 0) {
+    try {
+      const now = new Date().toISOString();
+      await query(
+        `INSERT INTO unhandled_requests
+           (user_id, message_text, bot_reply, status, created_at)
+         VALUES ($1, $2, $3, 'pending', $4)`,
+        [user.id, userMessage, finalText, now]
+      );
+      console.log(`• [conversation] [${ts()}] logged unhandled request: "${userMessage.slice(0, 80)}"`);
+    } catch (logErr) {
+      // Don't let logging failures break the user-facing flow.
+      console.error('[conversation] unhandled-log write failed:', logErr.message);
+    }
+  }
+
   if (ctx.saved || ctx.cancelled) {
     await resetConversation(user.id);
   } else {
@@ -1081,6 +1494,7 @@ async function handle(user, userMessage) {
     await saveConversationState(user.id, {
       draft: ctx.draft,
       recentMessages: newHistory,
+      pendingTool: ctx.pendingTool,
       state: ctx.confirmationRequested
         ? 'confirming'
         : Object.keys(ctx.draft).length > 0

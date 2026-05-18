@@ -5,6 +5,7 @@ const twilioClient = require('./twilio-client');
 const vcard = require('./vcard');
 const chitchat = require('./chitchat');
 const log = require('./log');
+const linkedTxn = require('./links/linked-transactions');
 
 const REGISTRATION_LINK_REPLY =
   "Hi! It looks like your number isn't registered yet. Please sign up at https://your-app.com/signup to link your WhatsApp number to your account.";
@@ -57,6 +58,12 @@ async function processIncomingMessage({ from, body, raw = null }) {
       return;
     }
 
+    // Capture WhatsApp ProfileName as the user's display_name (only sets it
+    // if not already populated — preserves any name the user set explicitly).
+    if (raw?.ProfileName) {
+      await users.captureProfileName(user.id, raw.ProfileName);
+    }
+
     const conv = await conversation.loadConversation(user.id);
     await messageLog.logIncoming(user.id, conv.id, body, raw);
 
@@ -70,6 +77,20 @@ async function processIncomingMessage({ from, body, raw = null }) {
         log.msgOut(from, cannedReply, 'chitchat');
         await twilioClient.sendText(from, cannedReply);
         return;
+      }
+
+      // B2B link acceptance/rejection: buyer replies "yes LINK-N" / "no LINK-N"
+      // to a proposed linked Sales Invoice. Handled out-of-band from the LLM.
+      try {
+        const linkReply = await linkedTxn.tryHandleLinkCommand(user, body || '');
+        if (linkReply) {
+          await messageLog.logOutgoing(user.id, conv.id, linkReply);
+          log.msgOut(from, linkReply, 'linked-txn');
+          await twilioClient.sendText(from, linkReply);
+          return;
+        }
+      } catch (err) {
+        console.error('[whatsapp] link command handler error:', err.message);
       }
     }
 
@@ -100,9 +121,32 @@ async function processIncomingMessage({ from, body, raw = null }) {
 
     await messageLog.logOutgoing(user.id, conv.id, text);
 
-    if (isConfirmation && text) {
+    // A "well-formed confirmation" is ANY text containing Date: and Amount:
+    // lines — that's the canonical card shape. We promote it to a template
+    // (button) card EVEN IF the LLM forgot to call request_confirmation,
+    // which happens after corrections (LLM updates the draft but skips the
+    // re-confirmation tool call). Trust the data, not the LLM's discipline.
+    const hasCardShape =
+      text &&
+      /\bAmount:/i.test(text) &&
+      /\bDate:/i.test(text);
+
+    if (hasCardShape) {
+      // Note when we're auto-promoting (LLM didn't call request_confirmation
+      // but the message body is clearly a confirmation card).
+      if (!isConfirmation) {
+        console.log('[whatsapp] auto-promoting card-shaped reply to template (LLM omitted request_confirmation)');
+      }
       log.msgOut(from, text, 'template');
       await twilioClient.sendConfirmation(from, text);
+    } else if (isConfirmation && text) {
+      // LLM called request_confirmation but the body has no card shape —
+      // surface honestly instead of sending a stub card.
+      const fallback =
+        "I got partway but couldn't put together a clean summary card. Can you rephrase the transaction in one line? (e.g. \"sold paraiba 5ct to Jameel Crest Gems for 20000 USD net 30\")";
+      console.warn(`[whatsapp] suppressed degenerate confirmation card. LLM reply was: ${text.slice(0, 200)}`);
+      log.msgOut(from, fallback);
+      await twilioClient.sendText(from, fallback);
     } else if (text) {
       log.msgOut(from, text);
       await twilioClient.sendText(from, text);

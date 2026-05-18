@@ -31,84 +31,8 @@
  */
 
 const { resolvePartyAccount } = require('./party-account');
+const { resolveWalletAccount } = require('./wallet');
 const { ts } = require('../log');
-
-/**
- * Find (or auto-create) a per-currency wallet leaf for the user.
- * Symmetric to resolvePartyAccount for Receivable/Payable — same shape, but
- * for Cash / Bank account types. Auto-creates "Cash USD - TTC" etc. on first use.
- *
- *   parentCode: '1000' (→ Cash) | '1100' (→ Bank). Anything else falls back to 'Cash'.
- *   currency:   ISO code matching the desired wallet currency.
- */
-const _walletCache = new Map();
-async function resolveWalletAccount(erp, parentCode, currency) {
-  const accountType = parentCode === '1100' ? 'Bank' : 'Cash';
-  const cacheKey = `${erp.company}|${accountType}|${currency}`;
-  if (_walletCache.has(cacheKey)) return _walletCache.get(cacheKey);
-
-  // Existing leaf?
-  const existing = await erp.listResource('Account', {
-    filters: [
-      ['company', '=', erp.company],
-      ['account_type', '=', accountType],
-      ['account_currency', '=', currency],
-      ['is_group', '=', 0],
-    ],
-    fields: ['name'],
-    limit: 1,
-  });
-  if (existing.data && existing.data.length > 0) {
-    _walletCache.set(cacheKey, existing.data[0].name);
-    return existing.data[0].name;
-  }
-
-  // Locate the parent group for this account type.
-  let parentAccount = null;
-  const groups = await erp.listResource('Account', {
-    filters: [
-      ['company', '=', erp.company],
-      ['account_type', '=', accountType],
-      ['is_group', '=', 1],
-    ],
-    fields: ['name'],
-    limit: 1,
-  });
-  if (groups.data && groups.data.length > 0) {
-    parentAccount = groups.data[0].name;
-  } else {
-    const anyLeaf = await erp.listResource('Account', {
-      filters: [
-        ['company', '=', erp.company],
-        ['account_type', '=', accountType],
-        ['is_group', '=', 0],
-      ],
-      fields: ['parent_account'],
-      limit: 1,
-    });
-    parentAccount = anyLeaf.data?.[0]?.parent_account || null;
-  }
-  if (!parentAccount) {
-    throw new Error(
-      `[erpnext] could not locate parent ${accountType} group account for company ${erp.company}`
-    );
-  }
-
-  // Create the per-currency leaf, e.g. "Cash USD" or "Bank USD".
-  const accountName = `${accountType} ${currency}`;
-  const result = await erp.createAccount({
-    account_name: accountName,
-    parent_account: parentAccount,
-    account_type: accountType,
-    account_currency: currency,
-  });
-  const erpName = result.data?.name;
-  console.log(
-    `• [conversation] [${ts()}] created ${accountType} account in ERPNext: ${erpName} (currency=${currency})`
-  );
-  _walletCache.set(cacheKey, erpName);
-  return erpName;
-}
 
 async function save(user, erp, draft) {
   if (!draft.parent_invoice_ref) {
@@ -152,8 +76,14 @@ async function save(user, erp, draft) {
 
   // 2. Resolve (or auto-create) a per-currency wallet leaf so paid_to / paid_from
   //    has currency matching the payment. Without this, ERPNext rejects a USD
-  //    payment landing in a THB-only cash account.
-  const walletAccount = await resolveWalletAccount(erp, draft.payment_account_code, draft.currency);
+  //    payment landing in a THB-only cash account. For Bank/Card the draft
+  //    must carry wallet_name so the leaf is identifiable later.
+  const walletAccount = await resolveWalletAccount(
+    erp,
+    draft.payment_account_code,
+    draft.currency,
+    draft.wallet_name || null
+  );
 
   // 3. Resolve the party account (Debtors/Creditors in payment currency).
   //    For Receive: paid_from = Debtors <CCY> (where the receivable sits).
@@ -218,7 +148,16 @@ async function save(user, erp, draft) {
     payload.unallocated_amount = unallocated;
   }
 
-  // 8. POST.
+  // 8. Bank/Card payments need reference_no + reference_date or ERPNext rejects:
+  //    "Reference No and Reference Date is mandatory for Bank transaction".
+  //    Use draft.payment_reference if the user provided one ("via SWIFT 12345"),
+  //    else default to the parent invoice ref so the entry is still traceable.
+  if (draft.payment_account_code === '1100' || draft.payment_account_code === '2100') {
+    payload.reference_no = draft.payment_reference || `Settles ${inv.name}`;
+    payload.reference_date = draft.transaction_date;
+  }
+
+  // 9. POST.
   const result = await erp.createPaymentEntry(payload);
   const erpName = result.data?.name;
 

@@ -15,6 +15,8 @@ const { ensureGenericSalesItem } = require('./item');
 const { resolveErpAccount } = require('./account');
 const { resolvePartyAccount } = require('./party-account');
 const { ts } = require('../log');
+const { query } = require('../db');
+const { proposeLink } = require('../links/linked-transactions');
 
 async function save(user, erp, draft) {
   if (!draft.counterparty_name) {
@@ -27,7 +29,7 @@ async function save(user, erp, draft) {
     email: draft.counterparty_email,
   });
 
-  const itemCode = await ensureGenericSalesItem(erp);
+  const itemCode = await ensureGenericSalesItem(user, erp);
 
   // Resolve income account from category_code (4000 → 4110 - Sales - TTC)
   const incomeAccount = await resolveErpAccount(
@@ -79,6 +81,42 @@ async function save(user, erp, draft) {
     `• [conversation] [${ts()}] saved Sales Invoice to ERPNext: ${erpName} ` +
       `(${draft.amount} ${draft.currency} for ${customerName}, due ${dueDate})`
   );
+
+  // B2B link: if we have a phone for this customer, park a linked_transactions
+  // row. If their phone matches a Berpal user, status='pending_buyer_confirmation'
+  // and we WhatsApp them now. If not, status='pending_buyer_signup' and the
+  // row claims itself when (if) they later sign up. Fire-and-forget.
+  try {
+    const linkRow = await query(
+      `SELECT linked_user_id, phone FROM counterparty_cache
+         WHERE owner_user_id = $1 AND erpnext_name = $2 AND erpnext_doctype = 'Customer'
+         LIMIT 1`,
+      [user.id, customerName]
+    );
+    const buyerUserId = linkRow.rows[0]?.linked_user_id;
+    const buyerPhone = linkRow.rows[0]?.phone || draft.counterparty_phone || null;
+    if (buyerUserId || buyerPhone) {
+      await proposeLink({
+        sellerUser: user,
+        sellerDoctype: 'Sales Invoice',
+        sellerDocName: erpName,
+        buyerUserId,
+        buyerPhone,
+        currency: draft.currency,
+        totalAmount: Number(draft.amount) || 0,
+        items: [
+          {
+            description: draft.description || `${customerName} invoice`,
+            qty: 1,
+            rate: Number(draft.amount) || 0,
+            amount: Number(draft.amount) || 0,
+          },
+        ],
+      });
+    }
+  } catch (err) {
+    console.warn(`• [conversation] [${ts()}] linked-txn propose skipped: ${err.message}`);
+  }
 
   return { ok: true, erpnext_name: erpName, doctype: 'Sales Invoice' };
 }

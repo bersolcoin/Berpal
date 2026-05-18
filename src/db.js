@@ -181,10 +181,119 @@ CREATE TABLE IF NOT EXISTS otp_attempts (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_attempts(phone);
+
+-- B2B link state — when seller and buyer are both Berpal users we mirror
+-- the transaction on both sides. Seller posts the Sales Invoice in their
+-- ERPNext first; buyer's Purchase Invoice is only created after the buyer
+-- explicitly accepts via a WhatsApp button. This table tracks the link
+-- end-to-end, including rejects / cancels for audit.
+CREATE TABLE IF NOT EXISTS linked_transactions (
+  id SERIAL PRIMARY KEY,
+
+  -- Seller side (already posted at row-insert time)
+  seller_user_id INTEGER NOT NULL REFERENCES users(id),
+  seller_doctype TEXT NOT NULL,          -- 'Sales Invoice', 'Payment Entry', ...
+  seller_doc_name TEXT NOT NULL,         -- ERPNext doc name on seller's side
+
+  -- Buyer side (populated after buyer accepts)
+  buyer_user_id INTEGER NOT NULL REFERENCES users(id),
+  buyer_doctype TEXT,                    -- 'Purchase Invoice', etc.
+  buyer_doc_name TEXT,
+
+  -- Snapshot of what was proposed (so we have it even if the seller
+  -- edits/cancels their invoice later)
+  currency TEXT NOT NULL,
+  total_amount NUMERIC NOT NULL,
+  items TEXT NOT NULL,                   -- JSON: [{code, name, qty, rate, amount}, ...]
+  notes TEXT,
+
+  status TEXT NOT NULL DEFAULT 'pending_buyer_confirmation',
+    -- 'pending_buyer_confirmation' = seller posted, buyer not yet responded
+    -- 'confirmed'                  = buyer accepted; buyer_doc_name populated
+    -- 'rejected'                   = buyer explicitly declined
+    -- 'cancelled'                  = seller cancelled before buyer responded
+    -- 'expired'                    = buyer didn't respond within window
+
+  proposed_at TEXT NOT NULL,             -- when seller's invoice posted
+  responded_at TEXT,                     -- when buyer accepted/rejected
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_linked_seller ON linked_transactions(seller_user_id);
+CREATE INDEX IF NOT EXISTS idx_linked_buyer ON linked_transactions(buyer_user_id);
+CREATE INDEX IF NOT EXISTS idx_linked_status ON linked_transactions(status);
+CREATE INDEX IF NOT EXISTS idx_linked_seller_doc ON linked_transactions(seller_user_id, seller_doctype, seller_doc_name);
+
+-- Unhandled-request log: every time the bot couldn't find a function to
+-- match the user's input, we capture it here. Drives the feature backlog
+-- (real demand from real users) and enables "we built it" notifications
+-- when the gap is closed.
+CREATE TABLE IF NOT EXISTS unhandled_requests (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  message_text TEXT NOT NULL,
+  bot_reply TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+    -- 'pending'  = newly logged, not yet triaged
+    -- 'resolved' = the feature was built; user not yet notified
+    -- 'notified' = user was sent the "we built it" message
+    -- 'dismissed' = not building this; closed without notification
+  notes TEXT,
+  resolved_at TEXT,
+  notified_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_unhandled_status ON unhandled_requests(status);
+CREATE INDEX IF NOT EXISTS idx_unhandled_user ON unhandled_requests(user_id);
+CREATE INDEX IF NOT EXISTS idx_unhandled_created ON unhandled_requests(created_at);
 `;
 
 async function migrate() {
   await query(SCHEMA);
+  // Idempotent additive column migrations live here. PG 9.6+ supports
+  // ADD COLUMN IF NOT EXISTS so re-running migrate() is safe.
+  await query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pending_tool_args TEXT`);
+
+  // Onboarding fields captured at signup. Surfaced on /settings, used by
+  // the bot for prompt-context (e.g. business_type changes how it asks
+  // about a sale: SKU+qty for product, just description+amount for service).
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS business_type TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS entity_type TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nature_of_business TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tax_id TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_line1 TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_line2 TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS city TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS state_province TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS postal_code TEXT`);
+
+  // Multi-tenancy: store the ERPNext Company abbreviation so we can compute
+  // per-company namespaces (Item Group, Warehouse prefix, etc.) without
+  // round-tripping to ERPNext on every request. UNIQUE because ERPNext
+  // enforces uniqueness on Company.abbr too — keep PG in sync.
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS erpnext_company_abbr TEXT`);
+  await query(`
+    DO $$ BEGIN
+      ALTER TABLE users
+        ADD CONSTRAINT users_erpnext_company_abbr_unique
+        UNIQUE (erpnext_company_abbr);
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$;
+  `);
+
+  // Counterparty cache: link to a platform user when the counterparty's
+  // phone matches a Berpal user. Drives the linked-transactions B2B flow.
+  await query(`ALTER TABLE counterparty_cache ADD COLUMN IF NOT EXISTS linked_user_id INTEGER REFERENCES users(id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_cp_cache_linked_user ON counterparty_cache(linked_user_id)`);
+
+  // Pending-invoice growth loop: invoices to non-users are stored with a
+  // phone instead of a buyer_user_id. When that phone later signs up, the
+  // post-provisioning binding step claims them. Relax buyer_user_id and
+  // add a buyer_phone column for matching.
+  await query(`ALTER TABLE linked_transactions ALTER COLUMN buyer_user_id DROP NOT NULL`);
+  await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_linked_buyer_phone ON linked_transactions(buyer_phone) WHERE buyer_user_id IS NULL`);
 }
 
 /**
