@@ -1,0 +1,45 @@
+/* Country flag sprites — used by <span class="fi fi-xx"> markup. Must come
+   before @tailwind directives because CSS spec requires @import first. */
+@import "flag-icons/css/flag-icons.min.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens — referenced via arbitrary values like bg-[var(--color-border)]. */
+:root {
+  --color-brand: #0f172a;
+  --color-brand-accent: #2563eb;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f8fafc;
+  --color-border: #e2e8f0;
+  --color-ink: #0f172a;
+  --color-ink-muted: #64748b;
+  --color-positive: #15803d;
+  --color-negative: #b91c1c;
+  --color-warning: #b45309;
+}
+
+html, body {
+  background: var(--color-surface-muted);
+  color: var(--color-ink);
+}
+
+/* Numeric values look better tabular */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Replace the browser's default <select> chevron (position varies by
+   browser) with a precisely-placed inline SVG. Use on any <select>
+   alongside our standard input padding. */
+.select-arrow {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3e%3cpath d='M1 1l4 4 4-4' stroke='%2394a3b8' stroke-width='1.5' fill='none' stroke-linecap='round'/%3e%3c/svg%3e");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 10px 6px;
+  padding-right: 32px;
+}

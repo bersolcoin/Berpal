@@ -23,3 +23,8 @@ data/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Next.js
+.next/
+out/
+next-env.d.ts

@@ -1,19 +1,33 @@
 {
-  "name": "ber-accounting-whatsapp-bot",
-  "version": "0.1.0",
-  "description": "WhatsApp bot via Twilio Sandbox — phase 1: echo reply over TwiML",
-  "main": "server.js",
+  "name": "berpal",
+  "version": "0.2.0",
+  "description": "AI bookkeeping bot (WhatsApp + web) backed by ERPNext.",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "legacy-start": "node server.js",
     "create-template": "node scripts/create-confirmation-template.js",
+    "create-otp-template": "node scripts/create-otp-template.js",
     "reset": "node scripts/reset-conversations.js"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "flag-icons": "^7.5.0",
+    "iron-session": "^8.0.4",
+    "libphonenumber-js": "^1.11.20",
+    "next": "^16.2.6",
     "openai": "^4.77.0",
     "pg": "^8.20.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
     "twilio": "^6.0.0"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17"
   }
 }
