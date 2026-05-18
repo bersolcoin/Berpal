@@ -64,6 +64,26 @@ function buildUserEmail({ phone, email }) {
   return `bot+${sanitized}@berpal.local`;
 }
 
+/**
+ * ERPNext's `Country` doctype is keyed on the full English name
+ * ("Australia", "United States", "Hong Kong"), not the ISO 3166-1
+ * alpha-2 code we get from libphonenumber-js. Convert before sending.
+ * Falls through to the original value if Intl.DisplayNames isn't
+ * available or can't resolve the code (we'd rather try the raw input
+ * than crash).
+ */
+function isoToCountryName(iso) {
+  if (!iso) return iso;
+  if (typeof iso === 'string' && iso.length > 2) return iso; // already a name
+  try {
+    const dn = new Intl.DisplayNames(['en'], { type: 'region' });
+    const name = dn.of(String(iso).toUpperCase());
+    return name || iso;
+  } catch {
+    return iso;
+  }
+}
+
 async function provisionTenant({
   phone,
   display_name,
@@ -99,13 +119,16 @@ async function provisionTenant({
   }
 
   // ── 1. Create Company ───────────────────────────────────────────────
+  // ERPNext Country lookup is by full English name, not ISO code.
+  const erpCountry = isoToCountryName(country);
+
   let companyName;
   try {
     const r = await admin.createResource('Company', {
       company_name: business_name,
       abbr,
       default_currency: currency,
-      country,
+      country: erpCountry,
       enable_perpetual_inventory: 1, // always on — UX gating happens in the web app
       ...(tax_id ? { tax_id } : {}),
     });
