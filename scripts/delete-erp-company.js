@@ -93,6 +93,12 @@ const COMPANY_SCOPED_LATE = ['Cost Center', 'Bank Account', 'Account', 'Warehous
     }
   }
 
+  // 0. Null out Company's default-link fields. They hold refs to
+  //    cost_center / default_*_account / etc. — without this step,
+  //    ERPNext refuses to delete those records ("Cost Center Main - ST
+  //    is linked with Company ...").
+  await clearCompanyDefaults(admin, company);
+
   // 1. Cancel + delete transactional docs (most-dependent first).
   for (const dt of COMPANY_SCOPED_TXN) {
     await cancelAndDeleteByCompany(admin, dt, company);
@@ -144,6 +150,56 @@ const COMPANY_SCOPED_LATE = ['Cost Center', 'Bank Account', 'Account', 'Warehous
   if (err.response) console.error('  response:', JSON.stringify(err.response).slice(0, 600));
   process.exit(1);
 });
+
+/**
+ * Null out Company default-link fields (cost_center, default_*_account
+ * etc.). Without this, ERPNext refuses to delete those linked records.
+ * Tolerant: missing fields on this version of ERPNext are skipped.
+ */
+async function clearCompanyDefaults(admin, company) {
+  const FIELDS_TO_CLEAR = [
+    'cost_center',
+    'round_off_cost_center',
+    'depreciation_cost_center',
+    'default_cash_account',
+    'default_bank_account',
+    'default_receivable_account',
+    'default_payable_account',
+    'default_income_account',
+    'default_expense_account',
+    'default_employee_advance_account',
+    'write_off_account',
+    'round_off_account',
+    'exchange_gain_loss_account',
+    'unrealized_exchange_gain_loss_account',
+    'unrealized_profit_loss_account',
+    'accumulated_depreciation_account',
+    'depreciation_expense_account',
+    'disposal_account',
+    'capital_work_in_progress_account',
+    'asset_received_but_not_billed',
+    'stock_received_but_not_billed',
+    'stock_adjustment_account',
+    'expenses_included_in_valuation',
+    'service_received_but_not_billed',
+    'default_provisional_account',
+    'default_in_transit_warehouse',
+    'default_warehouse_for_sales_return',
+    'default_buying_terms',
+    'default_selling_terms',
+    'default_holiday_list',
+    'default_finance_book',
+    'default_letter_head',
+  ];
+  const payload = {};
+  for (const f of FIELDS_TO_CLEAR) payload[f] = null;
+  try {
+    await admin.updateResource('Company', company, payload);
+    console.log(`  Company defaults cleared (${FIELDS_TO_CLEAR.length} fields)`);
+  } catch (err) {
+    console.warn(`  Company defaults clear warning: ${err.message.slice(0, 200)}`);
+  }
+}
 
 async function tallyDependents(admin, company) {
   const counts = {};
