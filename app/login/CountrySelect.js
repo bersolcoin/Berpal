@@ -102,7 +102,11 @@ export default function CountrySelect({ value, onChange }) {
       </button>
 
       {open && (
-        <div className="absolute z-50 mt-1 w-72 max-h-80 overflow-hidden bg-white border border-slate-200 rounded-lg shadow-lg flex flex-col">
+        // Popover spans the full form width on small screens and caps at
+        // the form max-width (28rem ≈ login form width) on desktop.
+        // text-base (16px) on the search input prevents iOS Safari's
+        // auto-zoom on focus.
+        <div className="absolute z-50 mt-1 left-0 w-[min(28rem,calc(100vw-3rem))] max-h-80 overflow-hidden bg-white border border-slate-200 rounded-lg shadow-lg flex flex-col">
           <div className="p-2 border-b border-slate-200 bg-slate-50">
             <input
               ref={inputRef}
@@ -110,12 +114,12 @@ export default function CountrySelect({ value, onChange }) {
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               placeholder="Search country or code…"
-              className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded outline-none focus:border-slate-400"
+              className="w-full px-3 py-2 text-base border border-slate-200 rounded outline-none focus:border-slate-400"
             />
           </div>
           <ul className="flex-1 overflow-y-auto py-1">
             {filtered.length === 0 ? (
-              <li className="px-3 py-2 text-sm text-slate-400">No matches</li>
+              <li className="px-3 py-2 text-base text-slate-400">No matches</li>
             ) : (
               filtered.map((c) => (
                 <li key={c.code}>
@@ -125,13 +129,13 @@ export default function CountrySelect({ value, onChange }) {
                       onChange(c.code);
                       setOpen(false);
                     }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 text-sm text-left hover:bg-slate-100 transition ${
+                    className={`w-full flex items-center gap-3 px-3 py-2 text-base text-left hover:bg-slate-100 transition ${
                       c.code === value ? 'bg-slate-100' : ''
                     }`}
                   >
                     <span className={`fi fi-${c.code.toLowerCase()} fis rounded-sm shrink-0 w-5 h-5`} aria-hidden="true" />
                     <span className="flex-1 truncate text-slate-800">{c.name}</span>
-                    <span className="text-slate-500 tabular text-xs">{c.dialCode}</span>
+                    <span className="text-slate-500 tabular text-sm">{c.dialCode}</span>
                   </button>
                 </li>
               ))
