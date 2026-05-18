@@ -161,10 +161,10 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="max-w-md mx-auto px-6 py-8 sm:py-16">
-      <img src="/logo.svg" alt="Berpal" className="w-9 h-9 mb-6 sm:mb-8" />
-      <h1 className="text-2xl font-semibold tracking-tight mb-2">Sign in</h1>
-      <p className="text-sm text-slate-600 mb-6">
+    <main className="max-w-md mx-auto px-6 py-6 sm:py-16">
+      <img src="/logo.svg" alt="Berpal" className="w-8 h-8 sm:w-9 sm:h-9 mb-4 sm:mb-8" />
+      <h1 className="text-xl sm:text-2xl font-semibold tracking-tight mb-1.5 sm:mb-2">Sign in</h1>
+      <p className="text-sm text-slate-600 mb-4 sm:mb-6">
         {step === STEPS.PHONE
           ? 'Enter your WhatsApp number — we’ll text you a one-time code.'
           : 'Enter the 6-digit code we just sent you.'}
@@ -207,7 +207,13 @@ export default function LoginPage() {
             disabled={busy || !national || !country}
             className="w-full py-3 bg-slate-900 text-white rounded-lg text-sm font-medium hover:bg-slate-800 disabled:opacity-50 transition"
           >
-            {busy ? 'Sending…' : detecting ? 'Detecting country…' : 'Send code'}
+            {busy ? (
+              'Sending…'
+            ) : detecting ? (
+              <span className="inline-block h-4 w-24 bg-white/30 rounded animate-pulse" />
+            ) : (
+              'Send code'
+            )}
           </button>
         </form>
       )}
@@ -255,8 +261,8 @@ export default function LoginPage() {
       {info && <p className="mt-4 text-sm text-emerald-700">{info}</p>}
       {error && <p className="mt-4 text-sm text-red-700">{error}</p>}
 
-      <div className="mt-8 sm:mt-12">
-        <p className="text-xs text-slate-500 leading-relaxed mb-3">
+      <div className="mt-6 sm:mt-12">
+        <p className="text-xs text-slate-500 leading-relaxed mb-2 sm:mb-3">
           Sandbox mode — first time? Join the Twilio WhatsApp sandbox.
           Opens WhatsApp with the join code pre-filled.
         </p>

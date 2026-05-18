@@ -106,7 +106,7 @@ export default function CountrySelect({ value, onChange }) {
         // the form max-width (28rem ≈ login form width) on desktop.
         // text-base (16px) on the search input prevents iOS Safari's
         // auto-zoom on focus.
-        <div className="absolute z-50 mt-1 left-0 w-[min(28rem,calc(100vw-3rem))] max-h-80 overflow-hidden bg-white border border-slate-200 rounded-lg shadow-lg flex flex-col">
+        <div className="absolute z-50 mt-1 left-0 w-[min(22rem,calc(100vw-3rem))] max-h-80 overflow-hidden bg-white border border-slate-200 rounded-lg shadow-lg flex flex-col">
           <div className="p-2 border-b border-slate-200 bg-slate-50">
             <input
               ref={inputRef}
