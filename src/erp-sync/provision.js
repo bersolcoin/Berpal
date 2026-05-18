@@ -30,6 +30,7 @@ const { recordOpeningBalance } = require('./opening-balance');
 const { ensureCompanyItemGroup } = require('./item-group');
 const { fetchRate } = require('../exchange');
 const { bindPendingByPhone } = require('../links/linked-transactions');
+const { refreshCoaCache } = require('./coa-cache');
 
 function deriveAbbreviation(businessName) {
   const words = businessName.trim().split(/\s+/).filter(Boolean);
@@ -384,6 +385,16 @@ async function provisionTenant({
   );
   const userId = upsert.rows[0]?.id;
   console.log(`• [provision] [${ts()}] users.id=${userId} provisioned (phone=${phone}, company=${companyName})`);
+
+  // ── 6.5. Seed the chart-of-accounts cache ───────────────────────────
+  // Pull the post-provisioning CoA snapshot (standard chart + the
+  // wallets we just created) into PG. Resolvers read from here going
+  // forward; ERPNext round-trips happen only on cache misses.
+  try {
+    await refreshCoaCache({ id: userId }, erp);
+  } catch (err) {
+    console.warn(`• [provision] [${ts()}] CoA cache seed failed: ${err.message}`);
+  }
 
   // ── 7. Claim any invoices waiting for this phone ─────────────────────
   // If suppliers have already sent invoices to this user's phone (before

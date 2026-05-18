@@ -297,6 +297,18 @@ async function migrate() {
   await query(`ALTER TABLE linked_transactions ALTER COLUMN buyer_user_id DROP NOT NULL`);
   await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
   await query(`CREATE INDEX IF NOT EXISTS idx_linked_buyer_phone ON linked_transactions(buyer_phone) WHERE buyer_user_id IS NULL`);
+
+  // Per-tenant chart-of-accounts cache. We seed it during provisionTenant
+  // and append to it on every account creation (wallets, party accounts).
+  // Users never edit ERPNext directly, so this is authoritative for the
+  // app — resolvers read from here instead of round-tripping to ERPNext.
+  await query(`
+    CREATE TABLE IF NOT EXISTS coa_cache (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      data TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
 }
 
 /**

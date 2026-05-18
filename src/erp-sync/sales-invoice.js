@@ -71,7 +71,7 @@ async function save(user, erp, draft) {
   // first use by resolvePartyAccount.
   if (draft.currency !== user.reporting_currency) {
     invoicePayload.conversion_rate = draft.exchange_rate || 1;
-    invoicePayload.debit_to = await resolvePartyAccount(erp, 'Receivable', draft.currency);
+    invoicePayload.debit_to = await resolvePartyAccount(erp, 'Receivable', draft.currency, user);
   }
 
   const result = await erp.createSalesInvoice(invoicePayload);

@@ -94,7 +94,7 @@ async function resolveOrCreateSupplier(
     // currency-matched Creditors leaf. Prevents ERPNext from locking the
     // supplier to whatever currency the FIRST bill happens to be in.
     if (currency) {
-      const payableAccount = await resolvePartyAccount(erp, 'Payable', currency);
+      const payableAccount = await resolvePartyAccount(erp, 'Payable', currency, user);
       supplierData.accounts = [{ company: erp.company, account: payableAccount }];
     }
 

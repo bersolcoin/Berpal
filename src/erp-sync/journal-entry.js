@@ -25,10 +25,22 @@ async function save(user, erp, draft) {
   }
 
   // ── Income / expense path ────────────────────────────────────────
-  // Resolve cash-side account (defaults to '1000' Cash)
+  // Cash side uses resolveWalletAccount — the canonical multi-currency-
+  // aware wallet lookup that creates a per-currency leaf on demand.
+  // (account.js previously handled this but its fuzzy match could
+  // return e.g. the THB Cash account for a USD txn, which corrupts
+  // the JE.)
   const cashCode = draft.payment_account_code || '1000';
-  const cashAccount = await resolveErpAccount(user, erp, cashCode, draft.currency);
+  let cashAccount;
+  try {
+    cashAccount = await resolveWalletAccount(
+      erp, cashCode, draft.currency, draft.wallet_name || null, user
+    );
+  } catch (err) {
+    return { ok: false, error: `Wallet lookup failed: ${err.message}` };
+  }
 
+  // Category side is a non-wallet chart account — use the category resolver.
   const categoryAccount = await resolveErpAccount(
     user, erp, draft.category_code, draft.currency
   );
@@ -40,16 +52,33 @@ async function save(user, erp, draft) {
     };
   }
 
+  // Multi-currency JE: if txn currency differs from the company's
+  // reporting currency, the wallet leg is in txn currency and the
+  // category leg is in company currency. ERPNext requires:
+  //   - multi_currency = 1 on the doc
+  //   - per-row exchange_rate (rate from row's account currency → company)
+  //   - amounts stated in each row's own account currency
+  const companyCcy = user.reporting_currency || 'THB';
+  const isMulti = draft.currency !== companyCcy;
+  const rate = isMulti ? (draft.exchange_rate || 1) : 1;
+  const amtTxn = Number(draft.amount);
+  const amtCompany = isMulti ? amtTxn * rate : amtTxn;
+
+  const cashRow = (debitOrCredit) => ({
+    account: cashAccount,
+    exchange_rate: rate,
+    [debitOrCredit + '_in_account_currency']: amtTxn,
+  });
+  const categoryRow = (debitOrCredit) => ({
+    account: categoryAccount,
+    exchange_rate: 1,
+    [debitOrCredit + '_in_account_currency']: amtCompany,
+  });
+
   const entries =
     draft.direction === 'expense'
-      ? [
-          { account: categoryAccount, debit_in_account_currency: draft.amount },
-          { account: cashAccount, credit_in_account_currency: draft.amount },
-        ]
-      : [
-          { account: cashAccount, debit_in_account_currency: draft.amount },
-          { account: categoryAccount, credit_in_account_currency: draft.amount },
-        ];
+      ? [categoryRow('debit'), cashRow('credit')]
+      : [cashRow('debit'), categoryRow('credit')];
 
   // For the title, follow the money: expense flows cash→category;
   // income flows category→cash.
@@ -66,6 +95,7 @@ async function save(user, erp, draft) {
     }),
     user_remark: draft.description || 'Bot entry',
     accounts: entries,
+    ...(isMulti ? { multi_currency: 1 } : {}),
     docstatus: 1,
   });
 
@@ -120,8 +150,8 @@ async function saveTransfer(user, erp, draft) {
 
   let srcAccount, dstAccount;
   try {
-    srcAccount = await resolveWalletAccount(erp, srcCode, draft.currency, draft.wallet_name || null);
-    dstAccount = await resolveWalletAccount(erp, dstCode, draft.currency, draft.transfer_destination_wallet_name || null);
+    srcAccount = await resolveWalletAccount(erp, srcCode, draft.currency, draft.wallet_name || null, user);
+    dstAccount = await resolveWalletAccount(erp, dstCode, draft.currency, draft.transfer_destination_wallet_name || null, user);
   } catch (err) {
     return { ok: false, error: `wallet resolution failed: ${err.message}` };
   }

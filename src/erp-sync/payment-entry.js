@@ -82,7 +82,8 @@ async function save(user, erp, draft) {
     erp,
     draft.payment_account_code,
     draft.currency,
-    draft.wallet_name || null
+    draft.wallet_name || null,
+    user
   );
 
   // 3. Resolve the party account (Debtors/Creditors in payment currency).
@@ -91,7 +92,8 @@ async function save(user, erp, draft) {
   const partyAccount = await resolvePartyAccount(
     erp,
     isIncome ? 'Receivable' : 'Payable',
-    draft.currency
+    draft.currency,
+    user
   );
 
   // 4. Compute allocation.

@@ -99,7 +99,7 @@ async function resolveOrCreateCustomer(
     // currency-matched Debtors leaf. Prevents ERPNext from locking the
     // customer to whatever currency the FIRST invoice happens to be in.
     if (currency) {
-      const receivableAccount = await resolvePartyAccount(erp, 'Receivable', currency);
+      const receivableAccount = await resolvePartyAccount(erp, 'Receivable', currency, user);
       customerData.accounts = [{ company: erp.company, account: receivableAccount }];
     }
 

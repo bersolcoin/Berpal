@@ -9,7 +9,21 @@ const { validateDraft: validateDraftServer } = require('./erp-sync/validate');
 const { resolveOrCreateCustomer } = require('./erp-sync/customer');
 const { resolveOrCreateSupplier } = require('./erp-sync/supplier');
 const { resolveWalletAccount } = require('./erp-sync/wallet');
+const { resolveErpAccount } = require('./erp-sync/account');
 const { recordOpeningBalance } = require('./erp-sync/opening-balance');
+
+// Inlined twin of app/(app)/_components/format.js#friendlyAccountName.
+// Kept duplicate (rather than require'd) because the app/ file is JSX/ESM
+// and not consumable from CommonJS src/. Keep both versions in sync.
+const ACCOUNT_ABBR_RE = /^[A-Z0-9]{2,10}$/;
+function friendlyAccountName(erpName) {
+  if (!erpName) return '';
+  const parts = String(erpName).split(' - ');
+  if (parts.length < 2) return erpName;
+  if (ACCOUNT_ABBR_RE.test(parts[parts.length - 1])) parts.pop();
+  if (parts.length > 1 && /^\d+$/.test(parts[0])) parts.shift();
+  return parts.join(' - ') || erpName;
+}
 
 // Account resolvers, customer/item resolvers, naming helpers, and ERP_CODE_MAP
 // all live in src/erp-sync/ — see imports at the top of this file.
@@ -505,6 +519,8 @@ ACCOUNT ARROW (convention: "<credit side> → <debit side>"):
 - Payment received:  Receivable from <counterparty_name> → <wallet_name>
 - Payment made:      <wallet_name> → Payable to <counterparty_name>
 
+IMPORTANT: when request_confirmation returns resolved_accounts (with wallet_display / category_display), use THOSE strings VERBATIM as <wallet_name> and <expense_category> in the Account: line. They are the real ERPNext leaf names the save will use (e.g. "cash (HKD)", "Miscellaneous Expenses") — showing generic words like "Cash" hides which currency leaf will be touched.
+
 QUERY ANSWERS — short, scannable, currency-grouped:
 
 (query_balance_with_counterparty with party_type='Both' — render only sides that have data)
@@ -692,6 +708,47 @@ const STANDALONE_TOOLS_WITH_PENDING = {
   create_counterparty: { identifier: 'name' },
 };
 
+/**
+ * Resolve the wallet + category leaves a save_transaction WOULD touch,
+ * without creating anything. Used by request_confirmation so the card
+ * shows the real leaf names ("cash (HKD)" / "Miscellaneous Expenses")
+ * instead of generic words ("Cash" / "Other Expenses") that hide the
+ * currency picked.
+ *
+ * Returns null on payment / transfer / invoice / bill drafts — those
+ * shapes don't use the same code path and the LLM template already
+ * handles their counterparty rendering. Returns null on lookup errors
+ * too (best-effort — never block confirmation).
+ */
+async function dryResolveAccounts(ctx) {
+  const draft = ctx.draft || {};
+  if (draft.transaction_type !== 'cash') return null;
+  if (draft.direction === 'transfer') return null;
+  if (!draft.payment_account_code || !draft.category_code || !draft.currency) return null;
+
+  try {
+    const erp = erpnext.forUser(ctx.user);
+    const [walletName, categoryName] = await Promise.all([
+      resolveWalletAccount(
+        erp,
+        draft.payment_account_code,
+        draft.currency,
+        draft.wallet_name || null,
+        ctx.user,
+        { dryRun: true }
+      ),
+      resolveErpAccount(ctx.user, erp, draft.category_code, draft.currency, { dryRun: true }),
+    ]);
+    return {
+      wallet_display: walletName ? friendlyAccountName(walletName) : null,
+      category_display: categoryName ? friendlyAccountName(categoryName) : null,
+    };
+  } catch (err) {
+    console.warn(`• [conversation] [${ts()}] dryResolveAccounts: ${err.message}`);
+    return null;
+  }
+}
+
 async function executeTool(toolName, args, ctx) {
   const pendingConfig = STANDALONE_TOOLS_WITH_PENDING[toolName];
 
@@ -738,7 +795,17 @@ async function executeTool(toolName, args, ctx) {
 async function _runTool(toolName, args, ctx) {
   switch (toolName) {
     case 'update_draft': {
+      const prevCurrency = ctx.draft.currency;
       ctx.draft = { ...ctx.draft, ...args };
+
+      // If the LLM swapped currencies mid-draft, any previously fetched
+      // exchange_rate is now stale and would mis-convert at save time.
+      // Drop it so the auto-fetch below (or the LLM's explicit
+      // fetch_exchange_rate fallback) refreshes it.
+      if (args && args.currency && args.currency !== prevCurrency) {
+        delete ctx.draft.exchange_rate;
+        delete ctx.draft.exchange_rate_source;
+      }
 
       // Counterparty short-form resolution. If the LLM passed counterparty_name
       // and it fuzzy-matches an existing cached customer/supplier, swap the
@@ -830,6 +897,49 @@ async function _runTool(toolName, args, ctx) {
         }
       }
 
+      // Server-side auto-defaults — collapse trivial round-trips that
+      // the LLM would otherwise spend an iteration on. Each guard is
+      // intentionally narrow so we never override what the LLM (or
+      // user) explicitly chose.
+      //
+      // (1) Cash expense/income with no wallet code → bare cash (1000).
+      //     Skipped for transfer (needs explicit source), payment
+      //     (often bank/card — let LLM pick), and invoice/bill (no wallet).
+      if (
+        ctx.draft.transaction_type === 'cash' &&
+        (ctx.draft.direction === 'expense' || ctx.draft.direction === 'income') &&
+        !ctx.draft.payment_account_code
+      ) {
+        ctx.draft.payment_account_code = '1000';
+        console.log(`• [conversation] [${ts()}] auto-default payment_account_code=1000 (cash ${ctx.draft.direction})`);
+      }
+
+      // (2) Cross-currency draft missing exchange_rate → fetch and inject.
+      //     If the fetch fails (network, bad pair, etc) we just skip
+      //     and the validator surfaces needs=[exchange_rate] so the LLM
+      //     falls back to its explicit fetch_exchange_rate tool.
+      const baseCcy = ctx.user.reporting_currency || ctx.user.default_currency || 'THB';
+      if (
+        ctx.draft.currency &&
+        ctx.draft.currency !== baseCcy &&
+        !ctx.draft.exchange_rate
+      ) {
+        try {
+          const fx = await exchange.fetchRate(
+            ctx.draft.currency,
+            baseCcy,
+            ctx.draft.transaction_date || null
+          );
+          if (fx && fx.rate) {
+            ctx.draft.exchange_rate = fx.rate;
+            ctx.draft.exchange_rate_source = fx.source;
+            console.log(`• [conversation] [${ts()}] auto-fetched FX ${ctx.draft.currency}->${baseCcy} = ${fx.rate} (${fx.source})`);
+          }
+        } catch (err) {
+          console.warn(`• [conversation] [${ts()}] auto-fetch FX failed: ${err.message}`);
+        }
+      }
+
       // Run the central validator. The LLM uses `needs` to drive its next
       // action — ask the user if needs_user_input items exist, otherwise
       // auto-fix (e.g. fetch_exchange_rate) or proceed to request_confirmation.
@@ -864,7 +974,13 @@ async function _runTool(toolName, args, ctx) {
       }
       ctx.confirmationRequested = true;
       console.log(`• [conversation] [${ts()}] tool=request_confirmation user_id=${ctx.user.id}`);
-      return { ok: true };
+
+      // Dry-resolve the accounts that save_transaction WOULD use, so the
+      // LLM can put the real leaf names on the confirmation card instead
+      // of generic words like "Cash". For brand-new wallets, we return
+      // what the leaf WOULD be named (no actual create).
+      const resolved = await dryResolveAccounts(ctx);
+      return { ok: true, ...(resolved ? { resolved_accounts: resolved } : {}) };
     }
 
     case 'save_transaction': {
@@ -1299,7 +1415,7 @@ async function _runTool(toolName, args, ctx) {
         }
 
         // Create / find the wallet itself.
-        const erpName = await resolveWalletAccount(erp, parentCode, currency, walletName);
+        const erpName = await resolveWalletAccount(erp, parentCode, currency, walletName, ctx.user);
         console.log(`• [conversation] [${ts()}] tool=create_wallet name="${walletName}" code=${parentCode} currency=${currency} → ${erpName}`);
 
         // Opening balance: book a JE if the user gave one > 0.

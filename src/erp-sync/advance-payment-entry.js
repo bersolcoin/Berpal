@@ -96,7 +96,8 @@ async function save(user, erp, draft) {
       erp,
       draft.payment_account_code,
       draft.currency,
-      draft.wallet_name || null
+      draft.wallet_name || null,
+      user
     );
   } catch (err) {
     return { ok: false, error: `wallet resolution failed: ${err.message}` };
@@ -106,7 +107,8 @@ async function save(user, erp, draft) {
   const partyAccount = await resolvePartyAccount(
     erp,
     partyType === 'Customer' ? 'Receivable' : 'Payable',
-    draft.currency
+    draft.currency,
+    user
   );
 
   // Build the Payment Entry. NO references — full amount becomes unallocated.

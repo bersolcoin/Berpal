@@ -116,13 +116,26 @@ export function Flag({ country, currency, square = true, className = '' }) {
 }
 
 /**
- * Strip ERPNext's account-name decoration: "1110 - Cash - TTC" → "Cash"
+ * Strip ERPNext's account-name decoration:
+ *   "1110 - Cash - TTC"               → "Cash"
+ *   "BBL Savings Bank (THB) - TTC"    → "BBL Savings Bank (THB)"
+ *   "5219 - Exchange Gain/Loss - TTC" → "Exchange Gain/Loss"
+ *
+ * Strategy: split on " - ", strip the leading element if numeric (the
+ * chart code) and the trailing element if it looks like a company abbr
+ * (2–10 chars, mostly uppercase / digits). Rejoin what's left.
  */
+const ABBR_RE = /^[A-Z0-9]{2,10}$/;
+
 export function friendlyAccountName(erpName) {
   if (!erpName) return '';
   const parts = String(erpName).split(' - ');
-  if (parts.length >= 3) return parts.slice(1, -1).join(' - ');
-  return erpName;
+  if (parts.length < 2) return erpName;
+  // Drop trailing abbr.
+  if (ABBR_RE.test(parts[parts.length - 1])) parts.pop();
+  // Drop leading numeric code.
+  if (parts.length > 1 && /^\d+$/.test(parts[0])) parts.shift();
+  return parts.join(' - ') || erpName;
 }
 
 /**

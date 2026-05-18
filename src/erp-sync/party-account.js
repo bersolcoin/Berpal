@@ -18,10 +18,12 @@
  */
 
 const { ts } = require('../log');
+const { getNextAccountNumber } = require('./account-numbering');
+const { upsertAccountInCoaCache } = require('./coa-cache');
 
 const _cache = new Map();
 
-async function resolvePartyAccount(erp, accountType, currency) {
+async function resolvePartyAccount(erp, accountType, currency, user = null) {
   const cacheKey = `${erp.company}|${accountType}|${currency}`;
   if (_cache.has(cacheKey)) return _cache.get(cacheKey);
 
@@ -77,17 +79,37 @@ async function resolvePartyAccount(erp, accountType, currency) {
   // 3. Create the per-currency leaf.
   const baseName = accountType === 'Receivable' ? 'Debtors' : 'Creditors';
   const accountName = `${baseName} ${currency}`;
+  const accountNumber = await getNextAccountNumber(erp, parentAccount);
   const result = await erp.createAccount({
     account_name: accountName,
     parent_account: parentAccount,
     account_type: accountType,
     account_currency: currency,
+    ...(accountNumber ? { account_number: accountNumber } : {}),
   });
   const erpName = result.data?.name;
   console.log(
     `• [conversation] [${ts()}] created ${accountType} account in ERPNext: ${erpName} (currency=${currency})`
   );
   _cache.set(cacheKey, erpName);
+
+  if (user?.id) {
+    try {
+      await upsertAccountInCoaCache(user.id, {
+        name: erpName,
+        account_name: accountName,
+        account_number: accountNumber || null,
+        account_type: accountType,
+        root_type: accountType === 'Receivable' ? 'Asset' : 'Liability',
+        account_currency: currency,
+        is_group: 0,
+        parent_account: parentAccount,
+      });
+    } catch (err) {
+      console.warn(`• [coa-cache] [${ts()}] append failed for ${erpName}: ${err.message}`);
+    }
+  }
+
   return erpName;
 }
 

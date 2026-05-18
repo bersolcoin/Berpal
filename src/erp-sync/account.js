@@ -24,6 +24,7 @@
 
 const { query } = require('../db');
 const { ts } = require('../log');
+const { filterAccounts } = require('./coa-cache');
 
 /**
  * Each code → an array of resolution attempts. Each attempt returns the
@@ -34,15 +35,17 @@ const { ts } = require('../log');
  */
 const CODE_RESOLVERS = {
   // ── Assets ────────────────────────────────────────────────────────
-  '1000': [{ account_type: 'Cash' }],
-  '1100': [{ account_type: 'Bank' }],
+  // Wallet codes (1000 Cash, 1100 Bank, 2100 Credit Card) intentionally
+  // NOT here — use wallet.js's resolveWalletAccount instead. That helper
+  // is currency-aware (creates per-currency leaves on demand) and
+  // supports a wallet_name (so "BBL" vs "SCB" resolve correctly). Letting
+  // both paths exist caused a "USD txn lands in THB cash account" bug.
   '1200': [{ account_type: 'Receivable' }],
   '1300': [{ root_type: 'Asset', namePrefer: ['Prepaid', 'Prepayment'] }],
   '1400': [{ root_type: 'Asset', namePrefer: ['Other Receivable', 'Other Asset'] }],
 
   // ── Liabilities ───────────────────────────────────────────────────
   '2000': [{ account_type: 'Payable' }],
-  '2100': [{ account_type: 'Credit Card' }],
   '2200': [{ root_type: 'Liability', namePrefer: ['Other Payable', 'Other Liability'] }],
 
   // ── Equity ────────────────────────────────────────────────────────
@@ -75,7 +78,38 @@ const CODE_RESOLVERS = {
 };
 
 /**
- * Try one resolution attempt. Returns the ERPNext account name or null.
+ * Apply namePrefer keyword preference + fallback to the first row.
+ * Shared between the cache-first path and the live-API fallback.
+ */
+function pickByNamePrefer(accounts, namePrefer) {
+  if (namePrefer?.length) {
+    for (const kw of namePrefer) {
+      const hit = accounts.find((a) =>
+        (a.account_name || '').toLowerCase().includes(kw.toLowerCase()) ||
+        (a.name || '').toLowerCase().includes(kw.toLowerCase())
+      );
+      if (hit) return hit.name;
+    }
+  }
+  return accounts[0].name;
+}
+
+/**
+ * Cache-first resolution attempt. Reads from coa_cache (no ERPNext call).
+ * Returns null on miss so the caller can fall back to the live API path.
+ */
+async function tryAttemptFromCache(userId, attempt) {
+  const where = { is_group: false };
+  if (attempt.account_type) where.account_type = attempt.account_type;
+  if (attempt.root_type) where.root_type = attempt.root_type;
+  const accounts = await filterAccounts(userId, where);
+  if (accounts.length === 0) return null;
+  return pickByNamePrefer(accounts, attempt.namePrefer);
+}
+
+/**
+ * Live-API resolution attempt. Round-trips ERPNext. Only used when the
+ * cache is empty (legacy tenants) or when a cache miss falls through.
  */
 async function tryAttempt(erp, attempt) {
   const filters = [
@@ -89,23 +123,12 @@ async function tryAttempt(erp, attempt) {
   const r = await erp.listAccounts({ filters, limit: 100 });
   const accounts = r.data || [];
   if (accounts.length === 0) return null;
-
-  // Name-keyword preference: pick the first account whose name contains
-  // any of the preferred keywords. Falls back to the first account.
-  if (attempt.namePrefer?.length) {
-    for (const kw of attempt.namePrefer) {
-      const hit = accounts.find((a) =>
-        (a.account_name || '').toLowerCase().includes(kw.toLowerCase()) ||
-        (a.name || '').toLowerCase().includes(kw.toLowerCase())
-      );
-      if (hit) return hit.name;
-    }
-  }
-  return accounts[0].name;
+  return pickByNamePrefer(accounts, attempt.namePrefer);
 }
 
-async function resolveErpAccount(user, erp, ourCode, currency = null) {
+async function resolveErpAccount(user, erp, ourCode, currency = null, opts = {}) {
   const cur = currency || user.reporting_currency || 'THB';
+  const { dryRun = false } = opts;
 
   // Cache hit?
   const cached = await query(
@@ -124,18 +147,40 @@ async function resolveErpAccount(user, erp, ourCode, currency = null) {
     return null;
   }
 
+  // Cache-first: walk attempts against the coa_cache snapshot. Almost
+  // every lookup is satisfied here — zero ERPNext round-trips on the
+  // happy path. The cache is kept current by wallet.js / party-account.js
+  // upserts and the refresh-coa-cache script.
   let erpName = null;
-  for (const attempt of attempts) {
-    erpName = await tryAttempt(erp, attempt);
-    if (erpName) break;
+  if (user?.id) {
+    for (const attempt of attempts) {
+      erpName = await tryAttemptFromCache(user.id, attempt);
+      if (erpName) break;
+    }
+  }
+
+  // Fall back to live ERPNext only if the cache turned up nothing
+  // (legacy tenants without a seeded cache, or a rare cache-out-of-sync).
+  // dryRun (used by request_confirmation) MUST stay read-only — skip
+  // the live ERPNext call (any network failure here would block the
+  // confirmation card unnecessarily) and just return null.
+  if (!erpName && !dryRun) {
+    for (const attempt of attempts) {
+      erpName = await tryAttempt(erp, attempt);
+      if (erpName) break;
+    }
   }
   if (!erpName) {
+    if (dryRun) return null;
     console.warn(
       `× [account] [${ts()}] could not resolve code "${ourCode}" for company "${erp.company}" ` +
         `(tried ${attempts.length} attempt${attempts.length === 1 ? '' : 's'})`
     );
     return null;
   }
+
+  // dryRun must not write to the account_cache table either.
+  if (dryRun) return erpName;
 
   // Write to cache (idempotent via ON CONFLICT)
   const now = new Date().toISOString();
