@@ -147,7 +147,7 @@ export default function LoginPage() {
                 type="tel"
                 inputMode="tel"
                 autoFocus
-                placeholder="838883866"
+                placeholder="818-8888"
                 value={national}
                 onChange={(e) => setNational(e.target.value.replace(/[^\d\s]/g, ''))}
                 disabled={busy}
