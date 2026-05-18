@@ -218,6 +218,10 @@ own subdomains. Zero code changes needed — no Next.js basePath gymnastics.
 
 _(not committed to building — capture and forget until they re-surface)_
 
+- Dark mode — follow `prefers-color-scheme` automatically (Tailwind's `dark:`
+  variant + a small ThemeProvider). Design tokens in globals.css already use
+  CSS custom properties so a `:root.dark { … }` block can swap them cleanly.
+  Per-user override (Light / Dark / System) in /settings later.
 - P&L view (Revenue → COGS → Gross Profit → Operating Expenses → Net Profit) — would be a real first "report"
 - Balance Sheet view
 - Cash-flow forecast view (based on open invoices + due dates)
