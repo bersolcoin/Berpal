@@ -218,13 +218,16 @@ async function tallyDependents(admin, company) {
 }
 
 /**
- * Pull rows in batches, cancel submitted ones (PUT docstatus=2), then
- * delete them all.
+ * Pull rows in batches, cancel submitted ones (via frappe.client.cancel
+ * which is the proper REST entrypoint for cancellation — PUT docstatus
+ * doesn't always work), then delete. Bails out of the outer loop if a
+ * batch makes zero progress (all rows failed to delete), so we don't
+ * loop forever on a persistently-blocked doc.
  */
 async function cancelAndDeleteByCompany(admin, doctype, company) {
   let totalCancelled = 0;
   let totalDeleted = 0;
-  let totalSkipped = 0;
+  const errorsSeen = [];
   while (true) {
     let r;
     try {
@@ -239,36 +242,59 @@ async function cancelAndDeleteByCompany(admin, doctype, company) {
     }
     const rows = r.data || [];
     if (rows.length === 0) break;
+    let deletedThisBatch = 0;
     for (const row of rows) {
       try {
         if (row.docstatus === 1) {
-          await admin.updateResource(doctype, row.name, { docstatus: 2 });
-          totalCancelled += 1;
+          // Use frappe.client.cancel — the supported REST entrypoint.
+          try {
+            await admin.callMethod('frappe.client.cancel', { doctype, name: row.name });
+            totalCancelled += 1;
+          } catch (cancelErr) {
+            // If cancel via method fails, try PUT as a fallback.
+            await admin.updateResource(doctype, row.name, { docstatus: 2 });
+            totalCancelled += 1;
+          }
         }
         await admin.deleteResource(doctype, row.name);
         totalDeleted += 1;
+        deletedThisBatch += 1;
       } catch (err) {
-        totalSkipped += 1;
-        if (totalSkipped <= 3) {
-          console.warn(`    ${doctype} "${row.name}": ${err.message.slice(0, 120)}`);
+        if (errorsSeen.length < 3) {
+          errorsSeen.push(`${doctype} "${row.name}": ${err.message}`);
         }
       }
     }
+    // No progress this round → stop retrying.
+    if (deletedThisBatch === 0) break;
   }
-  if (totalDeleted || totalSkipped) {
-    console.log(
-      `  ${doctype.padEnd(20)} deleted=${totalDeleted} cancelled=${totalCancelled} skipped=${totalSkipped}`
-    );
+  const stillThere = await currentCount(admin, doctype, company);
+  console.log(
+    `  ${doctype.padEnd(20)} deleted=${totalDeleted} cancelled=${totalCancelled} remaining=${stillThere}`
+  );
+  for (const e of errorsSeen) console.warn(`    ${e}`);
+}
+
+async function currentCount(admin, doctype, company) {
+  try {
+    const r = await admin.callMethod('frappe.client.get_count', {
+      doctype,
+      filters: [['company', '=', company]],
+    });
+    return Number(r.message) || 0;
+  } catch {
+    return '?';
   }
 }
 
 /**
  * Delete rows directly (no cancel step). For doctypes that don't have
  * a docstatus / submission concept (GL Entry, Stock Ledger Entry, etc.).
+ * Same progress-check bail as cancelAndDeleteByCompany.
  */
 async function deleteByCompany(admin, doctype, company) {
   let totalDeleted = 0;
-  let totalSkipped = 0;
+  const errorsSeen = [];
   while (true) {
     let r;
     try {
@@ -283,21 +309,25 @@ async function deleteByCompany(admin, doctype, company) {
     }
     const rows = r.data || [];
     if (rows.length === 0) break;
+    let deletedThisBatch = 0;
     for (const row of rows) {
       try {
         await admin.deleteResource(doctype, row.name);
         totalDeleted += 1;
+        deletedThisBatch += 1;
       } catch (err) {
-        totalSkipped += 1;
-        if (totalSkipped <= 3) {
-          console.warn(`    ${doctype} "${row.name}": ${err.message.slice(0, 120)}`);
+        if (errorsSeen.length < 3) {
+          errorsSeen.push(`${doctype} "${row.name}": ${err.message}`);
         }
       }
     }
+    if (deletedThisBatch === 0) break;
   }
-  if (totalDeleted || totalSkipped) {
-    console.log(`  ${doctype.padEnd(20)} deleted=${totalDeleted} skipped=${totalSkipped}`);
+  const stillThere = await currentCount(admin, doctype, company);
+  if (totalDeleted || stillThere > 0) {
+    console.log(`  ${doctype.padEnd(20)} deleted=${totalDeleted} remaining=${stillThere}`);
   }
+  for (const e of errorsSeen) console.warn(`    ${e}`);
 }
 
 /**
@@ -323,17 +353,18 @@ async function deleteAccountsLeafFirst(admin, company) {
   accounts.sort((a, b) => depth(b) - depth(a));
 
   let total = 0;
-  let skipped = 0;
+  const errorsSeen = [];
   for (const a of accounts) {
     try {
       await admin.deleteResource('Account', a.name);
       total += 1;
     } catch (err) {
-      skipped += 1;
-      if (skipped <= 3) {
-        console.warn(`    Account "${a.name}": ${err.message.slice(0, 120)}`);
+      if (errorsSeen.length < 5) {
+        errorsSeen.push(`Account "${a.name}": ${err.message}`);
       }
     }
   }
-  console.log(`  Account              deleted=${total} skipped=${skipped}`);
+  const stillThere = await currentCount(admin, 'Account', company);
+  console.log(`  Account              deleted=${total} remaining=${stillThere}`);
+  for (const e of errorsSeen) console.warn(`    ${e}`);
 }
