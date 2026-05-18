@@ -89,21 +89,32 @@ _(nothing right now — pick from "Upcoming" below)_
 - [ ] Search by code/name (URL `?q=`) — deferred to filters pass (#6)
 - [ ] **Multi-tenancy note**: ERPNext Item is site-global, not company-scoped. All users currently see all items. Will need User Permissions or per-company Item Group during provisioning to fix.
 
-### 4. Bot awareness of business_type
-**Why**: Bot should not ask service users for SKU/qty; should not let product users sell without specifying an item.
-
-- [ ] Bot reads `business_type` at conversation init (already in users table after #1)
-- [ ] Prompt rules conditional on business_type
-- [ ] Replace `GEN-SALE` placeholder Item with real Items from inventory for product/both
+### 4. Bot awareness of business_type ✅ (partial)
+- [x] Bot reads `business_type` at conversation init (already in users via `SELECT *`)
+- [x] Prompt rules conditional on business_type — service users not asked
+      for SKU/qty; product users expected to provide item code + qty + rate;
+      both = infer per transaction
+- [ ] Replace `GEN-SALE` placeholder Item with real per-SKU Items from
+      inventory for product/both (so /inventory populates from sales)
 - [ ] `lookup_item` tool (parallel to `lookup_counterparty`) for product/both
 
-### 5. Remaining ERPNext doctype handlers
-- [ ] Transfer JE (wallet→wallet, single user) — uses existing `buildJournalTitle` helper
-- [ ] Advance Payment Entry (`advance_given` / `advance_received`)
+### 5. Remaining ERPNext doctype handlers ✅
+- [x] Transfer JE (`direction='transfer'`) — DR dst / CR src, same-currency
+      only for v1, voucher_type='Bank Entry'
+- [x] Advance Payment Entry (`advance_given` / `advance_received`) — Payment
+      Entry with no references[]; sits as unallocated on the party ledger
+- [x] Bot tool fields added: `party_type`, `transfer_destination_account_code`,
+      `transfer_destination_wallet_name`
+- [x] Dispatcher cases wired in `src/erp-sync/index.js`
 
-### 6. Filters + pagination on more list pages
-- [ ] `/transactions` filters: `?type=`, `?from=`, `?to=`, `?q=` (Pagination component already preserves query)
-- [ ] `/customers`, `/suppliers`, `/expenses` — add `?q=` search + pagination
+### 6. Filters + pagination on more list pages ✅ (high-value done)
+- [x] `/transactions` filters: `?type=`, `?from=`, `?to=`, `?q=` via reusable
+      TransactionFilters component (URL-state, debounced, preserved on paginate)
+- [x] `/contacts` search: reusable SearchBox component, `?q=` filters
+      name/phone/email
+- [ ] `/customers`, `/suppliers` — same SearchBox pattern (lower priority
+      since /contacts is now canonical)
+- [ ] `/expenses` — usually a short list, can skip until needed
 - [ ] `/accounts/[name]` ledger — paginate (currently capped at 200 entries)
 
 ### 7. Live OTP delivery (Meta approval pending)
