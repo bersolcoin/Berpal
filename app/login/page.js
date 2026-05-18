@@ -207,13 +207,7 @@ export default function LoginPage() {
             disabled={busy || !national || !country}
             className="w-full py-3 bg-slate-900 text-white rounded-lg text-sm font-medium hover:bg-slate-800 disabled:opacity-50 transition"
           >
-            {busy ? (
-              'Sending…'
-            ) : detecting ? (
-              <span className="inline-block h-5 w-24 bg-white/30 rounded animate-pulse align-middle" />
-            ) : (
-              'Send code'
-            )}
+            {busy ? 'Sending…' : 'Send code'}
           </button>
         </form>
       )}
