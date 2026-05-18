@@ -227,7 +227,7 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
 
   async function exit() {
     if (busy) return;
-    if (!confirm('Exit and sign out? Anything you typed will be lost.')) return;
+    if (!confirm('Log out? Anything you typed will be lost.')) return;
     setBusy(true);
     try {
       await fetch('/api/auth/logout', { method: 'POST' });
@@ -274,9 +274,9 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
             type="button"
             onClick={exit}
             disabled={busy}
-            className="px-3 py-2.5 text-sm text-slate-500 hover:text-slate-900 hover:bg-slate-50 rounded-lg transition disabled:opacity-50"
+            className="px-4 py-2.5 text-sm text-slate-500 hover:text-slate-900 hover:bg-slate-50 border border-slate-200 rounded-lg transition disabled:opacity-50"
           >
-            Exit
+            Logout
           </button>
           {step > 1 && (
             <button
