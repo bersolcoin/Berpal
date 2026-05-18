@@ -225,6 +225,18 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
     setStep((s) => Math.max(s - 1, 1));
   }
 
+  async function exit() {
+    if (busy) return;
+    if (!confirm('Exit and sign out? Anything you typed will be lost.')) return;
+    setBusy(true);
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      /* ignore — proceed to /login either way */
+    }
+    router.push('/login');
+  }
+
   return (
     <div>
       <Stepper current={step} />
@@ -256,19 +268,27 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
         />
       )}
 
-      <div className="mt-8 flex items-center justify-between gap-3">
-        {step > 1 ? (
+      <div className="mt-8 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={back}
+            onClick={exit}
             disabled={busy}
-            className="px-4 py-2.5 text-sm text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 transition disabled:opacity-50"
+            className="px-3 py-2.5 text-sm text-slate-500 hover:text-slate-900 hover:bg-slate-50 rounded-lg transition disabled:opacity-50"
           >
-            ← Back
+            Exit
           </button>
-        ) : (
-          <div />
-        )}
+          {step > 1 && (
+            <button
+              type="button"
+              onClick={back}
+              disabled={busy}
+              className="px-4 py-2.5 text-sm text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 transition disabled:opacity-50"
+            >
+              ← Back
+            </button>
+          )}
+        </div>
 
         {step < TOTAL_STEPS ? (
           <button

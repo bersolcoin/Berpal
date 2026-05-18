@@ -49,14 +49,18 @@ export async function POST(request) {
 
   // Set session. If user is provisioned, link to their id. If not yet, stash
   // the phone so the onboarding endpoint can complete provisioning under it.
+  // For un-onboarded users, also stamp onboarding_started_at — the
+  // /onboarding page enforces a 30-minute window before forcing re-login.
   const sess = await getSession();
   sess.phone = phone;
   if (userRow && userRow.erpnext_company) {
     sess.user_id = userRow.id;
     sess.onboarded = true;
+    delete sess.onboarding_started_at;
   } else {
     sess.user_id = userRow ? userRow.id : null;
     sess.onboarded = false;
+    sess.onboarding_started_at = new Date().toISOString();
   }
   await sess.save();
 

@@ -19,6 +19,7 @@ import OnboardingFlow from './OnboardingFlow';
 export const dynamic = 'force-dynamic';
 
 const isDev = process.env.NODE_ENV !== 'production';
+const ONBOARDING_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
 
 export default async function OnboardingPage({ searchParams }) {
   const sp = (await searchParams) || {};
@@ -39,6 +40,16 @@ export default async function OnboardingPage({ searchParams }) {
       );
       if (r.rows[0]?.erpnext_company) redirect('/dashboard');
       // Stale cookie — fall through to render the onboarding form.
+    }
+
+    // 30-minute onboarding window. If they sat on this screen too long
+    // (or came back hours later), force re-login so we don't trust a
+    // stale session for a destructive operation like Company creation.
+    if (sess.onboarding_started_at) {
+      const startedMs = Date.parse(sess.onboarding_started_at);
+      if (Number.isFinite(startedMs) && Date.now() - startedMs > ONBOARDING_WINDOW_MS) {
+        redirect('/login?expired=1');
+      }
     }
   }
 

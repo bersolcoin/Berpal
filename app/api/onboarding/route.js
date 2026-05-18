@@ -46,10 +46,22 @@ function toNum(v) {
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
+const ONBOARDING_WINDOW_MS = 30 * 60 * 1000;
+
 export async function POST(request) {
   const sess = await getSession();
   if (!sess.phone) {
     return Response.json({ ok: false, error: 'Not signed in. Please request a new OTP.' }, { status: 401 });
+  }
+  // 30-min onboarding window — refuse submits with a stale session.
+  if (sess.onboarding_started_at) {
+    const startedMs = Date.parse(sess.onboarding_started_at);
+    if (Number.isFinite(startedMs) && Date.now() - startedMs > ONBOARDING_WINDOW_MS) {
+      return Response.json(
+        { ok: false, error: 'Onboarding session expired. Please sign in again.', expired: true },
+        { status: 401 }
+      );
+    }
   }
   // Don't trust sess.onboarded alone — it may be stale after a reset.
   // Re-check the DB; only block if there's a live ERPNext binding.

@@ -12,7 +12,7 @@
  */
 
 import { useState, useEffect, useMemo } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import {
   getCountryCallingCode,
   isValidPhoneNumber,
@@ -44,6 +44,8 @@ function placeholderFor(country) {
 
 export default function LoginPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const expired = searchParams.get('expired') === '1';
   const [step, setStep] = useState(STEPS.PHONE);
   // Country starts empty — we wait on IP geolocation before populating so
   // the user never sees a flash of the wrong country (US default → TH).
@@ -164,6 +166,11 @@ export default function LoginPage() {
     <main className="max-w-md mx-auto px-6 py-6 sm:py-16">
       <img src="/logo.svg" alt="Berpal" className="w-8 h-8 sm:w-9 sm:h-9 mb-4 sm:mb-8" />
       <h1 className="text-xl sm:text-2xl font-semibold tracking-tight mb-1.5 sm:mb-2">Sign in</h1>
+      {expired && (
+        <div className="mb-4 px-3 py-2 rounded-md bg-amber-50 border border-amber-200 text-xs text-amber-900">
+          Your onboarding session expired. Please sign in again to continue.
+        </div>
+      )}
       <p className="text-sm text-slate-600 mb-4 sm:mb-6">
         {step === STEPS.PHONE ? 'Enter your WhatsApp number' : 'Enter the 6-digit code'}
       </p>
