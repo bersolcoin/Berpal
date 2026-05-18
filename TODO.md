@@ -120,12 +120,22 @@ _(nothing right now — pick from "Upcoming" below)_
 - [ ] Confirm modal pattern (reusable)
 
 ### 9. Deploy + production hardening
-- [ ] Bot to Railway alongside ERPNext (stable webhook URL, no more ngrok)
-- [ ] Web app to Vercel or Railway
+**URL architecture (decided 2026-05-18)**: subdomain-per-app. Berpal lives at
+`berpal.ber.fun` (or `app.ber.fun` if we want to keep berpal.com elsewhere).
+Apex `ber.fun` reserved for a marketing/landing page. Future apps get their
+own subdomains. Zero code changes needed — no Next.js basePath gymnastics.
+
+- [ ] Deploy web + bot to Railway (or Vercel for web, Railway for bot)
+- [ ] DNS: A record / CNAME for `berpal.ber.fun` → deployment target
+- [ ] Set `APP_URL=https://berpal.ber.fun` in production env
+- [ ] Set Twilio WhatsApp webhook URL to `https://berpal.ber.fun/api/webhook`
+- [ ] Stable webhook URL means we can finally retire ngrok for live testing
 - [ ] `SESSION_SECRET` rotation strategy
 - [ ] Error monitoring (Sentry or equivalent)
 - [ ] Log retention policy (no chat content in prod logs)
 - [ ] Health-check endpoint
+- [ ] Audit for any localhost-baked assumptions (done once 2026-05-18 — clean.
+      Only `whatsapp.js` had a placeholder URL, now env-driven via `APP_URL`)
 
 ### 10. Commit hygiene
 - [ ] Group the big uncommitted blob into clean commits before next major feature:

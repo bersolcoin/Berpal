@@ -7,8 +7,14 @@ const chitchat = require('./chitchat');
 const log = require('./log');
 const linkedTxn = require('./links/linked-transactions');
 
-const REGISTRATION_LINK_REPLY =
-  "Hi! It looks like your number isn't registered yet. Please sign up at https://your-app.com/signup to link your WhatsApp number to your account.";
+function registrationLinkReply() {
+  // APP_URL is the public origin for the current environment, e.g.
+  // https://berpal.ber.fun in prod, http://localhost:3000 in dev.
+  const base = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
+  return (
+    `Hi! It looks like your number isn't registered yet. Sign up at ${base} to link your WhatsApp number to your account.`
+  );
+}
 
 async function fetchTwilioMedia(url) {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -53,8 +59,9 @@ async function processIncomingMessage({ from, body, raw = null }) {
     const user = await users.findByPhone(from);
 
     if (!user) {
-      log.msgOut(from, REGISTRATION_LINK_REPLY, 'unknown_phone');
-      await twilioClient.sendText(from, REGISTRATION_LINK_REPLY);
+      const reply = registrationLinkReply();
+      log.msgOut(from, reply, 'unknown_phone');
+      await twilioClient.sendText(from, reply);
       return;
     }
 
