@@ -210,7 +210,7 @@ export default function LoginPage() {
             {busy ? (
               'Sending…'
             ) : detecting ? (
-              <span className="inline-block h-4 w-24 bg-white/30 rounded animate-pulse" />
+              <span className="inline-block h-5 w-24 bg-white/30 rounded animate-pulse align-middle" />
             ) : (
               'Send code'
             )}
