@@ -12,26 +12,30 @@ import { listContacts } from '../../../src/erp-query';
 import PageHeader from '../_components/PageHeader';
 import Card from '../_components/Card';
 import Empty from '../_components/Empty';
+import SearchBox from '../_components/SearchBox';
 import { money } from '../_components/format';
 
 export const dynamic = 'force-dynamic';
 
-export default async function ContactsPage() {
+export default async function ContactsPage({ searchParams }) {
+  const params = (await searchParams) || {};
+  const q = typeof params.q === 'string' ? params.q : '';
   const { user, erp } = await getAppContext();
-  const contacts = await listContacts(user, erp);
+  const contacts = await listContacts(user, erp, { q });
 
   return (
     <>
       <PageHeader
         title="Contacts"
         subtitle="Everyone you do business with — customers, suppliers, or both."
+        right={<SearchBox placeholder="Search contacts…" />}
       />
 
       <Card>
         {contacts.length === 0 ? (
           <Empty
-            title="No contacts yet"
-            hint="Tell the bot about a sale or purchase and it will create the contact for you."
+            title={q ? 'No matches' : 'No contacts yet'}
+            hint={q ? `No contacts match "${q}". Try a different spelling.` : 'Tell the bot about a sale or purchase and it will create the contact for you.'}
           />
         ) : (
           <div className="overflow-x-auto -mx-5">

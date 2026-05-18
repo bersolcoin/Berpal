@@ -39,7 +39,7 @@ function mergeKey(name, phone) {
   return p ? `p:${p}` : `n:${normName(name)}`;
 }
 
-async function listContacts(user, erp, { limit = 200 } = {}) {
+async function listContacts(user, erp, { limit = 200, q = '' } = {}) {
   const [customers, suppliers, linksResult] = await Promise.all([
     listCustomersWithAR(user, erp, { limit }).catch(() => []),
     listSuppliersWithAP(user, erp, { limit }).catch(() => []),
@@ -122,15 +122,27 @@ async function listContacts(user, erp, { limit = 200 } = {}) {
     return { ...c, balance_by_currency };
   });
 
+  // Free-text filter on name / phone / email.
+  let filtered = rows;
+  if (q && q.trim()) {
+    const needle = q.trim().toLowerCase();
+    filtered = filtered.filter(
+      (c) =>
+        (c.display_name || '').toLowerCase().includes(needle) ||
+        (c.phone || '').toLowerCase().includes(needle) ||
+        (c.email || '').toLowerCase().includes(needle)
+    );
+  }
+
   // Sort: contacts with non-zero balance first (absolute size), then alpha.
-  rows.sort((a, b) => {
+  filtered.sort((a, b) => {
     const aSum = Object.values(a.balance_by_currency).reduce((s, v) => s + Math.abs(v), 0);
     const bSum = Object.values(b.balance_by_currency).reduce((s, v) => s + Math.abs(v), 0);
     if (aSum !== bSum) return bSum - aSum;
     return a.display_name.localeCompare(b.display_name);
   });
 
-  return rows;
+  return filtered;
 }
 
 module.exports = { listContacts };

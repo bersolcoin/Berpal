@@ -24,24 +24,38 @@
 
 const DEFAULT_LIMIT_PER_DOCTYPE = 50;
 
-async function listRecentTransactions(user, erp, { limit = 25, offset = 0 } = {}) {
+async function listRecentTransactions(user, erp, { limit = 25, offset = 0, filters = {} } = {}) {
   const perType = Math.max(limit + offset + 1, DEFAULT_LIMIT_PER_DOCTYPE);
+
+  // Per-doctype filters built from the global filter object (so the
+  // server-side query slims the result early). Type filtering happens
+  // post-merge (cleaner than special-casing which doctypes to query).
+  const dateFilters = [];
+  if (filters.from) dateFilters.push(['posting_date', '>=', filters.from]);
+  if (filters.to) dateFilters.push(['posting_date', '<=', filters.to]);
+
+  const baseFilters = (extra = []) => [
+    ['company', '=', erp.company],
+    ['docstatus', '!=', 2],
+    ...dateFilters,
+    ...extra,
+  ];
 
   const [si, pi, pe, je] = await Promise.all([
     erp.listResource('Sales Invoice', {
-      filters: [['company', '=', erp.company], ['docstatus', '!=', 2]],
+      filters: baseFilters(),
       fields: ['name', 'customer', 'posting_date', 'currency', 'grand_total', 'outstanding_amount', 'status', 'docstatus'],
       limit: perType,
       orderBy: 'posting_date desc, name desc',
     }),
     erp.listResource('Purchase Invoice', {
-      filters: [['company', '=', erp.company], ['docstatus', '!=', 2]],
+      filters: baseFilters(),
       fields: ['name', 'supplier', 'posting_date', 'currency', 'grand_total', 'outstanding_amount', 'status', 'docstatus'],
       limit: perType,
       orderBy: 'posting_date desc, name desc',
     }),
     erp.listResource('Payment Entry', {
-      filters: [['company', '=', erp.company], ['docstatus', '!=', 2]],
+      filters: baseFilters(),
       fields: [
         'name', 'payment_type', 'party_type', 'party',
         'posting_date', 'paid_amount',
@@ -52,7 +66,7 @@ async function listRecentTransactions(user, erp, { limit = 25, offset = 0 } = {}
       orderBy: 'posting_date desc, name desc',
     }),
     erp.listResource('Journal Entry', {
-      filters: [['company', '=', erp.company], ['docstatus', '!=', 2]],
+      filters: baseFilters(),
       fields: ['name', 'title', 'posting_date', 'total_debit', 'docstatus'],
       limit: perType,
       orderBy: 'posting_date desc, name desc',
@@ -119,7 +133,25 @@ async function listRecentTransactions(user, erp, { limit = 25, offset = 0 } = {}
     });
   }
 
-  rows.sort((a, b) => {
+  // Post-merge filters (kind + free-text search).
+  let filtered = rows;
+  if (filters.type) {
+    const t = String(filters.type).toLowerCase();
+    filtered = filtered.filter((r) => r.kind.toLowerCase() === t);
+  }
+  if (filters.q) {
+    const q = String(filters.q).toLowerCase().trim();
+    if (q) {
+      filtered = filtered.filter(
+        (r) =>
+          (r.party || '').toLowerCase().includes(q) ||
+          (r.erpnext_name || '').toLowerCase().includes(q) ||
+          (r.raw?.title || '').toLowerCase().includes(q)
+      );
+    }
+  }
+
+  filtered.sort((a, b) => {
     const da = a.posting_date || '';
     const db = b.posting_date || '';
     if (da !== db) return db.localeCompare(da);
@@ -127,7 +159,7 @@ async function listRecentTransactions(user, erp, { limit = 25, offset = 0 } = {}
   });
 
   // Slice and detect hasMore by fetching one extra row.
-  const page = rows.slice(offset, offset + limit + 1);
+  const page = filtered.slice(offset, offset + limit + 1);
   const hasMore = page.length > limit;
   return { rows: page.slice(0, limit), hasMore };
 }
@@ -137,14 +169,23 @@ async function listRecentTransactions(user, erp, { limit = 25, offset = 0 } = {}
  * Used for numbered pagination. Single Promise.all so the four calls run
  * in parallel.
  */
-async function countRecentTransactions(user, erp) {
-  const baseFilters = [['company', '=', erp.company], ['docstatus', '!=', 2]];
+/**
+ * Count for pagination. Honors date-range filters (cheap per-doctype counts)
+ * but ignores type/search filters — those would require fetching + post-
+ * filtering, which defeats the point of the count. When type or q is set,
+ * the caller should hide the "of N" display or treat the number as the
+ * pre-filter universe.
+ */
+async function countRecentTransactions(user, erp, { filters = {} } = {}) {
+  const baseFilters = [
+    ['company', '=', erp.company],
+    ['docstatus', '!=', 2],
+  ];
+  if (filters.from) baseFilters.push(['posting_date', '>=', filters.from]);
+  if (filters.to) baseFilters.push(['posting_date', '<=', filters.to]);
 
-  const callCount = (doctype, filters = baseFilters) =>
-    erp.callMethod('frappe.client.get_count', {
-      doctype,
-      filters,
-    });
+  const callCount = (doctype) =>
+    erp.callMethod('frappe.client.get_count', { doctype, filters: baseFilters });
 
   const [si, pi, pe, je] = await Promise.all([
     callCount('Sales Invoice'),
