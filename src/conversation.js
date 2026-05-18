@@ -884,10 +884,20 @@ async function _runTool(toolName, args, ctx) {
           ctx.savedIds = [...(ctx.savedIds || []), result.erpnext_name];
           ctx.draft = {};
           ctx.confirmationRequested = false;
+        } else {
+          // Handler returned ok=false without throwing (most validation
+          // failures take this path). Log the full reason so we can debug
+          // without needing the LLM to parrot it back.
+          console.error(
+            `× [conversation] [${ts()}] save returned ok=false user_id=${ctx.user.id} ` +
+              `tx_type=${ctx.draft?.transaction_type || 'cash'} reason=${result.error}`
+          );
         }
         return result;
       } catch (err) {
-        console.error('[conversation] save error:', err.message);
+        console.error(`× [conversation] [${ts()}] save threw user_id=${ctx.user.id} tx_type=${ctx.draft?.transaction_type || 'cash'}:`);
+        console.error(err);
+        if (err.response) console.error('  err.response:', JSON.stringify(err.response).slice(0, 800));
         // Surface ambiguity errors with structured candidates so the LLM can
         // present a natural-language picker (not just a stringy error).
         if (err.code === 'AMBIGUOUS_WALLET') {
