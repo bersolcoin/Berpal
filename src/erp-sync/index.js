@@ -16,6 +16,7 @@ const salesInvoice = require('./sales-invoice');
 const purchaseInvoice = require('./purchase-invoice');
 const journalEntry = require('./journal-entry');
 const paymentEntry = require('./payment-entry');
+const advancePaymentEntry = require('./advance-payment-entry');
 
 async function save(user, draft) {
   const erp = erpnext.forUser(user);
@@ -31,11 +32,16 @@ async function save(user, draft) {
     case 'payment':
       return paymentEntry.save(user, erp, draft);
 
+    case 'advance_given':
+    case 'advance_received':
+      return advancePaymentEntry.save(user, erp, draft);
+
     case 'cash':
     default:
-      // Cash income/expense → Journal Entry. Default fallback so unknown
-      // transaction_types don't silently break — they hit the JE path,
-      // which has its own validation (will return ok:false if missing fields).
+      // Cash income/expense/transfer → Journal Entry. Default fallback so
+      // unknown transaction_types don't silently break — they hit the JE
+      // path, which has its own validation (will return ok:false if
+      // missing fields).
       return journalEntry.save(user, erp, draft);
   }
 }

@@ -71,6 +71,14 @@ const TOOLS = [
             type: 'number',
             description: 'For direction=transfer ONLY: the DESTINATION wallet id (where the money lands). Combined with payment_account_id (source), records the move in one transaction row. Both must be set for transfers.',
           },
+          transfer_destination_account_code: {
+            type: 'string',
+            description: 'For direction=transfer ONLY: chart-of-accounts code of the DESTINATION wallet type ("1000" cash, "1100" bank, "2100" credit card). Parallel to payment_account_code which is the SOURCE side.',
+          },
+          transfer_destination_wallet_name: {
+            type: 'string',
+            description: 'For direction=transfer ONLY: short name of the SPECIFIC destination wallet (e.g. "BBL Savings"). REQUIRED when transfer_destination_account_code is 1100 or 2100.',
+          },
           category_code: {
             type: 'string',
             description:
@@ -102,6 +110,11 @@ const TOOLS = [
           tax_inclusive: {
             type: 'boolean',
             description: 'True if amount already includes tax; false if tax is on top.',
+          },
+          party_type: {
+            type: 'string',
+            enum: ['Customer', 'Supplier'],
+            description: 'Required for transaction_type=advance_given / advance_received. Tells the server which side of the books to charge. Customer = the other party is a buyer-from-you (advances they paid, refunds you gave them). Supplier = the other party is a seller-to-you (prepayments you made, refunds they gave you).',
           },
           transaction_type: {
             type: 'string',
@@ -642,15 +655,29 @@ function validateDraft(draft) {
     if (draft[field] == null || draft[field] === '') missing.push(field);
   }
   const tt = draft.transaction_type;
+  const dir = draft.direction;
 
-  // category_code is required for everything except wallet-to-wallet transfers
-  if (tt !== 'transfer' && (draft.category_code == null || draft.category_code === '')) {
+  // category_code requirement: cash income/expense need it for the
+  // chart-of-accounts side. Transfers + advances + payments + invoices
+  // settle to specific accounts already (wallets / party AR/AP).
+  const NO_CATEGORY = new Set(['payment', 'advance_given', 'advance_received']);
+  const isTransfer = dir === 'transfer';
+  if (!isTransfer && !NO_CATEGORY.has(tt) && (draft.category_code == null || draft.category_code === '')) {
     missing.push('category_code');
   }
-  // counterparty_name is required for invoice/bill flows (they need a Customer/Supplier in ERPNext)
-  if ((tt === 'invoice_issued' || tt === 'bill_received') && !draft.counterparty_name) {
+
+  // counterparty_name: required for anything that names a party.
+  if ((tt === 'invoice_issued' || tt === 'bill_received' ||
+       tt === 'advance_given' || tt === 'advance_received') && !draft.counterparty_name) {
     missing.push('counterparty_name');
   }
+
+  // party_type: required for advance flows so the server knows which side
+  // of the books to charge.
+  if ((tt === 'advance_given' || tt === 'advance_received') && !draft.party_type) {
+    missing.push('party_type');
+  }
+
   return missing;
 }
 
