@@ -29,16 +29,16 @@ export default async function OnboardingPage({ searchParams }) {
     if (!sess.phone) redirect('/login');
     // sess.onboarded may be stale (cookie issued before the user was
     // reset). Re-check the DB before bouncing back to /dashboard.
+    // Note: can't sess.save() in a server component (Next 15+); the
+    // stale cookie just sits unread until /api/onboarding overwrites
+    // it on next submit.
     if (sess.onboarded && sess.user_id) {
       const r = await query(
         `SELECT erpnext_company FROM users WHERE id = $1`,
         [sess.user_id]
       );
       if (r.rows[0]?.erpnext_company) redirect('/dashboard');
-      // Stale cookie — fall through to onboarding. Mark session as
-      // un-onboarded so we don't loop on subsequent visits.
-      sess.onboarded = false;
-      await sess.save();
+      // Stale cookie — fall through to render the onboarding form.
     }
   }
 

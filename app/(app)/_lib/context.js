@@ -33,12 +33,12 @@ export const getAppContext = cache(async () => {
 
   // The user's session cookie may say "onboarded=true" but the DB row
   // could've been wiped (admin ran reset-user-onboarding.js, ERPNext
-  // creds rotated, etc). If there's no ERPNext binding, mark the
-  // session as un-onboarded and send them back through /onboarding —
-  // otherwise erpnext.forUser would throw "missing api_key / api_secret".
+  // creds rotated, etc). If there's no ERPNext binding, send them to
+  // /onboarding instead of crashing inside erpnext.forUser. Note: can't
+  // sess.save() here — Next 15+ blocks cookie writes from server
+  // components. /onboarding does its own DB re-check so the stale
+  // cookie is harmless; /api/onboarding's submit overwrites it.
   if (!user.erpnext_company || !user.erpnext_api_key || !user.erpnext_api_secret) {
-    sess.onboarded = false;
-    await sess.save();
     redirect('/onboarding');
   }
 

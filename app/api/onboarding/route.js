@@ -51,8 +51,14 @@ export async function POST(request) {
   if (!sess.phone) {
     return Response.json({ ok: false, error: 'Not signed in. Please request a new OTP.' }, { status: 401 });
   }
-  if (sess.onboarded) {
-    return Response.json({ ok: false, error: 'Already onboarded.', dashboard: '/dashboard' }, { status: 409 });
+  // Don't trust sess.onboarded alone — it may be stale after a reset.
+  // Re-check the DB; only block if there's a live ERPNext binding.
+  if (sess.onboarded && sess.user_id) {
+    const { query } = require('../../../src/db');
+    const r = await query(`SELECT erpnext_company FROM users WHERE id = $1`, [sess.user_id]);
+    if (r.rows[0]?.erpnext_company) {
+      return Response.json({ ok: false, error: 'Already onboarded.', dashboard: '/dashboard' }, { status: 409 });
+    }
   }
 
   let body;
