@@ -165,9 +165,7 @@ export default function LoginPage() {
       <img src="/logo.svg" alt="Berpal" className="w-8 h-8 sm:w-9 sm:h-9 mb-4 sm:mb-8" />
       <h1 className="text-xl sm:text-2xl font-semibold tracking-tight mb-1.5 sm:mb-2">Sign in</h1>
       <p className="text-sm text-slate-600 mb-4 sm:mb-6">
-        {step === STEPS.PHONE
-          ? 'Enter your WhatsApp number — we’ll text you a one-time code.'
-          : 'Enter the 6-digit code we just sent you.'}
+        {step === STEPS.PHONE ? 'Enter your WhatsApp number' : 'Enter the 6-digit code'}
       </p>
 
       {step === STEPS.PHONE && (
@@ -214,8 +212,8 @@ export default function LoginPage() {
 
       {step === STEPS.CODE && (
         <form onSubmit={submitCode} className="space-y-4">
-          <label className="block">
-            <span className="block text-sm font-medium text-slate-700 mb-1.5">6-digit code</span>
+          <div className="block">
+            <span className="block text-sm font-medium text-slate-700 mb-1.5">Code</span>
             <input
               type="text"
               inputMode="numeric"
@@ -226,9 +224,9 @@ export default function LoginPage() {
               value={code}
               onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
               disabled={busy}
-              className="w-full px-3 py-3 border border-slate-300 rounded-lg outline-none focus:border-slate-400 text-2xl tabular text-center tracking-[0.4em]"
+              className="w-full px-3 py-3 border border-slate-300 rounded-lg outline-none focus:border-slate-400 text-base tabular text-center tracking-[0.4em]"
             />
-          </label>
+          </div>
           <button
             type="submit"
             disabled={busy || code.length !== 6}
@@ -247,7 +245,7 @@ export default function LoginPage() {
             disabled={busy}
             className="text-sm text-slate-500 hover:text-slate-900 transition"
           >
-            ← Use a different number
+            ← Back
           </button>
         </form>
       )}
@@ -256,9 +254,8 @@ export default function LoginPage() {
       {error && <p className="mt-4 text-sm text-red-700">{error}</p>}
 
       <div className="mt-6 sm:mt-12">
-        <p className="text-xs text-slate-500 leading-relaxed mb-2 sm:mb-3">
-          Sandbox mode — first time? Join the Twilio WhatsApp sandbox.
-          Opens WhatsApp with the join code pre-filled.
+        <p className="text-xs text-slate-500 mb-2 sm:mb-3">
+          First time? Join the WhatsApp sandbox.
         </p>
         <a
           href="https://wa.me/14155238886?text=join%20explore-individual"
