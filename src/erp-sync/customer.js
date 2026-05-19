@@ -14,6 +14,8 @@ const { ts } = require('../log');
 const { resolvePartyAccount } = require('./party-account');
 const { linkCounterparty } = require('../links/counterparty-match');
 const { assertPhoneUnused } = require('./contact-guard');
+const { getCustomerGroupName } = require('./party-group');
+const { abbrFromUser } = require('./item-group');
 
 async function resolveOrCreateCustomer(
   user,
@@ -34,7 +36,7 @@ async function resolveOrCreateCustomer(
     return exact.rows[0].erpnext_name;
   }
 
-  // 1b. fuzzy cache hit (LIKE): user said "Jameel", cache has "Jameel Crest Gems".
+  // 1b. fuzzy cache hit (LIKE): user said "Acme", cache has "Acme Trading".
   //     If exactly ONE row matches, use it. If MORE than one matches, refuse to
   //     silently pick — throw an AmbiguousCounterpartyError so the LLM can ask
   //     the user which one. Never bluff a guess on identity-critical data.
@@ -85,10 +87,15 @@ async function resolveOrCreateCustomer(
       }
     }
     // 3. create
+    // Per-tenant customer_group ("Customers - <ABBR>") so the bot's
+    // User Permission fence keeps this Customer scoped to this tenant.
+    // Legacy fallback to "Individual" if the user has no abbr yet
+    // (only happens during a half-broken provisioning flow).
+    const customerGroup = getCustomerGroupName(abbrFromUser(user)) || 'Individual';
     const customerData = {
       customer_name: name,
       customer_type: 'Individual',
-      customer_group: 'Individual',
+      customer_group: customerGroup,
       territory: 'All Territories',
     };
     if (currency) customerData.default_currency = currency;
@@ -114,9 +121,8 @@ async function resolveOrCreateCustomer(
     `INSERT INTO counterparty_cache
        (owner_user_id, name, phone, email, erpnext_doctype, erpnext_name, created_at, updated_at)
      VALUES ($1, $2, $3, $4, 'Customer', $5, $6, $6)
-     ON CONFLICT (owner_user_id, name) DO UPDATE SET
+     ON CONFLICT (owner_user_id, erpnext_doctype, name) DO UPDATE SET
        erpnext_name = EXCLUDED.erpnext_name,
-       erpnext_doctype = EXCLUDED.erpnext_doctype,
        phone = COALESCE(counterparty_cache.phone, EXCLUDED.phone),
        email = COALESCE(counterparty_cache.email, EXCLUDED.email),
        updated_at = EXCLUDED.updated_at`,

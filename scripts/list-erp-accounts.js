@@ -9,7 +9,7 @@
  *   node scripts/list-erp-accounts.js --user +66838883866
  *      → load user by phone, use their per-user ERPNext creds + company
  *
- *   node scripts/list-erp-accounts.js --company "KruZn Co"
+ *   node scripts/list-erp-accounts.js --company "Acme Trading"
  *      → admin creds, query that company by name
  *
  * Output grouped by root_type then account_type, sorted by account name.

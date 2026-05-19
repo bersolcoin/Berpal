@@ -20,6 +20,7 @@ const { ensureGenericPurchaseItem } = require('./item');
 const { resolveErpAccount } = require('./account');
 const { resolvePartyAccount } = require('./party-account');
 const { ts } = require('../log');
+const paymentEntry = require('./payment-entry');
 
 async function save(user, erp, draft) {
   if (!draft.counterparty_name) {
@@ -84,6 +85,52 @@ async function save(user, erp, draft) {
     `• [conversation] [${ts()}] saved Purchase Invoice to ERPNext: ${erpName} ` +
       `(${draft.amount} ${draft.currency} from ${supplierName}, due ${dueDate})`
   );
+
+  // paid_now: post the matching outbound Payment Entry against this
+  // bill in the same save. See sales-invoice.js for the mirror flow.
+  if (draft.paid_now) {
+    try {
+      const peResult = await paymentEntry.save(user, erp, {
+        transaction_type: 'payment',
+        direction: 'expense',
+        amount: draft.amount,
+        currency: draft.currency,
+        exchange_rate: draft.exchange_rate,
+        counterparty_name: draft.counterparty_name,
+        payment_account_code: draft.payment_account_code,
+        wallet_name: draft.wallet_name || null,
+        parent_invoice_ref: erpName,
+        transaction_date: draft.transaction_date,
+        payment_reference: draft.payment_reference || null,
+      });
+      if (peResult?.ok) {
+        console.log(
+          `• [conversation] [${ts()}] saved paid-now PE to ERPNext: ${peResult.erpnext_name} (settles ${erpName})`
+        );
+        return {
+          ok: true,
+          erpnext_name: erpName,
+          doctype: 'Purchase Invoice',
+          payment_entry_name: peResult.erpnext_name,
+          payment_entry_doctype: 'Payment Entry',
+        };
+      }
+      return {
+        ok: true,
+        erpnext_name: erpName,
+        doctype: 'Purchase Invoice',
+        payment_entry_error: peResult?.error || 'unknown payment-entry failure',
+      };
+    } catch (err) {
+      console.warn(`• [conversation] [${ts()}] paid-now PE post failed for ${erpName}: ${err.message}`);
+      return {
+        ok: true,
+        erpnext_name: erpName,
+        doctype: 'Purchase Invoice',
+        payment_entry_error: err.message,
+      };
+    }
+  }
 
   return { ok: true, erpnext_name: erpName, doctype: 'Purchase Invoice' };
 }

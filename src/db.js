@@ -141,13 +141,14 @@ CREATE TABLE IF NOT EXISTS counterparty_cache (
   phone TEXT,
   email TEXT,
 
-  erpnext_doctype TEXT,             -- 'Customer' | 'Supplier' | both as separate rows if needed
-  erpnext_name TEXT,                -- ERPNext doctype name (e.g. 'Jameel Crest Gems-TTC')
+  erpnext_doctype TEXT,             -- 'Customer' | 'Supplier' | both as separate rows
+  erpnext_name TEXT,                -- ERPNext doctype name (e.g. 'Acme Trading-TTC')
 
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
 
-  UNIQUE(owner_user_id, name)
+  CONSTRAINT counterparty_cache_owner_doctype_name_key
+    UNIQUE(owner_user_id, erpnext_doctype, name)
 );
 CREATE INDEX IF NOT EXISTS idx_cp_cache_owner ON counterparty_cache(owner_user_id);
 
@@ -290,6 +291,32 @@ async function migrate() {
   await query(`ALTER TABLE counterparty_cache ADD COLUMN IF NOT EXISTS linked_user_id INTEGER REFERENCES users(id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_cp_cache_linked_user ON counterparty_cache(linked_user_id)`);
 
+  // The original UNIQUE(owner_user_id, name) constraint was too narrow —
+  // a single contact can legitimately exist as BOTH a Customer and a
+  // Supplier in ERPNext (eager dual-create writes both). Without doctype
+  // in the unique key, supplier.js's ON CONFLICT clobbers customer.js's
+  // row (including its linked_user_id), breaking the B2B notification.
+  // Widen to (owner, doctype, name).
+  await query(`
+    DO $$ BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'counterparty_cache_owner_user_id_name_key'
+      ) THEN
+        ALTER TABLE counterparty_cache
+          DROP CONSTRAINT counterparty_cache_owner_user_id_name_key;
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'counterparty_cache_owner_doctype_name_key'
+      ) THEN
+        ALTER TABLE counterparty_cache
+          ADD CONSTRAINT counterparty_cache_owner_doctype_name_key
+          UNIQUE (owner_user_id, erpnext_doctype, name);
+      END IF;
+    END $$;
+  `);
+
   // Pending-invoice growth loop: invoices to non-users are stored with a
   // phone instead of a buyer_user_id. When that phone later signs up, the
   // post-provisioning binding step claims them. Relax buyer_user_id and
@@ -309,6 +336,41 @@ async function migrate() {
       updated_at TEXT NOT NULL
     )
   `);
+
+  // Pending TODOs — a shared inbox between the bot and the web app.
+  // Triggers (e.g. sales-invoice.js) enqueue rows; the bot lists them
+  // on demand ("any todos?") and either resolves them inline or sends
+  // the user to /todos. NO nagging — never volunteered by the bot.
+  //   kind            — string discriminator (e.g. 'unknown_item_purchase')
+  //   payload_json    — kind-specific data the resolver needs
+  //   related_*       — denormalized link back to the source ERPNext doc
+  //   bot_resolvable  — bot can walk the user through the resolution
+  //   web_resolvable  — web /todos page has a form for this kind
+  //   bot_prompt      — pre-rendered sentence the bot uses when listing
+  // Row deletes on resolution (no status column — history lives in the
+  // resolution doc the action creates).
+  await query(`
+    CREATE TABLE IF NOT EXISTS todos (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      related_doctype TEXT,
+      related_name TEXT,
+      bot_resolvable INTEGER NOT NULL DEFAULT 1,
+      web_resolvable INTEGER NOT NULL DEFAULT 1,
+      bot_prompt TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+  // Dedupe: one TODO per (user, kind, related_name) — if the same
+  // trigger fires twice on the same doc, the second insert no-ops.
+  await query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_todos_user_kind_related
+      ON todos(user_id, kind, related_name)
+      WHERE related_name IS NOT NULL
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_todos_user ON todos(user_id)`);
 }
 
 /**

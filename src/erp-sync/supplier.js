@@ -14,6 +14,8 @@ const { ts } = require('../log');
 const { resolvePartyAccount } = require('./party-account');
 const { linkCounterparty } = require('../links/counterparty-match');
 const { assertPhoneUnused } = require('./contact-guard');
+const { getSupplierGroupName } = require('./party-group');
+const { abbrFromUser } = require('./item-group');
 
 async function resolveOrCreateSupplier(
   user,
@@ -81,10 +83,14 @@ async function resolveOrCreateSupplier(
       }
     }
     // 3. create
+    // Per-tenant supplier_group ("Suppliers - <ABBR>") so the bot's
+    // User Permission fence keeps this Supplier scoped to this tenant.
+    // Legacy fallback only if abbr missing.
+    const supplierGroup = getSupplierGroupName(abbrFromUser(user)) || 'All Supplier Groups';
     const supplierData = {
       supplier_name: name,
       supplier_type: 'Individual',
-      supplier_group: 'All Supplier Groups',
+      supplier_group: supplierGroup,
     };
     if (currency) supplierData.default_currency = currency;
     if (phone) supplierData.mobile_no = phone;
@@ -109,9 +115,8 @@ async function resolveOrCreateSupplier(
     `INSERT INTO counterparty_cache
        (owner_user_id, name, phone, email, erpnext_doctype, erpnext_name, created_at, updated_at)
      VALUES ($1, $2, $3, $4, 'Supplier', $5, $6, $6)
-     ON CONFLICT (owner_user_id, name) DO UPDATE SET
+     ON CONFLICT (owner_user_id, erpnext_doctype, name) DO UPDATE SET
        erpnext_name = EXCLUDED.erpnext_name,
-       erpnext_doctype = EXCLUDED.erpnext_doctype,
        phone = COALESCE(counterparty_cache.phone, EXCLUDED.phone),
        email = COALESCE(counterparty_cache.email, EXCLUDED.email),
        updated_at = EXCLUDED.updated_at`,

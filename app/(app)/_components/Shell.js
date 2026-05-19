@@ -8,7 +8,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useSearchParams } from 'next/navigation';
 import {
   House,
   Tray,
@@ -19,9 +19,12 @@ import {
   Briefcase,
   UsersThree,
   ListBullets,
+  ListChecks,
   Gear,
   List,
   X,
+  HandCoins,
+  ShoppingBag,
 } from '@phosphor-icons/react';
 import LogoutButton from './LogoutButton';
 
@@ -39,8 +42,11 @@ const ICON_WEIGHT = 'regular';
 
 const NAV = [
   { href: '/dashboard', label: 'Overview', Icon: House },
-  { href: '/inbox', label: 'Inbox', Icon: Tray, badgeKey: 'pendingInboxCount' },
+  { href: '/inbox', label: 'Inbox', Icon: Tray, badgeKey: 'pendingInboxCount', badgeTone: 'emerald' },
+  { href: '/todos', label: 'Todos', Icon: ListChecks, badgeKey: 'pendingTodosCount', badgeTone: 'orange' },
   { href: '/transactions', label: 'Transactions', Icon: ArrowsLeftRight },
+  { href: '/transactions?type=Invoice', label: 'Sales', Icon: HandCoins },
+  { href: '/transactions?type=Purchase', label: 'Purchases', Icon: ShoppingBag },
   { href: '/wallets', label: 'Wallets', Icon: Wallet },
   { href: '/expenses', label: 'Expenses', Icon: Receipt },
   { href: '/inventory', label: 'Inventory', Icon: Package, showFor: new Set(['product', 'both', null]) },
@@ -50,11 +56,17 @@ const NAV = [
   { href: '/settings', label: 'Settings', Icon: Gear },
 ];
 
-export default function Shell({ user, pendingInboxCount = 0, children }) {
+const BADGE_TONE = {
+  emerald: 'bg-emerald-600 text-white',
+  orange: 'bg-orange-500 text-white',
+};
+
+export default function Shell({ user, pendingInboxCount = 0, pendingTodosCount = 0, children }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const pathname = usePathname();
+  const searchParams = useSearchParams();
 
-  const badges = { pendingInboxCount };
+  const badges = { pendingInboxCount, pendingTodosCount };
   const businessType = user.business_type || null;
   const visibleNav = NAV.filter(
     (item) => !item.showFor || item.showFor.has(businessType)
@@ -112,7 +124,7 @@ export default function Shell({ user, pendingInboxCount = 0, children }) {
         <nav className="flex-1 px-2 py-4 overflow-y-auto">
           <ul className="space-y-0.5">
             {visibleNav.map((item) => {
-              const active = isActive(pathname, item.href);
+              const active = isActive(pathname, searchParams, item.href);
               const badgeCount = item.badgeKey ? badges[item.badgeKey] : 0;
               const Icon = item.Icon;
               return (
@@ -134,8 +146,8 @@ export default function Shell({ user, pendingInboxCount = 0, children }) {
                     <span className="flex-1">{item.label}</span>
                     {badgeCount > 0 && (
                       <span
-                        className={`text-[10px] font-medium px-1.5 py-0.5 rounded-full ${
-                          active ? 'bg-white text-slate-900' : 'bg-emerald-600 text-white'
+                        className={`shrink-0 inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1 text-[10px] leading-none font-semibold rounded-full ${
+                          active ? 'bg-white text-slate-900' : (BADGE_TONE[item.badgeTone] || BADGE_TONE.emerald)
                         }`}
                       >
                         {badgeCount}
@@ -166,10 +178,28 @@ export default function Shell({ user, pendingInboxCount = 0, children }) {
 /**
  * `/dashboard` matches exactly. Other top-level routes match their prefix
  * so /contacts/abc-trading still highlights "Contacts".
+ *
+ * Items can also encode a query (e.g. /transactions?type=Invoice for
+ * "Sales"). When the href has a query, both pathname and the type filter
+ * must match. The plain /transactions item then suppresses itself when
+ * type is Invoice or Purchase so the more-specific item wins.
  */
-function isActive(pathname, href) {
+function isActive(pathname, searchParams, href) {
   if (!pathname) return false;
-  if (href === '/dashboard') return pathname === '/dashboard';
-  return pathname === href || pathname.startsWith(href + '/');
+  const [hrefPath, hrefQuery] = href.split('?');
+  if (hrefPath === '/dashboard') return pathname === '/dashboard';
+
+  const pathMatch = pathname === hrefPath || pathname.startsWith(hrefPath + '/');
+  if (!pathMatch) return false;
+
+  if (hrefQuery) {
+    const wanted = new URLSearchParams(hrefQuery).get('type');
+    return searchParams?.get('type') === wanted;
+  }
+  if (hrefPath === '/transactions') {
+    const t = searchParams?.get('type');
+    if (t === 'Invoice' || t === 'Purchase') return false;
+  }
+  return true;
 }
 

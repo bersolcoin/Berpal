@@ -239,6 +239,7 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
 
   return (
     <div>
+      {busy && step === TOTAL_STEPS && <CreatingOverlay />}
       <Stepper current={step} />
 
       {step === 1 && (
@@ -306,7 +307,7 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
             disabled={busy}
             className="px-5 py-2.5 text-sm bg-slate-900 text-white rounded-lg hover:bg-slate-800 transition disabled:opacity-50 font-medium"
           >
-            {busy ? 'Creating your workspace…' : 'Create my workspace'}
+            {busy ? '…' : 'Create my workspace'}
           </button>
         )}
       </div>
@@ -314,12 +315,26 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
       {error && (
         <p className="mt-3 text-sm text-red-700 text-right">{error}</p>
       )}
+    </div>
+  );
+}
 
-      {busy && (
-        <p className="mt-3 text-xs text-slate-500 italic text-right">
-          This usually takes 5–10 seconds. We&rsquo;re setting up ERPNext, creating accounts, posting opening balances…
-        </p>
-      )}
+/**
+ * Full-screen overlay shown while ERPNext provisioning runs (5–10s
+ * usually). Locks the UI so the user can't double-submit or wander to
+ * a different step mid-flight.
+ */
+function CreatingOverlay() {
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-100/95 backdrop-blur-sm">
+      <img src="/logo.svg" alt="Berpal" className="w-12 h-12 mb-6" />
+      <div
+        className="w-8 h-8 rounded-full border-2 border-slate-300 border-t-slate-900 animate-spin"
+        role="status"
+        aria-label="Creating your workspace"
+      />
+      <p className="mt-6 text-sm font-medium text-slate-700">Creating your workspace…</p>
+      <p className="mt-1.5 text-xs text-slate-500">Usually 5–10 seconds.</p>
     </div>
   );
 }

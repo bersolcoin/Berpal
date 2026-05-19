@@ -8,7 +8,7 @@
  *
  * Matching strategy: normalize both sides to bare digits with a leading +
  * (E.164-ish), then compare. Handles common formatting variants:
- *   "+66 838 883 866" ≈ "+66838883866" ≈ "+66-838-883-866"
+ *   "+66 838 883 866" ≈ "+12345550111" ≈ "+66-838-883-866"
  *
  * Always uses the OWNER side's phone numbers — we never expose other
  * users' contact details to a tenant.

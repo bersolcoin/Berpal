@@ -26,7 +26,7 @@ function friendlyAccountName(erpAccountName) {
  *
  * Format: "<From>(<CUR>) to <To>(<CUR>)" — money flows source → destination.
  * Per-side currency is shown so multi-currency moves are unambiguous, e.g.
- * "Jameel Crest Gems(USD) to Cash(THB)" when a USD invoice is settled in THB cash.
+ * "Acme Trading(USD) to Cash(THB)" when a USD invoice is settled in THB cash.
  *
  *   Expense:   from = cash/bank/card wallet, to = expense category
  *   Income:    from = revenue category,      to = cash/bank/card wallet

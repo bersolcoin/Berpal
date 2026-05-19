@@ -21,8 +21,8 @@
  *
  * DESTRUCTIVE AND IRREVERSIBLE. Triple-check the name.
  *
- *   node scripts/delete-erp-company.js "KruZn Co"
- *   node scripts/delete-erp-company.js "DS Gems" --yes  # skip confirm
+ *   node scripts/delete-erp-company.js "Acme Trading"
+ *   node scripts/delete-erp-company.js "Acme Trading" --yes  # skip confirm
  */
 
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });

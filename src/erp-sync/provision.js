@@ -27,10 +27,72 @@ const { ts } = require('../log');
 const erpnext = require('../erpnext');
 const { resolveWalletAccount } = require('./wallet');
 const { recordOpeningBalance } = require('./opening-balance');
-const { ensureCompanyItemGroup } = require('./item-group');
+const { ensureCompanyItemGroup, getCompanyItemGroupName } = require('./item-group');
+const { ensureCustomerGroup, ensureSupplierGroup, getCustomerGroupName, getSupplierGroupName } = require('./party-group');
+const { applyTenantFence } = require('./user-permission');
 const { fetchRate } = require('../exchange');
 const { bindPendingByPhone } = require('../links/linked-transactions');
 const { refreshCoaCache } = require('./coa-cache');
+const twilio = require('../twilio-client');
+
+// Roles granted to every per-tenant bot user.
+//
+// CRITICAL: System Manager is INTENTIONALLY NOT included. System
+// Manager bypasses User Permissions, which would defeat the per-tenant
+// fence we set up via applyTenantFence (Company / Customer Group /
+// Supplier Group / Item Group restrictions). The whole privacy model
+// depends on the bot being unable to see other tenants' data — so
+// we grant full functional Manager + User roles for every module the
+// tenant might use, then rely on User Permissions for isolation.
+//
+// Intentionally NOT included:
+//   • System Manager           — bypasses User Permissions; would leak across tenants
+//   • Script Manager           — can run arbitrary server-side Python
+//   • Supplier / Customer / Employee — portal roles for outside parties, not staff
+//   • Website / Dashboard / Workspace / Translator / Newsletter / Knowledge Base
+//                              — UI / content roles, not bookkeeping-relevant
+//   • Auditor / Analytics / Prepared Report User — read-only specializations
+//
+// Within the fence, the bot has full create/write/delete on its tenant's
+// data across every functional module ERPNext ships with.
+const ROLES_FOR_BOT_USER = [
+  // Accounting
+  { role: 'Accounts Manager' },
+  { role: 'Accounts User' },
+  { role: 'Report Manager' },
+  // Sales
+  { role: 'Sales Manager' },
+  { role: 'Sales Master Manager' },
+  { role: 'Sales User' },
+  // Purchase
+  { role: 'Purchase Manager' },
+  { role: 'Purchase Master Manager' },
+  { role: 'Purchase User' },
+  // Stock / Items
+  { role: 'Stock Manager' },
+  { role: 'Stock User' },
+  { role: 'Item Manager' },
+  // HR
+  { role: 'HR Manager' },
+  { role: 'HR User' },
+  // Manufacturing
+  { role: 'Manufacturing Manager' },
+  { role: 'Manufacturing User' },
+  // Projects
+  { role: 'Projects Manager' },
+  { role: 'Projects User' },
+  // Delivery / Fleet / Maintenance / Quality
+  { role: 'Delivery Manager' },
+  { role: 'Delivery User' },
+  { role: 'Fleet Manager' },
+  { role: 'Maintenance Manager' },
+  { role: 'Maintenance User' },
+  { role: 'Quality Manager' },
+  // Other ops
+  { role: 'Fulfillment User' },
+  { role: 'Marketing Manager' },
+  { role: 'Support Team' },
+];
 
 function deriveAbbreviation(businessName) {
   const words = businessName.trim().split(/\s+/).filter(Boolean);
@@ -207,14 +269,39 @@ async function provisionTenant({
         ...(lastName ? { last_name: lastName } : {}),
         send_welcome_email: 0,
         enabled: 1,
-        roles: [
-          { role: 'Accounts User' },
-          { role: 'Accounts Manager' },
-          { role: 'Sales User' },
-          { role: 'Purchase User' },
-          { role: 'Stock User' },
-        ],
+        // CRITICAL — REST API access requires System User. Without this
+        // the role assignment below is meaningless (Website Users can't
+        // hit /api/resource/* regardless of roles). Default in many
+        // Frappe versions is "Website User" if omitted, so always set
+        // explicitly.
+        user_type: 'System User',
+        roles: ROLES_FOR_BOT_USER,
       });
+
+      // Frappe's User REST endpoint silently drops the `roles` child
+      // table on insert in many versions — the user ends up without
+      // permissions, every Supplier/Customer/Invoice create then fails
+      // with "User X does not have doctype access". PUT both fields
+      // immediately after to force-persist. Idempotent.
+      try {
+        await admin.updateResource('User', userEmail, {
+          user_type: 'System User',
+          roles: ROLES_FOR_BOT_USER,
+        });
+        // Per-user permission cache: Frappe builds it lazily on first
+        // access and doesn't invalidate when the User doc is updated
+        // via REST. Clear it explicitly so the brand-new roles take
+        // effect on the very first /api/resource/* call.
+        try {
+          await admin.callMethod('frappe.clear_cache', { user: userEmail });
+        } catch (cacheErr) {
+          console.warn(`• [provision] [${ts()}] cache-clear warning: ${cacheErr.message}`);
+        }
+        console.log(`• [provision] [${ts()}] user_type + roles confirmed + cache cleared on "${userEmail}"`);
+      } catch (roleErr) {
+        console.warn(`• [provision] [${ts()}] role PUT failed for "${userEmail}": ${roleErr.message}`);
+      }
+
       partial.user = userEmail;
       console.log(`• [provision] [${ts()}] created User "${userEmail}"`);
     } catch (createErr) {
@@ -268,22 +355,47 @@ async function provisionTenant({
     console.warn(`• [provision] [${ts()}] could not set FX account: ${err.message}`);
   }
 
-  // ── 4b. Per-company Item Group ─────────────────────────────────────
-  // Tag the tenant's namespace for Items so we can scope inventory views
-  // and (later) hard-restrict via User Permissions.
+  // ── 4b. Per-tenant master-data groups + User Permission fence ───────
+  // ERPNext multi-tenancy: bind the bot user to its Company AND to
+  // per-tenant Customer/Supplier/Item groups so it can't see or modify
+  // any other tenant's master data via the API. Bot user has no
+  // System Manager role, so these User Permissions actually fire.
+  //
+  // The admin client (Administrator) creates the groups + the
+  // UserPermission rows; the bot user can only USE them.
+  const adminErp = {
+    getResource: (dt, n) => admin.getResource(dt, n),
+    createResource: (dt, d) => admin.createResource(dt, d),
+    listResource: (dt, args) => admin.listResource(dt, args),
+  };
+  const itemGroupName = getCompanyItemGroupName(abbr);
+  const customerGroupName = getCustomerGroupName(abbr);
+  const supplierGroupName = getSupplierGroupName(abbr);
   try {
-    const adminErp = {
-      // Reuse the admin client for this one call — works because
-      // ensureCompanyItemGroup only does Item Group ops which don't need
-      // user scoping. Tiny adapter to match the ErpNextClient interface
-      // ensureCompanyItemGroup expects.
-      getResource: (dt, n) => admin.getResource(dt, n),
-      createResource: (dt, d) => admin.createResource(dt, d),
-    };
     await ensureCompanyItemGroup(adminErp, abbr);
-    partial.item_group = `Items - ${abbr}`;
+    await ensureCustomerGroup(adminErp, abbr);
+    await ensureSupplierGroup(adminErp, abbr);
+    partial.item_group = itemGroupName;
+    partial.customer_group = customerGroupName;
+    partial.supplier_group = supplierGroupName;
   } catch (err) {
-    console.warn(`• [provision] [${ts()}] Item Group create skipped: ${err.message}`);
+    console.warn(`• [provision] [${ts()}] per-tenant group create skipped: ${err.message}`);
+  }
+
+  // Apply the fence. Failures here are loud (warn only) so partial
+  // provisioning doesn't get rolled back, but they're a privacy risk
+  // — operator should re-run scripts/harden-tenant.js to repair.
+  try {
+    await applyTenantFence(admin, {
+      user: userEmail,
+      company: companyName,
+      customerGroup: customerGroupName,
+      supplierGroup: supplierGroupName,
+      itemGroup: itemGroupName,
+    });
+    console.log(`• [provision] [${ts()}] tenant fence applied to "${userEmail}"`);
+  } catch (err) {
+    console.warn(`• [provision] [${ts()}] tenant fence skipped (RUN harden-tenant!): ${err.message}`);
   }
 
   // ── 5. Provision starter wallets ────────────────────────────────────
@@ -396,9 +508,28 @@ async function provisionTenant({
     console.warn(`• [provision] [${ts()}] CoA cache seed failed: ${err.message}`);
   }
 
-  // ── 7. Claim any invoices waiting for this phone ─────────────────────
+  // ── 7. Welcome WhatsApp ──────────────────────────────────────────────
+  // Send the welcome message FIRST so it lands before any catch-up
+  // invoice messages from bindPendingByPhone below. Fire-and-forget —
+  // a Twilio hiccup here shouldn't fail onboarding.
+  try {
+    // Use the user's typed business_name (not ERPNext's normalized
+    // companyName) — ERPNext strips '&' and other punctuation, which
+    // makes "SS & Co" come back as "SS Co" and feels wrong on the
+    // very first message the user sees.
+    await twilio.sendText(
+      phone,
+      `Congratulations! I'm here to assist you with ${business_name}. Let me know when you need me.`
+    );
+    console.log(`• [provision] [${ts()}] welcome message sent to ${phone}`);
+  } catch (err) {
+    console.warn(`• [provision] [${ts()}] welcome message failed: ${err.message}`);
+  }
+
+  // ── 8. Claim any invoices waiting for this phone ─────────────────────
   // If suppliers have already sent invoices to this user's phone (before
-  // they signed up), bind them so they show up in /inbox.
+  // they signed up), bind them so they show up in /inbox. bindPendingByPhone
+  // also fires a catch-up WhatsApp per claimed row.
   let pendingInvoicesCount = 0;
   try {
     pendingInvoicesCount = await bindPendingByPhone(userId, phone);

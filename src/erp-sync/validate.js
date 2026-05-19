@@ -82,7 +82,9 @@ function validateDraft(draft, user) {
         ask_user: tt === 'invoice_issued' ? 'Who did you sell to?' : 'Who sent the bill?',
       });
     }
-    if (!draft.payment_terms && !draft.due_date) {
+    // payment_terms unnecessary when the invoice is being paid in the same
+    // breath (paid_now=true) — server defaults to net_0. Otherwise ask.
+    if (!draft.paid_now && !draft.payment_terms && !draft.due_date) {
       needs.push({
         field: 'payment_terms',
         priority: 2,
@@ -90,9 +92,20 @@ function validateDraft(draft, user) {
         ask_user: 'Was it cash now or on terms (e.g. net 30, in 7 days)?',
       });
     }
+    // paid_now requires the wallet leg (which Cash / Bank / Card) so the
+    // server can post the matching Payment Entry. Wallet name is enforced
+    // separately below via the (1100|2100) → wallet_name rule.
+    if (draft.paid_now && !draft.payment_account_code) {
+      needs.push({
+        field: 'payment_account_code',
+        priority: 2,
+        needs_user_input: false,
+        instruction: "Pick from user words for the paid_now Payment Entry: default '1000' (Cash); 'bank/transfer/wire/wired/deposited' → '1100'; 'card/credit card/visa/mastercard/amex' → '2100'.",
+      });
+    }
     // Capture phone when creating a NEW counterparty. Server-side flag
     // _counterparty_known is set by update_draft after the cache lookup.
-    // Phone is the seed for the viral on-boarding loop: if Jameel later
+    // Phone is the seed for the viral on-boarding loop: if Acme later
     // signs up to the service via this phone, we can offer to import the
     // mirror set of transactions as his purchases in one click.
     if (

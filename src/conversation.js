@@ -5,12 +5,14 @@ const exchange = require('./exchange');
 const erpnext = require('./erpnext');
 const erpSync = require('./erp-sync');
 const erpQuery = require('./erp-query');
+const todos = require('./todos');
 const { validateDraft: validateDraftServer } = require('./erp-sync/validate');
 const { resolveOrCreateCustomer } = require('./erp-sync/customer');
 const { resolveOrCreateSupplier } = require('./erp-sync/supplier');
 const { resolveWalletAccount } = require('./erp-sync/wallet');
 const { resolveErpAccount } = require('./erp-sync/account');
 const { recordOpeningBalance } = require('./erp-sync/opening-balance');
+const { linkCounterparty } = require('./links/counterparty-match');
 
 // Inlined twin of app/(app)/_components/format.js#friendlyAccountName.
 // Kept duplicate (rather than require'd) because the app/ file is JSX/ESM
@@ -152,6 +154,10 @@ const TOOLS = [
             type: 'string',
             description: 'For transaction_type=payment ONLY: the ERPNext name of the invoice/bill being settled (e.g. "ACC-SINV-2026-00001" for AR, "ACC-PINV-2026-00001" for AP). Get this from query_open_invoices.invoices[N].erpnext_name. Required for payment transactions.',
           },
+          paid_now: {
+            type: 'boolean',
+            description: 'For transaction_type=invoice_issued / bill_received ONLY. Set TRUE when the same message says the invoice/bill was paid at the time it was raised (e.g. "sold X to Acme for 2000 USD, got paid cash"; "received a bill from Acme for 500 USD, paid via BBL"). On save, the server posts BOTH the Invoice/Bill AND a matching Payment Entry that settles it in one shot, so AR/AP is created and immediately cleared. Requires payment_account_code (and wallet_name if bank/card). When FALSE/omitted, only the Invoice/Bill is posted and AR/AP stays open until a later "X paid me Y" / "I paid X Y" message.',
+          },
           invoice_number: {
             type: 'string',
             description: "External invoice/bill reference number (the supplier's number for bill_received, your own number for invoice_issued).",
@@ -235,7 +241,7 @@ const TOOLS = [
         properties: {
           counterparty_name: {
             type: 'string',
-            description: 'Natural-language counterparty name as the user said it (e.g. "Jameel Crest Gems"). The bot resolves this to the ERPNext party name internally.',
+            description: 'Natural-language counterparty name as the user said it (e.g. "Acme Trading"). The bot resolves this to the ERPNext party name internally.',
           },
           party_type: {
             type: 'string',
@@ -299,6 +305,34 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'query_pending_todos',
+      description:
+        'List the user\'s pending TODOs (deferred follow-up questions about past transactions, e.g. "you sold X but I don\'t know who you bought it from"). Use ONLY when the user explicitly asks ("any todos?", "anything pending?", "what should I do?", "any follow-ups?"). NEVER proactively. Returns id, kind, and the question the user needs to answer.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'resolve_todo',
+      description:
+        'Resolve a pending TODO with the user\'s answer. Call after the user has answered the question from query_pending_todos. Pass the todo `id` and an `input` object whose shape depends on the TODO kind — for unknown_item_purchase the fields are { supplier_name, unit_cost, purchase_date?, skip? }. Use skip:true if the user says "skip it" / "I don\'t remember" — that just deletes the TODO without creating any document.',
+      parameters: {
+        type: 'object',
+        required: ['id', 'input'],
+        properties: {
+          id: { type: 'integer', description: 'The TODO id from query_pending_todos.' },
+          input: {
+            type: 'object',
+            description: 'Kind-specific answer payload. See tool description.',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'query_cash_bank_balance',
       description:
         'List the user\'s current cash, bank, and credit-card balances per wallet, with totals per currency. Use when the user asks "how much money do I have", "what\'s my bank balance", "current cash position", "what\'s in my wallets". Credit-card balances come back negative (you owe).',
@@ -318,7 +352,7 @@ const TOOLS = [
     function: {
       name: 'create_counterparty',
       description:
-        'STANDALONE: create a new contact (Customer, Supplier, or Both) in ERPNext WITHOUT logging a transaction. Use when the user explicitly asks to add a contact ("add contact for X", "save Jameel as a new customer", "new supplier"), or when a vCard share has no transaction context. For transaction flows (sales, bills, payments) do NOT call this — the counterparty is auto-created at save time. Returns the ERPNext party name(s) created.',
+        'STANDALONE: create a new contact (Customer, Supplier, or Both) in ERPNext WITHOUT logging a transaction. Use when the user explicitly asks to add a contact ("add contact for X", "save Acme as a new customer", "new supplier"), or when a vCard share has no transaction context. For transaction flows (sales, bills, payments) do NOT call this — the counterparty is auto-created at save time. Returns the ERPNext party name(s) created.',
       parameters: {
         type: 'object',
         required: ['name', 'party_type'],
@@ -331,7 +365,7 @@ const TOOLS = [
           },
           phone: {
             type: 'string',
-            description: 'E.164 phone (e.g. "+66838883866"). If user gave a bare number, apply country-code inference first.',
+            description: 'E.164 phone (e.g. "+12345550111"). If user gave a bare number, apply country-code inference first.',
           },
           email: { type: 'string', description: 'Optional.' },
           nickname: { type: 'string', description: 'Optional fuzzy alias like "tall mike".' },
@@ -441,11 +475,17 @@ WRITES (state-changing):
   vCard arrives standalone → still use this function.
 
 • update_draft — user is DESCRIBING a transaction. Stages fields onto a draft. Cover:
-  - Sale on terms: "sold X to Y for Z net 30", "invoiced X", "sent invoice" → transaction_type='invoice_issued', direction='income'
-  - Bill received: "got a bill from X for Z net 30", "X invoiced me" → transaction_type='bill_received', direction='expense'
-  - Cash income/expense: "paid X for Y", "spent X on Y", "got X cash for Y", "lunch 250" → transaction_type='cash', direction='expense'/'income'
-  - Payment received: "X paid me Y", "X wired me Y", "received Y from X" → transaction_type='payment', direction='income'
-  - Payment made: "I paid X Y", "I sent X Y for the bill" → transaction_type='payment', direction='expense'
+
+  KEY DECISION — named counterparty changes the type:
+    Any sale or purchase mentioning a SPECIFIC counterparty name ("Acme", "BBL", a person's name, a company) creates AR or AP that needs to be tracked per-party. Pick invoice_issued / bill_received — NOT cash — even if the same message says "paid cash". The paid_now flag (below) handles the immediate-payment case. Generic cash income/expense WITHOUT a named counterparty (walk-in sale, lunch, parking, coffee, "got 50 cash from the till") is the only case that uses transaction_type='cash'.
+
+  - Sale to named customer, paid SAME message: "sold X to Acme for 2000 USD got paid cash", "invoiced Acme 500 paid via BBL" → transaction_type='invoice_issued', direction='income', paid_now=true, payment_account_code (+ wallet_name if bank/card). Server posts BOTH a Sales Invoice and a Payment Entry settling it.
+  - Sale to named customer on terms: "sold X to Acme for 2000 USD net 30", "invoiced Acme" → transaction_type='invoice_issued', direction='income', paid_now=false (or omit). AR stays open.
+  - Bill from named supplier, paid SAME message: "bought X from Acme for 500 USD paid cash" → transaction_type='bill_received', direction='expense', paid_now=true, payment_account_code.
+  - Bill from named supplier on terms: "got a bill from Acme for 500 USD net 30" → transaction_type='bill_received', direction='expense', paid_now=false.
+  - Cash income/expense (NO named counterparty): "spent 250 on lunch", "paid 50 for parking", "got 100 cash sale" → transaction_type='cash', direction='expense'/'income'.
+  - Payment received (settling a PRIOR invoice): "Acme paid me 500", "received 500 from Acme for the invoice" → transaction_type='payment', direction='income'. Use query_open_invoices first to find which SI to settle.
+  - Payment made (settling a PRIOR bill): "I paid Acme 500", "sent Acme the 500 for the bill" → transaction_type='payment', direction='expense'. query_open_invoices first.
   - Rate override / corrections: any time the user adjusts a field on the current draft.
   Extract whatever fields are in the message; the server's validation result tells you what's still needed.
 
@@ -465,6 +505,10 @@ READS (no state change):
 
 • query_cash_bank_balance — "how much money do I have", "what's my bank balance", "current cash position", "what's in my wallets".
 
+• query_pending_todos — ONLY when user explicitly asks for pending things: "any todos?", "anything pending?", "what should I do?", "any follow-ups?", "what have I missed?". NEVER volunteer this. NEVER tack it onto a save confirmation. If count=0, reply "Nothing pending." If count>0, list the questions one per line numbered, then stop — let the user pick which to answer.
+
+• resolve_todo — only after a query_pending_todos has been shown and the user supplies an answer to one of the questions. Pass id + input. For unknown_item_purchase the input is { supplier_name, unit_cost, purchase_date?, skip? }. Use skip:true if the user says "skip", "I don't remember", "drop it" — that just deletes the TODO without writing anything.
+
 • get_counterparty_details — identity/contact lookup for ONE party. "What currency is X", "X's phone", "what's Acme's email", "is X a customer or supplier", "details of X". Returns name, default_currency, phone, email, group per side. Don't use for balance — use query_balance_with_counterparty for that.
 
 ═══════════════════════════════════════════════════════════════════
@@ -478,11 +522,11 @@ ${coaListing}
   Decision order — pick the FIRST match in this list:
     1. If message contains "purchase", "purchased", "bought ... stones/gems/parcel/stock/inventory", or it's clearly a supplier bill for goods → 5000 (COGS).
     2. If message clearly matches a specific category by its keywords above → that category.
-    3. Income default → 4000 (Sales Revenue).
+    3. Income: SERVICE-shaped (intangible work: consulting, repair, design, fees, labor, advice, retainer, polishing, cutting, appraisal, brokerage) → 4100. PRODUCT-shaped (a physical item / SKU was handed over: gemstone, parcel, jewellery, goods, merchandise) → 4000. If ambiguous and the user's business_type is 'service' → prefer 4100; if 'product' → prefer 4000; if 'both' or unset → ask one short clarifying question ("was this for goods or for a service?") before picking. The downstream TODO system uses 4100 to skip "where did you buy it?" questions, so getting this right matters.
     4. Expense fallback → 5900 (Other Expenses) — ONLY when nothing above fits and the word "purchase"/"goods"/"stock" is NOT present.
 
 ENTITY PARSING:
-• Counterparty: word right after "to" / "from" (single name or multi-word like "Jameel Crest Gems"). NEVER ask "who?" when "to <name>" is in the message.
+• Counterparty: word right after "to" / "from" (single name or multi-word like "Acme Trading"). NEVER ask "who?" when "to <name>" is in the message.
 • Wallet identifier: "BBL", "SCB", "HSBC", "KBank" → wallet_name, payment_account_code='1100' (bank). "AmEx", "Visa", "Mastercard" → wallet_name, payment_account_code='2100' (card). Bare "cash" → payment_account_code='1000' (no wallet_name needed).
 • Amount: number + currency. If user wrote "5000 us$" or "5000 USD", currency="USD", amount=5000. If currency missing, default to ${user.default_currency} and the server will mark "(assumed)".
 • Date: "today"="${today}", "yesterday"=date-1, "last X"=relative. Default transaction_date=today.
@@ -502,22 +546,33 @@ Date: YYYY/MM/DD
 Amount: <pick ONE form>
    Form A (transaction currency == ${user.reporting_currency}):   Amount: X,XXX ${user.reporting_currency}
    Form B (foreign currency):                                    Amount: X,XXX ${user.reporting_currency} (Y,YYY <foreign_ccy> @ R.RR)
-Type: <Expense | Income | Invoice Sent | Bill Received | Payment | Transfer>
-Account: <source_name> → <destination_name>
+Type: <Sale | Purchase | Expense | Income | Invoice Sent | Bill Received | Payment | Transfer>
+   Use "Sale"     when transaction_type='invoice_issued' AND paid_now=true.
+   Use "Purchase" when transaction_type='bill_received'  AND paid_now=true.
+   Use "Invoice Sent"     for invoice_issued without paid_now.
+   Use "Bill Received"    for bill_received without paid_now.
+Account: <source_name> → <destination_name>     (one-arrow form; see paid_now below for two-line form)
 Counterparty: <name>            (omit entirely if no counterparty)
-Due: YYYY/MM/DD (Net N)         (only for Invoice Sent or Bill Received)
+Due: YYYY/MM/DD (Net N)         (only for Invoice Sent or Bill Received WITHOUT paid_now)
 {settles_preview.rendered}      (only for Payment, when present — drop the rendered string in VERBATIM, including its own line break)
 Note: <description>             (omit if no description)
 
 Choose below or tell me what to fix.
 
 ACCOUNT ARROW (convention: "<credit side> → <debit side>"):
-- Cash income:       Sales Revenue → <wallet_name>
-- Cash expense:      <wallet_name> → <expense_category>
-- Invoice Sent:      Sales Revenue → Receivable from <counterparty_name>
-- Bill Received:     <expense_category> → Payable to <counterparty_name>
-- Payment received:  Receivable from <counterparty_name> → <wallet_name>
-- Payment made:      <wallet_name> → Payable to <counterparty_name>
+- Cash income (no counterparty):  Sales Revenue → <wallet_name>
+- Cash expense (no counterparty): <wallet_name> → <expense_category>
+- Invoice Sent:                   Sales Revenue → Receivable from <counterparty_name>
+- Bill Received:                  <expense_category> → Payable to <counterparty_name>
+- Payment received:               Receivable from <counterparty_name> → <wallet_name>
+- Payment made:                   <wallet_name> → Payable to <counterparty_name>
+
+PAID-NOW (paid_now=true on invoice_issued or bill_received) — TWO ENTRIES, render both on their own lines so the user sees the full dual-post:
+- Sale (paid):     Entry 1: Sales Revenue → Receivable from <counterparty_name>
+                   Entry 2: Receivable from <counterparty_name> → <wallet_name>
+- Purchase (paid): Entry 1: <expense_category> → Payable to <counterparty_name>
+                   Entry 2: Payable to <counterparty_name> → <wallet_name>
+Skip the Due line in paid_now cases (it's paid).
 
 IMPORTANT: when request_confirmation returns resolved_accounts (with wallet_display / category_display), use THOSE strings VERBATIM as <wallet_name> and <expense_category> in the Account: line. They are the real ERPNext leaf names the save will use (e.g. "cash (HKD)", "Miscellaneous Expenses") — showing generic words like "Cash" hides which currency leaf will be touched.
 
@@ -526,24 +581,24 @@ QUERY ANSWERS — short, scannable, currency-grouped:
 (query_balance_with_counterparty with party_type='Both' — render only sides that have data)
 
 Both sides:
-"With Jameel Crest Gems:
-• Jameel owes you: 12,000 USD (1 invoice)
-• You owe Jameel: 3,000 USD (1 bill)
+"With Acme Trading:
+• Acme owes you: 12,000 USD (1 invoice)
+• You owe Acme: 3,000 USD (1 bill)
 • Net: 9,000 USD in your favor"
 
 Only AR:
-"With Jameel Crest Gems:
-• Jameel owes you: 45,000 USD (1 invoice)"
+"With Acme Trading:
+• Acme owes you: 45,000 USD (1 invoice)"
 
 Only AP:
 "With Acme Gems:
 • You owe Acme: 5,000 USD (1 bill)"
 
 Advance only (no invoices):
-"Jameel has 5,000 USD on advance with you — no open invoices."
+"Acme has 5,000 USD on advance with you — no open invoices."
 
 Empty:
-"Nothing outstanding with Jameel."
+"Nothing outstanding with Acme."
 
 (query_cash_bank_balance)
 "Cash position:
@@ -554,7 +609,7 @@ Totals: 212,000 THB + 8,000 USD"
 
 (query_open_invoices)
 "You have 2 unpaid receivables:
-• ACC-SINV-2026-00001 to Jameel Crest Gems — 45,000 USD (1,444,500 THB @ 32.10), due 2026/06/11
+• ACC-SINV-2026-00001 to Acme Trading — 45,000 USD (1,444,500 THB @ 32.10), due 2026/06/11
 • ACC-SINV-2026-00003 to Vicky FEI — 50,000 USD (1,620,750 THB @ 32.415), due 2026/08/10"
 
 Show overdue with "(OVERDUE by N days)" tag. Empty results: state plainly.
@@ -566,10 +621,13 @@ AMBIGUOUS RESPONSES — when a function returns ambiguous_wallet or ambiguous_co
 • HSBC Singapore Bank (USD)"
 
 SUCCESS REPLIES — ONLY after a function returned ok:true:
-• Sale/bill saved:        "Saved ✓\\nRef: <erpnext_name>"
-• Payment saved:          "Saved ✓\\nRef: <erpnext_name>"
-• Wallet created:         "Added <wallet_name> <currency> <type> ✓" (+ "(opening balance N CCY)" if a JE was booked)
-• Counterparty created:   "Added <name> as a <currency> <party_type> ✓ (<phone if any>)"
+• Sale/bill saved (no payment):    "Saved ✓\\nRef: <erpnext_name>"
+• Sale/bill saved (paid_now ok):   "Saved ✓\\nInvoice: <erpnext_name>\\nPayment: <payment_entry_name>"
+• Sale/bill saved (paid_now FAIL): "Invoice saved ✓ <erpnext_name>\\nPayment didn't post: <payment_entry_error>\\nTell me when you settle it (e.g. \\"<counterparty> paid me <amount> <ccy>\\") and I'll book the payment."
+• Payment saved (standalone):      "Saved ✓\\nRef: <erpnext_name>"
+• Cash JE saved:                   "Saved ✓\\nRef: <erpnext_name>"
+• Wallet created:                  "Added <wallet_name> <currency> <type> ✓" (+ "(opening balance N CCY)" if a JE was booked)
+• Counterparty created:            "Added <name> as a <currency> <party_type> ✓ (<phone if any>)"
 
 CHITCHAT (no function called):
 • Greeting → "Hey! I help log transactions and answer questions about your books. What would you like to do?"
@@ -722,9 +780,19 @@ const STANDALONE_TOOLS_WITH_PENDING = {
  */
 async function dryResolveAccounts(ctx) {
   const draft = ctx.draft || {};
-  if (draft.transaction_type !== 'cash') return null;
   if (draft.direction === 'transfer') return null;
-  if (!draft.payment_account_code || !draft.category_code || !draft.currency) return null;
+  if (!draft.currency) return null;
+
+  // We dry-resolve for two shapes:
+  //   1. transaction_type='cash'  → wallet + category
+  //   2. invoice/bill + paid_now  → wallet + category (the PE leg's wallet
+  //      is the same as the user-typed payment_account_code)
+  const isCash = draft.transaction_type === 'cash';
+  const isPaidNowInvoice =
+    (draft.transaction_type === 'invoice_issued' || draft.transaction_type === 'bill_received') &&
+    draft.paid_now;
+  if (!isCash && !isPaidNowInvoice) return null;
+  if (!draft.payment_account_code || !draft.category_code) return null;
 
   try {
     const erp = erpnext.forUser(ctx.user);
@@ -807,39 +875,106 @@ async function _runTool(toolName, args, ctx) {
         delete ctx.draft.exchange_rate_source;
       }
 
-      // Counterparty short-form resolution. If the LLM passed counterparty_name
-      // and it fuzzy-matches an existing cached customer/supplier, swap the
-      // short form for the full name SO the confirmation card shows the
-      // resolved identity. If there are MULTIPLE candidates, don't pick — return
-      // them to the LLM so it can ask the user. Only acts when counterparty_name
-      // was part of THIS update (so we don't repeatedly re-resolve on every call).
-      // Also tags _counterparty_known on the draft so the validator can ask for
-      // a phone number when this is a NEW counterparty being created.
+      // Counterparty short-form resolution + existence check.
+      //
+      // Hybrid lookup: PG cache first (fast path), ERPNext fallback on miss.
+      // The cache is fast but not authoritative — a customer may exist in
+      // ERPNext from a previous flow without ever being cached for this
+      // owner. ERPNext is the source of truth, so on a cache miss we
+      // round-trip once and pre-warm the cache so subsequent calls stay
+      // local. Sets _counterparty_known so the validator only asks for a
+      // phone when the counterparty is genuinely new.
       if (args && Object.prototype.hasOwnProperty.call(args, 'counterparty_name') && args.counterparty_name) {
         const wantedDoctype =
           ctx.draft.transaction_type === 'bill_received' ? 'Supplier' : 'Customer';
-        const fuzzy = await query(
+
+        const cacheFuzzy = await query(
           `SELECT name, erpnext_name FROM counterparty_cache
            WHERE owner_user_id = $1 AND erpnext_doctype = $2
              AND (LOWER(name) LIKE LOWER($3) OR LOWER($4) LIKE LOWER('%' || name || '%'))
            ORDER BY id DESC`,
           [ctx.user.id, wantedDoctype, `%${args.counterparty_name}%`, args.counterparty_name]
         );
-        if (fuzzy.rowCount === 1 && fuzzy.rows[0].name !== args.counterparty_name) {
-          const fullName = fuzzy.rows[0].name;
-          ctx.draft.counterparty_name = fullName;
-          console.log(`• [conversation] [${ts()}] counterparty resolved "${args.counterparty_name}" → "${fullName}" (1 cache match)`);
-        } else if (fuzzy.rowCount > 1) {
-          const candidates = fuzzy.rows.map((r) => r.name);
-          console.log(`• [conversation] [${ts()}] counterparty ambiguous "${args.counterparty_name}" → ${candidates.join(', ')}`);
+
+        if (cacheFuzzy.rowCount === 1) {
+          if (cacheFuzzy.rows[0].name !== args.counterparty_name) {
+            ctx.draft.counterparty_name = cacheFuzzy.rows[0].name;
+            console.log(`• [conversation] [${ts()}] counterparty resolved "${args.counterparty_name}" → "${cacheFuzzy.rows[0].name}" (1 cache match)`);
+          }
+          ctx.draft._counterparty_known = true;
+        } else if (cacheFuzzy.rowCount > 1) {
+          const candidates = cacheFuzzy.rows.map((r) => r.name);
+          console.log(`• [conversation] [${ts()}] counterparty ambiguous (cache) "${args.counterparty_name}" → ${candidates.join(', ')}`);
           return {
             ok: false,
             error: `Multiple ${wantedDoctype.toLowerCase()}s match "${args.counterparty_name}". Ask the user which one and call update_draft again with the full name.`,
             candidates,
           };
+        } else {
+          // Cache miss — ask ERPNext directly. Pre-warms the cache (incl.
+          // mobile_no + linkCounterparty) so the downstream save path
+          // and B2B link detection both work without re-asking the user.
+          ctx.draft._counterparty_known = false;
+          try {
+            const erp = erpnext.forUser(ctx.user);
+            const isCustomer = wantedDoctype === 'Customer';
+            const nameField = isCustomer ? 'customer_name' : 'supplier_name';
+            const live = await erp.listResource(wantedDoctype, {
+              filters: [[nameField, 'like', `%${args.counterparty_name}%`]],
+              fields: ['name', nameField, 'mobile_no', 'email_id'],
+              limit: 5,
+            });
+            const rows = live.data || [];
+
+            if (rows.length === 1) {
+              const row = rows[0];
+              const canonical = row[nameField] || row.name;
+              const now = new Date().toISOString();
+              await query(
+                `INSERT INTO counterparty_cache
+                   (owner_user_id, name, phone, email, erpnext_doctype, erpnext_name, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+                 ON CONFLICT (owner_user_id, erpnext_doctype, name) DO UPDATE SET
+                   erpnext_name = EXCLUDED.erpnext_name,
+                   phone = COALESCE(counterparty_cache.phone, EXCLUDED.phone),
+                   email = COALESCE(counterparty_cache.email, EXCLUDED.email),
+                   updated_at = EXCLUDED.updated_at`,
+                [ctx.user.id, canonical, row.mobile_no || null, row.email_id || null, wantedDoctype, row.name, now]
+              );
+              if (row.mobile_no) {
+                try {
+                  const linked = await linkCounterparty({
+                    ownerUserId: ctx.user.id,
+                    counterpartyName: canonical,
+                    phone: row.mobile_no,
+                  });
+                  if (linked) {
+                    console.log(`• [conversation] [${ts()}] erpnext-fuzzy linked "${canonical}" → user_id=${linked}`);
+                  }
+                } catch (err) {
+                  console.warn(`• [conversation] [${ts()}] erpnext-fuzzy link skipped: ${err.message}`);
+                }
+              }
+              if (canonical !== args.counterparty_name) {
+                ctx.draft.counterparty_name = canonical;
+                console.log(`• [conversation] [${ts()}] counterparty resolved "${args.counterparty_name}" → "${canonical}" (1 ERPNext match)`);
+              } else {
+                console.log(`• [conversation] [${ts()}] counterparty confirmed via ERPNext: "${canonical}"`);
+              }
+              ctx.draft._counterparty_known = true;
+            } else if (rows.length > 1) {
+              const candidates = rows.map((r) => r[nameField] || r.name);
+              console.log(`• [conversation] [${ts()}] counterparty ambiguous (ERPNext) "${args.counterparty_name}" → ${candidates.join(', ')}`);
+              return {
+                ok: false,
+                error: `Multiple ${wantedDoctype.toLowerCase()}s match "${args.counterparty_name}" in ERPNext. Ask the user which one and call update_draft again with the full name.`,
+                candidates,
+              };
+            }
+          } catch (err) {
+            console.warn(`• [conversation] [${ts()}] ERPNext fuzzy lookup failed for "${args.counterparty_name}": ${err.message}`);
+          }
         }
-        // Server-only flag for the validator. Never set by the LLM.
-        ctx.draft._counterparty_known = fuzzy.rowCount > 0;
       }
 
       // For payments: pre-compute the Settles line server-side so the LLM
@@ -1053,8 +1188,8 @@ async function _runTool(toolName, args, ctx) {
 
     case 'query_open_invoices': {
       try {
-        // Resolve user-facing short name (e.g. "Jameel") to the ERPNext party
-        // name (e.g. "Jameel Crest Gems") via counterparty_cache, so the
+        // Resolve user-facing short name (e.g. "Acme") to the ERPNext party
+        // name (e.g. "Acme Trading") via counterparty_cache, so the
         // ERPNext filter is an EXACT match against the right record.
         let counterpartyErpName = null;
         if (args?.counterparty_search) {
@@ -1206,6 +1341,45 @@ async function _runTool(toolName, args, ctx) {
         return { ok: true, ...sides };
       } catch (err) {
         console.error('[conversation] get_counterparty_details error:', err.message);
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case 'query_pending_todos': {
+      try {
+        const rows = await todos.listTodos(ctx.user.id, { botOnly: true });
+        console.log(`• [conversation] [${ts()}] tool=query_pending_todos count=${rows.length}`);
+        return {
+          ok: true,
+          count: rows.length,
+          todos: rows.map((t) => ({
+            id: t.id,
+            kind: t.kind,
+            question: t.bot_prompt,
+            related: t.related_name || null,
+          })),
+        };
+      } catch (err) {
+        console.error('[conversation] query_pending_todos error:', err.message);
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case 'resolve_todo': {
+      try {
+        const id = parseInt(args?.id, 10);
+        if (!id) return { ok: false, error: 'resolve_todo requires numeric id (from query_pending_todos)' };
+        const erp = erpnext.forUser(ctx.user);
+        const result = await todos.resolveTodo({
+          user: ctx.user,
+          erp,
+          todoId: id,
+          userInput: args?.input || {},
+        });
+        console.log(`• [conversation] [${ts()}] tool=resolve_todo id=${id} ok=${!!result?.ok}`);
+        return result;
+      } catch (err) {
+        console.error('[conversation] resolve_todo error:', err.message);
         return { ok: false, error: err.message };
       }
     }

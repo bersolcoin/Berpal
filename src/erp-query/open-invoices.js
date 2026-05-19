@@ -12,7 +12,7 @@
  *     {
  *       doctype: 'Sales Invoice',
  *       erpnext_name: 'ACC-SINV-2026-00001',
- *       counterparty: 'Jameel Crest Gems',
+ *       counterparty: 'Acme Trading',
  *       posting_date: '2026-05-12',
  *       due_date: '2026-06-11',
  *       currency: 'USD',

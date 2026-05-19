@@ -32,6 +32,25 @@ function fmtMoney(n, ccy) {
 }
 
 /**
+ * Render the WhatsApp proposal body for a linked_transactions row.
+ * Used by both proposeLink (in-the-moment) and bindPendingByPhone
+ * (catch-up after the buyer onboards). Keep the shape stable — the
+ * buyer-side reply parser only looks at the "LINK-N" code, not the
+ * surrounding text.
+ */
+function buildProposalMessage({ sellerLabel, linkCode, items, currency, totalAmount }) {
+  const itemLines = (items || [])
+    .map((it) => `• ${it.qty} × ${it.description || ''} @ ${fmtMoney(it.rate, currency)} = ${fmtMoney(it.amount, currency)}`)
+    .join('\n');
+  return (
+    `🔗 ${sellerLabel} says they sold you:\n\n` +
+    `${itemLines || `Amount: ${fmtMoney(totalAmount, currency)}`}\n\n` +
+    `Total: ${fmtMoney(totalAmount, currency)}\n\n` +
+    `Reply "yes ${linkCode}" to add to your books as a purchase, or "no ${linkCode}" to decline.`
+  );
+}
+
+/**
  * Insert a linked_transactions row + (when the buyer is already a Berpal
  * user) send a WhatsApp proposal asking them to accept / reject.
  *
@@ -107,15 +126,13 @@ async function proposeLink({
     }
 
     const sellerLabel = sellerUser.erpnext_company || sellerUser.display_name || 'A Berpal user';
-    const itemLines = (items || [])
-      .map((it) => `• ${it.qty} × ${it.description || ''} @ ${fmtMoney(it.rate, currency)} = ${fmtMoney(it.amount, currency)}`)
-      .join('\n');
-
-    const body =
-      `🔗 ${sellerLabel} says they sold you:\n\n` +
-      `${itemLines || `Amount: ${fmtMoney(totalAmount, currency)}`}\n\n` +
-      `Total: ${fmtMoney(totalAmount, currency)}\n\n` +
-      `Reply "yes ${linkCode}" to add to your books as a purchase, or "no ${linkCode}" to decline.`;
+    const body = buildProposalMessage({
+      sellerLabel,
+      linkCode,
+      items,
+      currency,
+      totalAmount,
+    });
 
     await twilio.sendText(buyer.phone, body);
     console.log(`• [linked-txn] [${ts()}] proposed ${linkCode} to user_id=${buyer.id} (${buyer.phone})`);
@@ -144,13 +161,53 @@ async function bindPendingByPhone(newUserId, phone) {
      WHERE buyer_user_id IS NULL
        AND status = 'pending_buyer_signup'
        AND buyer_phone IN ($3, $4, $5)
-     RETURNING id`,
+     RETURNING id, seller_user_id, currency, total_amount, items`,
     [newUserId, new Date().toISOString(), phone, stripped, plussed]
   );
-  if (r.rowCount > 0) {
-    console.log(`• [linked-txn] [${ts()}] bound ${r.rowCount} pending invoice(s) to new user_id=${newUserId}`);
+  if (r.rowCount === 0) return 0;
+
+  console.log(`• [linked-txn] [${ts()}] bound ${r.rowCount} pending invoice(s) to new user_id=${newUserId}`);
+
+  // Catch-up WhatsApp send: the original proposeLink couldn't message
+  // an unregistered phone, so do it now that the buyer is on Berpal.
+  // Per row, fire-and-forget — a failed send shouldn't roll back the
+  // bind (the row still shows in /inbox).
+  for (const row of r.rows) {
+    try {
+      const linkCode = `LINK-${row.id}`;
+      const seller = (await query(
+        `SELECT id, phone, display_name, erpnext_company
+           FROM users WHERE id = $1`,
+        [row.seller_user_id]
+      )).rows[0];
+      const sellerLabel = seller?.erpnext_company || seller?.display_name || 'A Berpal user';
+      const items = safeParseItems(row.items);
+      const body = buildProposalMessage({
+        sellerLabel,
+        linkCode,
+        items,
+        currency: row.currency,
+        totalAmount: row.total_amount,
+      });
+      await twilio.sendText(phone, body);
+      console.log(`• [linked-txn] [${ts()}] catch-up sent ${linkCode} to user_id=${newUserId} (${phone})`);
+    } catch (err) {
+      console.warn(`• [linked-txn] [${ts()}] catch-up send failed for row id=${row.id}: ${err.message}`);
+    }
   }
+
   return r.rowCount;
+}
+
+function safeParseItems(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 /** Parse a buyer-side inbound message for an accept/reject command. */

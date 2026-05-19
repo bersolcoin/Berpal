@@ -43,8 +43,8 @@ _(nothing right now — pick from "Upcoming" below)_
 - Seller gets a confirmation/reject WhatsApp notification either way
 
 **To test the linked B2B flow:**
-1. Both test users (TTC user1 +66838883866, DG user2 +85258608836) must be joined to the Twilio WhatsApp sandbox
-2. From TTC's WhatsApp: *"sold 5ct paraiba to Jameel for 2000 usd"* — but for testing, use Jameel's name with phone +85258608836 (so the bot's customer creation matches DG)
+1. Both test users (TTC user1 +12345550111, DG user2 +12345550112) must be joined to the Twilio WhatsApp sandbox
+2. From TTC's WhatsApp: *"sold 5ct paraiba to Acme for 2000 usd"* — but for testing, use Acme's name with phone +12345550112 (so the bot's customer creation matches DG)
 3. Confirm on TTC's side → DG receives the proposal message
 4. DG replies *"yes LINK-1"* → mirror Purchase Invoice created in DG's ERPNext; both sides get a confirmation
 5. Verify in `/transactions` on both accounts

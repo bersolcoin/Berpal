@@ -28,3 +28,7 @@ data/
 .next/
 out/
 next-env.d.ts
+
+# Local debug dumps from inspect / refresh scripts (contain real ERPNext data)
+coa-cache-*.json
+*-coa.txt

@@ -1,6 +1,6 @@
 # ber-accounting
 
-WhatsApp-first bookkeeping bot for small businesses. Users log transactions in plain language ("paid 850 for lunch", "sold ruby 7.68ct to Jameel Crest Gems for 45000 USD net 30"), the bot extracts the structured fields, shows a confirmation card, and posts the transaction to **ERPNext** as the accounting backend.
+WhatsApp-first bookkeeping bot for small businesses. Users log transactions in plain language ("paid 850 for lunch", "sold ruby 7.68ct to Acme Trading for 45000 USD net 30"), the bot extracts the structured fields, shows a confirmation card, and posts the transaction to **ERPNext** as the accounting backend.
 
 > **Status:** active development. Sales-invoice and cash-journal flows work end-to-end against ERPNext. Purchase-invoice, payment-entry (settlement), and transfer/opening-balance journals are next. The codebase is mid-refactor toward a modular `erp-sync/` + `erp-query/` + `tools/` layout — expect churn.
 

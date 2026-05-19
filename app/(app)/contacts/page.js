@@ -66,10 +66,11 @@ export default async function ContactsPage({ searchParams }) {
                         <RoleBadges contact={c} />
                         {c.linked_user_id && (
                           <span
-                            className="shrink-0 text-[10px] uppercase tracking-wide font-medium px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
+                            className="shrink-0 text-[11px] leading-none font-medium px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
                             title="This contact is also a Berpal user — transactions auto-mirror via WhatsApp."
+                            aria-label="Linked Berpal user"
                           >
-                            ⇄ Linked
+                            ⇄
                           </span>
                         )}
                         {c.default_currency && (

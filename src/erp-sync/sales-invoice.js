@@ -17,6 +17,8 @@ const { resolvePartyAccount } = require('./party-account');
 const { ts } = require('../log');
 const { query } = require('../db');
 const { proposeLink } = require('../links/linked-transactions');
+const { createTodo } = require('../todos');
+const paymentEntry = require('./payment-entry');
 
 async function save(user, erp, draft) {
   if (!draft.counterparty_name) {
@@ -116,6 +118,91 @@ async function save(user, erp, draft) {
     }
   } catch (err) {
     console.warn(`• [conversation] [${ts()}] linked-txn propose skipped: ${err.message}`);
+  }
+
+  // Pending-TODO trigger: every product sale where we don't have a
+  // purchase record for the goods becomes a follow-up (the user fills
+  // in supplier + cost later via /todos or by asking the bot).
+  // Two filters:
+  //   - business_type: services-only tenants don't sell goods at all
+  //   - category_code: 4100 (Service/Consulting/Fees) means this
+  //     specific invoice is for labor, not goods — nothing was "bought"
+  //     to fulfill it, so no purchase-record question to ask.
+  // Idempotent via the (user_id, kind, related_name) unique index, so
+  // re-saves of the same invoice never produce duplicates.
+  try {
+    const bizType = user.business_type;
+    const isServiceRevenue = draft.category_code === '4100';
+    if (!isServiceRevenue && (bizType === 'product' || bizType === 'both')) {
+      await createTodo({
+        userId: user.id,
+        kind: 'unknown_item_purchase',
+        payload: {
+          item_name: draft.description || '(item)',
+          qty_sold: 1,
+          amount_sold: Number(draft.amount) || 0,
+          currency: draft.currency,
+          invoice_ref: erpName,
+          customer_name: customerName,
+        },
+        relatedDoctype: 'Sales Invoice',
+        relatedName: erpName,
+      });
+    }
+  } catch (err) {
+    console.warn(`• [conversation] [${ts()}] todo enqueue skipped: ${err.message}`);
+  }
+
+  // paid_now flow: the SAME message described the invoice AND its
+  // immediate payment (e.g. "sold X to Acme for 2000 USD, paid cash").
+  // Post the matching Payment Entry now so AR is created AND cleared
+  // in one user action. If the PE post fails, the SI stays — operator
+  // (or user via "X paid me Y") can settle it later. Surface a clear
+  // partial-success in the return so the caller can render both refs.
+  if (draft.paid_now) {
+    try {
+      const peResult = await paymentEntry.save(user, erp, {
+        transaction_type: 'payment',
+        direction: 'income',
+        amount: draft.amount,
+        currency: draft.currency,
+        exchange_rate: draft.exchange_rate,
+        counterparty_name: draft.counterparty_name,
+        payment_account_code: draft.payment_account_code,
+        wallet_name: draft.wallet_name || null,
+        parent_invoice_ref: erpName,
+        transaction_date: draft.transaction_date,
+        payment_reference: draft.payment_reference || null,
+      });
+      if (peResult?.ok) {
+        console.log(
+          `• [conversation] [${ts()}] saved paid-now PE to ERPNext: ${peResult.erpnext_name} (settles ${erpName})`
+        );
+        return {
+          ok: true,
+          erpnext_name: erpName,
+          doctype: 'Sales Invoice',
+          payment_entry_name: peResult.erpnext_name,
+          payment_entry_doctype: 'Payment Entry',
+        };
+      }
+      // PE failed AFTER SI succeeded — return a partial-success shape so
+      // the caller can tell the user "invoice saved, payment didn't post".
+      return {
+        ok: true,
+        erpnext_name: erpName,
+        doctype: 'Sales Invoice',
+        payment_entry_error: peResult?.error || 'unknown payment-entry failure',
+      };
+    } catch (err) {
+      console.warn(`• [conversation] [${ts()}] paid-now PE post failed for ${erpName}: ${err.message}`);
+      return {
+        ok: true,
+        erpnext_name: erpName,
+        doctype: 'Sales Invoice',
+        payment_entry_error: err.message,
+      };
+    }
   }
 
   return { ok: true, erpnext_name: erpName, doctype: 'Sales Invoice' };

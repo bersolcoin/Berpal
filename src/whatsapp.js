@@ -150,7 +150,7 @@ async function processIncomingMessage({ from, body, raw = null }) {
       // LLM called request_confirmation but the body has no card shape —
       // surface honestly instead of sending a stub card.
       const fallback =
-        "I got partway but couldn't put together a clean summary card. Can you rephrase the transaction in one line? (e.g. \"sold paraiba 5ct to Jameel Crest Gems for 20000 USD net 30\")";
+        "I got partway but couldn't put together a clean summary card. Can you rephrase the transaction in one line? (e.g. \"sold paraiba 5ct to Acme Trading for 20000 USD net 30\")";
       console.warn(`[whatsapp] suppressed degenerate confirmation card. LLM reply was: ${text.slice(0, 200)}`);
       log.msgOut(from, fallback);
       await twilioClient.sendText(from, fallback);
