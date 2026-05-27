@@ -98,12 +98,29 @@ async function save(user, erp, draft) {
     const buyerUserId = linkRow.rows[0]?.linked_user_id;
     const buyerPhone = linkRow.rows[0]?.phone || draft.counterparty_phone || null;
     if (buyerUserId || buyerPhone) {
+      // Derive seller-side payment context. The buyer-side template uses
+      // it to (a) show "received in cash" / "received to bank" in the
+      // proposal body, and (b) narrow the buyer's wallet-pick step to
+      // accounts of the same type.
+      let walletType = null;
+      let walletLabel = null;
+      if (draft.paid_now && draft.payment_account_code) {
+        walletType =
+          draft.payment_account_code === '1000' ? 'cash' :
+          draft.payment_account_code === '1100' ? 'bank' :
+          draft.payment_account_code === '2100' ? 'card' :
+          null;
+        walletLabel = draft.wallet_name
+          ? draft.wallet_name
+          : (walletType === 'cash' ? `Cash ${draft.currency}` : null);
+      }
       await proposeLink({
-        sellerUser: user,
-        sellerDoctype: 'Sales Invoice',
-        sellerDocName: erpName,
-        buyerUserId,
-        buyerPhone,
+        initiatorUser: user,
+        initiatorRole: 'seller',
+        initiatorDoctype: 'Sales Invoice',
+        initiatorDocName: erpName,
+        responderUserId: buyerUserId,
+        responderPhone: buyerPhone,
         currency: draft.currency,
         totalAmount: Number(draft.amount) || 0,
         items: [
@@ -114,6 +131,10 @@ async function save(user, erp, draft) {
             amount: Number(draft.amount) || 0,
           },
         ],
+        paidNow: !!draft.paid_now,
+        paymentAccountCode: draft.paid_now ? draft.payment_account_code : null,
+        walletLabel,
+        walletType,
       });
     }
   } catch (err) {
@@ -138,6 +159,7 @@ async function save(user, erp, draft) {
         userId: user.id,
         kind: 'unknown_item_purchase',
         payload: {
+          item_code: itemCode,
           item_name: draft.description || '(item)',
           qty_sold: 1,
           amount_sold: Number(draft.amount) || 0,

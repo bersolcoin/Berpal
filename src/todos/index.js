@@ -22,6 +22,7 @@ const { ts } = require('../log');
 
 const KINDS = {
   unknown_item_purchase: require('./kinds/unknown-item-purchase'),
+  unrecorded_link_payment: require('./kinds/unrecorded-link-payment'),
 };
 
 /**

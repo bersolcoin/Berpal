@@ -2,7 +2,7 @@ import './globals.css';
 
 export const metadata = {
   title: 'Berpal — AI bookkeeping bot',
-  description: 'WhatsApp-first bookkeeping with ERPNext backend.',
+  description: 'WhatsApp-first bookkeeping for small businesses.',
 };
 
 export default function RootLayout({ children }) {

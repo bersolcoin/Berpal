@@ -53,11 +53,11 @@ export default async function TodosPage() {
       ) : (
         <div className="bg-white border border-[var(--color-border)] rounded-xl divide-y divide-[var(--color-border)]">
           {rows.map((t) => {
-            const href = relatedHref(t.related_doctype, t.related_name);
+            const sourceHref = relatedHref(t.related_doctype, t.related_name);
             return (
               <div key={t.id} className="p-4 sm:p-5 space-y-2">
                 <div className="flex items-start justify-between gap-3">
-                  <span className="inline-flex items-center text-[10px] uppercase tracking-wider font-medium text-slate-500 bg-slate-100 px-2 py-0.5 rounded">
+                  <span className="inline-flex items-center text-[10px] uppercase tracking-wider font-medium text-orange-700 bg-orange-100 px-2 py-0.5 rounded">
                     {KIND_LABEL[t.kind] || t.kind}
                   </span>
                   <span className="text-xs text-slate-400 whitespace-nowrap">
@@ -69,14 +69,22 @@ export default async function TodosPage() {
                   </span>
                 </div>
                 <p className="text-sm text-slate-800 leading-relaxed">{t.bot_prompt}</p>
-                {href && (
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pt-1">
                   <Link
-                    href={href}
-                    className="inline-block text-xs text-[var(--color-brand-accent)] hover:underline"
+                    href={`/todos/${t.id}`}
+                    className="inline-flex items-center px-3 py-1.5 text-xs font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800"
                   >
-                    {t.related_doctype}: {friendlyAccountName(t.related_name) || t.related_name} →
+                    Resolve →
                   </Link>
-                )}
+                  {sourceHref && (
+                    <Link
+                      href={sourceHref}
+                      className="inline-block text-xs text-[var(--color-brand-accent)] hover:underline"
+                    >
+                      {t.related_doctype}: {friendlyAccountName(t.related_name) || t.related_name}
+                    </Link>
+                  )}
+                </div>
               </div>
             );
           })}

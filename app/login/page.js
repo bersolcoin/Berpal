@@ -24,6 +24,7 @@ import CountrySelect from './CountrySelect';
 
 const STEPS = { PHONE: 'phone', CODE: 'code' };
 const DEFAULT_COUNTRY = 'US';
+const RESEND_COOLDOWN_SECONDS = 30; // matches MIN_RESEND_GAP_MS in src/auth/otp.js
 
 /**
  * National-formatted example number for the selected country, e.g.
@@ -58,6 +59,17 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [busy, setBusy] = useState(false);
+  // Seconds remaining before the user can resend. 0 = button enabled.
+  const [resendIn, setResendIn] = useState(0);
+
+  // Tick the resend cooldown every second while CODE step is active.
+  useEffect(() => {
+    if (step !== STEPS.CODE || resendIn <= 0) return;
+    const t = setInterval(() => {
+      setResendIn((s) => (s <= 1 ? 0 : s - 1));
+    }, 1000);
+    return () => clearInterval(t);
+  }, [step, resendIn]);
 
   useEffect(() => {
     let cancelled = false;
@@ -127,6 +139,37 @@ export default function LoginPage() {
       }
       setStep(STEPS.CODE);
       setInfo(`Code sent via WhatsApp to ${phone}. Check your messages.`);
+      setResendIn(RESEND_COOLDOWN_SECONDS);
+    } catch (err) {
+      setError(err.message || 'Network error.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resendCode() {
+    if (resendIn > 0 || busy) return;
+    setError('');
+    const phone = buildE164();
+    if (!phone) {
+      setError('Phone number is invalid.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await fetch('/api/auth/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone }),
+      });
+      const data = await r.json();
+      if (!r.ok || !data.ok) {
+        setError(data.error || 'Could not resend code.');
+        return;
+      }
+      setInfo(`New code sent to ${phone}.`);
+      setCode('');
+      setResendIn(RESEND_COOLDOWN_SECONDS);
     } catch (err) {
       setError(err.message || 'Network error.');
     } finally {
@@ -241,19 +284,37 @@ export default function LoginPage() {
           >
             {busy ? 'Verifying…' : 'Verify'}
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              setStep(STEPS.PHONE);
-              setCode('');
-              setError('');
-              setInfo('');
-            }}
-            disabled={busy}
-            className="text-sm text-slate-500 hover:text-slate-900 transition"
-          >
-            ← Back
-          </button>
+
+          <div className="flex items-center justify-between text-sm">
+            <button
+              type="button"
+              onClick={() => {
+                setStep(STEPS.PHONE);
+                setCode('');
+                setError('');
+                setInfo('');
+                setResendIn(0);
+              }}
+              disabled={busy}
+              className="text-slate-500 hover:text-slate-900 transition disabled:opacity-50"
+            >
+              ← Back
+            </button>
+            {resendIn > 0 ? (
+              <span className="text-slate-400 tabular">
+                Resend code in {resendIn}s
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={resendCode}
+                disabled={busy}
+                className="text-[var(--color-brand-accent)] hover:underline disabled:opacity-50"
+              >
+                {busy ? 'Sending…' : 'Resend code'}
+              </button>
+            )}
+          </div>
         </form>
       )}
 

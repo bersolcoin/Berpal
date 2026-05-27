@@ -20,6 +20,8 @@ const { ensureGenericPurchaseItem } = require('./item');
 const { resolveErpAccount } = require('./account');
 const { resolvePartyAccount } = require('./party-account');
 const { ts } = require('../log');
+const { query } = require('../db');
+const { proposeLink } = require('../links/linked-transactions');
 const paymentEntry = require('./payment-entry');
 
 async function save(user, erp, draft) {
@@ -64,6 +66,11 @@ async function save(user, erp, draft) {
         qty: 1,
         rate: draft.amount,
         description: draft.description || `${supplierName} bill`,
+        // delivered_by_supplier=0 sidesteps an unguarded getattr in
+        // erpnext.controllers.accounts_controller.is_drop_ship which trips
+        // on some ERPNext versions. Safe to send; ERPNext ignores unknown
+        // fields when they ARE recognized.
+        delivered_by_supplier: 0,
         ...(expenseAccount ? { expense_account: expenseAccount } : {}),
       },
     ],
@@ -85,6 +92,58 @@ async function save(user, erp, draft) {
     `• [conversation] [${ts()}] saved Purchase Invoice to ERPNext: ${erpName} ` +
       `(${draft.amount} ${draft.currency} from ${supplierName}, due ${dueDate})`
   );
+
+  // Buyer-initiated B2B link: if the supplier's contact phone matches
+  // another Berpal user, park a linked_transactions row + send them a
+  // proposal so they get a mirror Sales Invoice on Accept. Fire-and-forget.
+  try {
+    const linkRow = await query(
+      `SELECT linked_user_id, phone FROM counterparty_cache
+         WHERE owner_user_id = $1 AND erpnext_name = $2 AND erpnext_doctype = 'Supplier'
+         LIMIT 1`,
+      [user.id, supplierName]
+    );
+    const responderUserId = linkRow.rows[0]?.linked_user_id;
+    const responderPhone = linkRow.rows[0]?.phone || draft.counterparty_phone || null;
+    if (responderUserId || responderPhone) {
+      let walletType = null;
+      let walletLabel = null;
+      if (draft.paid_now && draft.payment_account_code) {
+        walletType =
+          draft.payment_account_code === '1000' ? 'cash' :
+          draft.payment_account_code === '1100' ? 'bank' :
+          draft.payment_account_code === '2100' ? 'card' :
+          null;
+        walletLabel = draft.wallet_name
+          ? draft.wallet_name
+          : (walletType === 'cash' ? `Cash ${draft.currency}` : null);
+      }
+      await proposeLink({
+        initiatorUser: user,
+        initiatorRole: 'buyer',
+        initiatorDoctype: 'Purchase Invoice',
+        initiatorDocName: erpName,
+        responderUserId,
+        responderPhone,
+        currency: draft.currency,
+        totalAmount: Number(draft.amount) || 0,
+        items: [
+          {
+            description: draft.description || `${supplierName} bill`,
+            qty: 1,
+            rate: Number(draft.amount) || 0,
+            amount: Number(draft.amount) || 0,
+          },
+        ],
+        paidNow: !!draft.paid_now,
+        paymentAccountCode: draft.paid_now ? draft.payment_account_code : null,
+        walletLabel,
+        walletType,
+      });
+    }
+  } catch (err) {
+    console.warn(`• [conversation] [${ts()}] linked-txn (buyer-init) propose skipped: ${err.message}`);
+  }
 
   // paid_now: post the matching outbound Payment Entry against this
   // bill in the same save. See sales-invoice.js for the mirror flow.

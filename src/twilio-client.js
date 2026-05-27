@@ -3,6 +3,7 @@ const twilio = require('twilio');
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 const confirmationContentSid = process.env.TWILIO_CONFIRMATION_CONTENT_SID;
+const b2bLinkContentSid = process.env.TWILIO_B2B_LINK_CONTENT_SID;
 
 function resolveFromNumber() {
   const env = (process.env.TWILIO_ENV || 'sandbox').toLowerCase();
@@ -63,6 +64,47 @@ async function sendConfirmation(toAddress, summaryText) {
   }
 }
 
+/**
+ * Send a B2B link proposal — Accept / Decline quick-reply template.
+ * Falls back to sendText if the template SID is missing (e.g. before
+ * the one-off template-creation script has been run).
+ *
+ * Returns the outbound Twilio MessageSid so callers can persist it on
+ * linked_transactions.proposal_message_sid; inbound button replies
+ * carry OriginalRepliedMessageSid which lets us route them back.
+ */
+async function sendB2BLinkProposal(toAddress, bodyText) {
+  if (!client) {
+    console.error('[twilio] cannot send B2B proposal: client not configured');
+    return null;
+  }
+  if (!fromNumber) {
+    console.error('[twilio] cannot send B2B proposal: from number not set');
+    return null;
+  }
+
+  const to = normalizeWhatsappAddress(toAddress);
+
+  if (!b2bLinkContentSid) {
+    console.warn('[twilio] TWILIO_B2B_LINK_CONTENT_SID not set — falling back to plain text');
+    return await sendText(toAddress, bodyText);
+  }
+
+  try {
+    const message = await client.messages.create({
+      from: fromNumber,
+      to,
+      contentSid: b2bLinkContentSid,
+      contentVariables: JSON.stringify({ '1': bodyText }),
+    });
+    console.log(`[twilio] sent B2B proposal message_sid=${message.sid} to=${to}`);
+    return message.sid;
+  } catch (err) {
+    console.error('[twilio] failed to send B2B proposal:', err.message);
+    return null;
+  }
+}
+
 async function sendText(toAddress, text) {
   if (!client) {
     console.error('[twilio] cannot send text: client not configured');
@@ -92,4 +134,4 @@ async function sendText(toAddress, text) {
   }
 }
 
-module.exports = { sendConfirmation, sendText };
+module.exports = { sendConfirmation, sendB2BLinkProposal, sendText };

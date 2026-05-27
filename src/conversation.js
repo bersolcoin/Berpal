@@ -13,11 +13,42 @@ const { resolveWalletAccount } = require('./erp-sync/wallet');
 const { resolveErpAccount } = require('./erp-sync/account');
 const { recordOpeningBalance } = require('./erp-sync/opening-balance');
 const { linkCounterparty } = require('./links/counterparty-match');
+const { filterByNameMatch, normalizeNameForMatch } = require('./links/name-match');
 
 // Inlined twin of app/(app)/_components/format.js#friendlyAccountName.
 // Kept duplicate (rather than require'd) because the app/ file is JSX/ESM
 // and not consumable from CommonJS src/. Keep both versions in sync.
 const ACCOUNT_ABBR_RE = /^[A-Z0-9]{2,10}$/;
+/**
+ * Server-built reply for a successful save. Used as a short-circuit
+ * so the user sees a fixed-format confirmation every time, instead of
+ * the LLM rephrasing it (and occasionally drifting / claiming success
+ * on a failed payment leg). Mirrors the templates that were previously
+ * in the LLM prompt — change here, NOT in the prompt.
+ */
+function formatSaveSuccessReply(result, draft) {
+  const inv = result.erpnext_name;
+  const pay = result.payment_entry_name;
+  const payErr = result.payment_entry_error;
+  const tt = draft?.transaction_type;
+
+  if (tt === 'invoice_issued' || tt === 'bill_received') {
+    if (payErr) {
+      return (
+        `Invoice saved ✓ ${inv}\n` +
+        `Payment didn't post: ${payErr}\n` +
+        `Tell me when you settle it and I'll book the payment.`
+      );
+    }
+    if (pay) {
+      return `Saved ✓\nInvoice: ${inv}\nPayment: ${pay}`;
+    }
+    return `Saved ✓\nRef: ${inv}`;
+  }
+  // payment / cash JE / transfer / opening / etc. all share the simple form.
+  return `Saved ✓\nRef: ${inv}`;
+}
+
 function friendlyAccountName(erpName) {
   if (!erpName) return '';
   const parts = String(erpName).split(' - ');
@@ -888,22 +919,26 @@ async function _runTool(toolName, args, ctx) {
         const wantedDoctype =
           ctx.draft.transaction_type === 'bill_received' ? 'Supplier' : 'Customer';
 
-        const cacheFuzzy = await query(
+        // Fetch all cache rows for this owner+doctype and filter JS-side
+        // using normalized matching ("SS & co" ~ "ss and co"). SQL LIKE
+        // misses these variants without REPLACE acrobatics; cache sizes
+        // per tenant are small so JS-side filtering is fine.
+        const cacheAll = await query(
           `SELECT name, erpnext_name FROM counterparty_cache
            WHERE owner_user_id = $1 AND erpnext_doctype = $2
-             AND (LOWER(name) LIKE LOWER($3) OR LOWER($4) LIKE LOWER('%' || name || '%'))
            ORDER BY id DESC`,
-          [ctx.user.id, wantedDoctype, `%${args.counterparty_name}%`, args.counterparty_name]
+          [ctx.user.id, wantedDoctype]
         );
+        const cacheMatches = filterByNameMatch(cacheAll.rows, args.counterparty_name, 'name');
 
-        if (cacheFuzzy.rowCount === 1) {
-          if (cacheFuzzy.rows[0].name !== args.counterparty_name) {
-            ctx.draft.counterparty_name = cacheFuzzy.rows[0].name;
-            console.log(`• [conversation] [${ts()}] counterparty resolved "${args.counterparty_name}" → "${cacheFuzzy.rows[0].name}" (1 cache match)`);
+        if (cacheMatches.length === 1) {
+          if (cacheMatches[0].name !== args.counterparty_name) {
+            ctx.draft.counterparty_name = cacheMatches[0].name;
+            console.log(`• [conversation] [${ts()}] counterparty resolved "${args.counterparty_name}" → "${cacheMatches[0].name}" (1 cache match)`);
           }
           ctx.draft._counterparty_known = true;
-        } else if (cacheFuzzy.rowCount > 1) {
-          const candidates = cacheFuzzy.rows.map((r) => r.name);
+        } else if (cacheMatches.length > 1) {
+          const candidates = cacheMatches.map((r) => r.name);
           console.log(`• [conversation] [${ts()}] counterparty ambiguous (cache) "${args.counterparty_name}" → ${candidates.join(', ')}`);
           return {
             ok: false,
@@ -924,7 +959,29 @@ async function _runTool(toolName, args, ctx) {
               fields: ['name', nameField, 'mobile_no', 'email_id'],
               limit: 5,
             });
-            const rows = live.data || [];
+            let rows = live.data || [];
+
+            // & ↔ and fallback: the raw input may not LIKE-match because
+            // ERPNext stores the swapped form (e.g. input "SS & co", stored
+            // "SS and co"). Try the swap once before giving up.
+            if (rows.length === 0) {
+              const swapped = /[&]/.test(args.counterparty_name)
+                ? args.counterparty_name.replace(/\s*&\s*/g, ' and ')
+                : / and /i.test(args.counterparty_name)
+                  ? args.counterparty_name.replace(/\s+and\s+/gi, ' & ')
+                  : null;
+              if (swapped && swapped !== args.counterparty_name) {
+                const live2 = await erp.listResource(wantedDoctype, {
+                  filters: [[nameField, 'like', `%${swapped}%`]],
+                  fields: ['name', nameField, 'mobile_no', 'email_id'],
+                  limit: 5,
+                });
+                rows = live2.data || [];
+                if (rows.length > 0) {
+                  console.log(`• [conversation] [${ts()}] ERPNext fuzzy hit via & ↔ and swap: "${args.counterparty_name}" → "${swapped}"`);
+                }
+              }
+            }
 
             if (rows.length === 1) {
               const row = rows[0];
@@ -1128,6 +1185,9 @@ async function _runTool(toolName, args, ctx) {
           next_user_question: validation.next_user_question,
         };
       }
+      // Snapshot the draft BEFORE save (save clears it) so the canned
+      // success reply can describe what was saved.
+      const draftSnapshot = { ...ctx.draft };
       try {
         const result = await erpSync.save(ctx.user, ctx.draft);
         if (result.ok) {
@@ -1135,6 +1195,10 @@ async function _runTool(toolName, args, ctx) {
           ctx.savedIds = [...(ctx.savedIds || []), result.erpnext_name];
           ctx.draft = {};
           ctx.confirmationRequested = false;
+          // Server-built reply — bypasses the next LLM iteration so the
+          // user sees a fixed-format confirmation every time (no LLM
+          // creative re-phrasing, no "BLUFF DETECTED" false positives).
+          result._saved_reply = formatSaveSuccessReply(result, draftSnapshot);
         } else {
           // Handler returned ok=false without throwing (most validation
           // failures take this path). Log the full reason so we can debug
@@ -1781,9 +1845,22 @@ async function handle(user, userMessage) {
           if (directAsk) {
             ctx._directAsk = directAsk;
           }
+          // Same idea, but for save-success — the backend builds a fixed
+          // reply ("Saved ✓\nInvoice: …\nPayment: …") and we send it
+          // directly. Side benefits: deterministic copy, immune to BLUFF
+          // false-positives, one fewer LLM round.
+          if (result?._saved_reply) {
+            ctx._savedReply = result._saved_reply;
+          }
         }
-        // If any tool surfaced a direct user question, short-circuit: send
-        // that text without burning another LLM round to rephrase it.
+        // If any tool surfaced a direct user question OR a canned save
+        // reply, short-circuit: send that text without burning another
+        // LLM round to rephrase it.
+        if (ctx._savedReply) {
+          finalText = ctx._savedReply;
+          console.log(`• [conversation] [${ts()}] saved-reply short-circuit: "${ctx._savedReply.replace(/\n/g, ' / ').slice(0, 100)}"`);
+          break;
+        }
         if (ctx._directAsk) {
           finalText = ctx._directAsk;
           console.log(`• [conversation] [${ts()}] direct-ask short-circuit: "${ctx._directAsk.slice(0, 100)}"`);

@@ -320,9 +320,9 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
 }
 
 /**
- * Full-screen overlay shown while ERPNext provisioning runs (5–10s
- * usually). Locks the UI so the user can't double-submit or wander to
- * a different step mid-flight.
+ * Full-screen overlay shown while the workspace is being provisioned
+ * (5–10s usually). Locks the UI so the user can't double-submit or
+ * wander to a different step mid-flight.
  */
 function CreatingOverlay() {
   return (
@@ -427,7 +427,7 @@ function Step1({ form, setField }) {
         </div>
       </Field>
 
-      <Field label="Business name" required hint="Legal entity name — becomes your ERPNext Company.">
+      <Field label="Business name" required hint="The legal name of your business — used across your invoices and reports.">
         <input
           type="text"
           autoFocus

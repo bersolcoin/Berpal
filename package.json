@@ -9,6 +9,7 @@
     "legacy-start": "node server.js",
     "create-template": "node scripts/create-confirmation-template.js",
     "create-otp-template": "node scripts/create-otp-template.js",
+    "create-b2b-link-template": "node scripts/create-b2b-link-template.js",
     "reset": "node scripts/reset-conversations.js"
   },
   "dependencies": {

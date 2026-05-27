@@ -13,41 +13,36 @@ _(nothing right now — pick from "Upcoming" below)_
 
 ## 🧪 Just landed — needs end-to-end test
 
-### Multi-tenancy hardening (Phase 1)
-- Per-company Item Group "Items - <ABBR>" auto-created during `provisionTenant`
-- Bot's `ensureGenericSalesItem` / `ensureGenericPurchaseItem` now tag created Items with the user's group
-- Web `/inventory` and `/services` filter by the user's item group
-- Company `abbr` is now collision-checked at provision time (`AG` → `AG2` if taken)
-- New PG column `users.erpnext_company_abbr` (UNIQUE)
-- Backfill script: `node scripts/backfill-company-abbr.js`
+### B2B link — credit-sale regression (post-direction-aware refactor)
+Both directions verified live for the paid_now case (2026-05-27). Credit
+case (no payment at time of post) hasn't been re-exercised since the
+refactor — should land just the invoice on each side, no PE, no todo.
 
-### Pending-invoices growth loop (Phase 2½)
-- `linked_transactions.buyer_user_id` is now nullable; new `buyer_phone` column for matching unsigned-up phones
-- When a seller sends a Sales Invoice to a phone with no matching Berpal user, row parked as `pending_buyer_signup`
-- `provisionTenant` now ends with a `bindPendingByPhone` step — claims all parked invoices for the new user's phone and bumps them to `pending_buyer_confirmation`
-- Onboarding response routes to `/inbox` instead of `/dashboard` when `pending_invoices_count > 0`
-- New `/inbox` page lists pending invoices with Accept / Decline buttons per row
-- Sidebar shows Inbox with a live count badge (green pill, refreshes on every page nav)
-- API: `POST /api/links/[id]/confirm` and `POST /api/links/[id]/reject` — same code path as the WhatsApp accept/reject
+- [ ] Seller-init credit: `"sold 1ct sapphire to SS & co for $500 net 30"`
+      → SI on A, proposal to B, Accept → PI on B, no todo, no PE
+- [ ] Buyer-init credit: `"bought 1ct sapphire from SS & co for $500 net 30"`
+      → PI on A, proposal to B, Accept → SI on B, no todo, no PE
 
-### Linked transactions B2B flow (Phase 2)
-- New PG table `linked_transactions` (seller doc + buyer doc + status + items)
-- New PG column `counterparty_cache.linked_user_id` — set automatically when a counterparty's phone matches another Berpal user
-- **/customers** and **/suppliers** show a green "⇄ Linked" badge for matched counterparties
-- Sales Invoice handler: after posting, if customer is linked, inserts a `linked_transactions` row and sends a WhatsApp proposal to the buyer:
-  > "🔗 Test Trading Company says they sold you: …
-  >  Reply 'yes LINK-N' to accept or 'no LINK-N' to decline."
-- Bot inbound: `tryHandleLinkCommand` intercepts buyer's `yes LINK-N` / `no LINK-N` reply BEFORE the LLM
-- On accept: mirror Purchase Invoice created in buyer's ERPNext (resolves seller as Supplier, uses per-tenant GEN-PURCHASE item, per-currency Creditors account), `linked_transactions.status='confirmed'` with `buyer_doc_name`
-- On reject: status='rejected', seller notified via WhatsApp
-- Seller gets a confirmation/reject WhatsApp notification either way
+### Multi-wallet pick path
+Auto-resolve and 0-wallet (ask + create + opening-balance) paths both
+work. The "responder has 2+ matching wallets" numbered-list path
+hasn't been exercised yet.
 
-**To test the linked B2B flow:**
-1. Both test users (TTC user1 +12345550111, DG user2 +12345550112) must be joined to the Twilio WhatsApp sandbox
-2. From TTC's WhatsApp: *"sold 5ct paraiba to Acme for 2000 usd"* — but for testing, use Acme's name with phone +12345550112 (so the bot's customer creation matches DG)
-3. Confirm on TTC's side → DG receives the proposal message
-4. DG replies *"yes LINK-1"* → mirror Purchase Invoice created in DG's ERPNext; both sides get a confirmation
-5. Verify in `/transactions` on both accounts
+- [ ] Set up a second cash/bank wallet on B for the test
+- [ ] Run a paid-now link → confirm numbered prompt + index reply path
+      (e.g. "1" or "2") → confirm name-match reply path ("HSBC")
+
+### Failsafe layers 2 + 3 (cache freshness)
+Layer 1 (in-proposeLink phone-lookup fallback) is live. Layers 2 + 3
+would prevent the stale-cache miss before it happens.
+
+- [ ] Layer 2: opportunistic `linkCounterparty` on the early-return paths
+      in `customer.js` and `supplier.js` (cache-hit branches) so phone→user
+      links self-heal on every contact touch
+- [ ] Layer 3: on `provisionTenant`, sweep `counterparty_cache` for rows
+      with the new user's phone and back-fill `linked_user_id` (so older
+      tenants instantly "wake up" to the new user)
+- [ ] One-shot backfill script for existing orphan cache rows
 
 ---
 
@@ -222,6 +217,59 @@ own subdomains. Zero code changes needed — no Next.js basePath gymnastics.
 ### Other
 - [x] `business_type` UX renaming: Invoice / Purchase / Expense / Receipt / Payment / Cash (was Bill / Journal)
 - [x] Cost of Goods Sold filtered out of `/expenses`
+
+### B2B linked transactions — bidirectional flow (Phase 2, refactored 2026-05-27)
+Both sale-initiated AND purchase-initiated linking work end-to-end with
+Twilio Quick Reply buttons and inline wallet pick. Schema-symmetric:
+`seller_*` columns always refer to the SI side, `buyer_*` to the PI
+side, and `initiated_by_buyer` flag drives every direction-specific
+branch. See `memory/project_b2b_bidirectional_link.md` for the
+architecture map.
+
+- [x] Schema: `linked_transactions` table with direction flag + payment
+      context (`seller_payment_account_code`, `seller_wallet_label`,
+      `seller_wallet_type`) + Twilio MessageSid columns
+- [x] Twilio Content Template `b2b_link_proposal` (Accept / Decline
+      quick-reply buttons) — replaces the old "yes LINK-N" text fallback
+      (text still works for sandbox, but is no longer in the prompt body)
+- [x] `proposeLink` takes a clean initiator/responder signature, persists
+      direction, sends template, stores outbound MessageSid
+- [x] `tryHandleLinkCommand` routes button replies via
+      `OriginalRepliedMessageSid` against `proposal_message_sid` (works
+      across multiple pending links for the same buyer)
+- [x] `confirmLink` branches by direction — creates a PI mirror on
+      seller-init Accept, or an SI mirror on buyer-init Accept; both
+      paths share the same wallet-pick follow-up
+- [x] Wallet-pick state machine (`src/links/buyer-wallet-pick.js`):
+      auto-posts the PE when exactly one matching wallet exists, asks
+      inline when 0 or 2+ — wording flips correctly ("paid from" vs
+      "received to") and PE direction matches (expense vs income)
+- [x] 0-wallet path: bot asks for bank/wallet name, creates the leaf via
+      shared `resolveWalletAccount`, then mirrors the `create_wallet` UX
+      by asking for an opening balance — books via shared
+      `recordOpeningBalance` if > 0
+- [x] Fallback `unrecorded_link_payment` todo enqueued whenever the PE
+      didn't post atomically; auto-deleted when the inline pick succeeds
+- [x] `/todos/[id]` resolver also posts the payment (existing kind, works
+      on both directions)
+- [x] Failsafe layer 1: in-`proposeLink` phone-based lookup that catches
+      stale `counterparty_cache.linked_user_id` rows
+- [x] Name normalization (`src/links/name-match.js`) — `&` ↔ `and` +
+      lower + whitespace; applied in LLM-time `_counterparty_known`
+      check, customer/supplier fuzzy cache, and ERPNext `&`↔`and` swap
+      retry on fallback queries
+- [x] Initiator gets a "✅ Your invoice/purchase X with <party> was
+      accepted/declined" WhatsApp notification (party name, no "their
+      ref" noise)
+- [x] Server-canned save reply (bypasses LLM rendering): the
+      `save_transaction` tool attaches `_saved_reply` and the loop
+      short-circuits — fixed `Saved ✓\nInvoice: X\nPayment: Y` format
+      every time, immune to BLUFF false-positives
+- [x] Sidebar Todos badge updates dynamically after resolve (server
+      `revalidatePath` + client `router.refresh()`)
+- [x] Helper scripts: `create-b2b-link-template.js`,
+      `resend-link-proposal.js`, `claim-pending-by-phone.js`,
+      `inspect-linked-transactions.js`
 
 ---
 

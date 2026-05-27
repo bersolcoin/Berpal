@@ -325,6 +325,50 @@ async function migrate() {
   await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS buyer_phone TEXT`);
   await query(`CREATE INDEX IF NOT EXISTS idx_linked_buyer_phone ON linked_transactions(buyer_phone) WHERE buyer_user_id IS NULL`);
 
+  // seller_paid_now lets confirmLink know whether the seller's SI was
+  // already paid at the time of sale. When true, accepting the link on
+  // the buyer side enqueues an unrecorded_link_payment TODO so the
+  // buyer can later record which wallet they paid from. Without it,
+  // the mirror PI sits as an open payable that doesn't match reality.
+  await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS seller_paid_now BOOLEAN DEFAULT FALSE`);
+
+  // Seller-side payment context — surfaces in the proposal message and
+  // narrows the buyer's wallet-pick step (cash vs bank, in the same
+  // currency). Null when the sale was on credit.
+  await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS seller_payment_account_code TEXT`);
+  await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS seller_wallet_label TEXT`);
+  await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS seller_wallet_type TEXT`);
+
+  // Twilio outbound MessageSid for the proposal — inbound button replies
+  // arrive with OriginalRepliedMessageSid that we match against this to
+  // route an "Accept" / "Decline" tap to the right linked_transactions row
+  // even when the buyer has more than one pending link.
+  await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS proposal_message_sid TEXT`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_linked_proposal_msg_sid ON linked_transactions(proposal_message_sid) WHERE proposal_message_sid IS NOT NULL`);
+
+  // Wallet-pick follow-up state. After a buyer taps Accept and there
+  // are 0 or 2+ matching wallets, the row is parked here while the bot
+  // asks which wallet to use. wallet_pick_candidates is a JSON array
+  // [{ label, code, name }, ...] frozen at ask time.
+  await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS wallet_pick_candidates TEXT`);
+  await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS wallet_pick_message_sid TEXT`);
+
+  // Direction of the B2B link. FALSE (default) = seller-initiated:
+  // the seller posted a Sales Invoice, the buyer confirms and gets the
+  // mirror Purchase Invoice. TRUE = buyer-initiated: the buyer posted
+  // a Purchase Invoice first, the seller confirms and gets the mirror
+  // Sales Invoice. seller_* and buyer_* columns always refer to the
+  // SI side and the PI side respectively (regardless of who initiated).
+  await query(`ALTER TABLE linked_transactions ADD COLUMN IF NOT EXISTS initiated_by_buyer BOOLEAN DEFAULT FALSE`);
+
+  // Relax NOT NULL on the initiator-side doc columns to support the
+  // inverse (buyer-initiated) direction. In a buyer-init row the SI
+  // doesn't exist at row-insert time — it's created on the seller's
+  // Accept and the seller_doctype/seller_doc_name columns are filled
+  // in then. Buyer-side columns were already nullable.
+  await query(`ALTER TABLE linked_transactions ALTER COLUMN seller_doctype DROP NOT NULL`);
+  await query(`ALTER TABLE linked_transactions ALTER COLUMN seller_doc_name DROP NOT NULL`);
+
   // Per-tenant chart-of-accounts cache. We seed it during provisionTenant
   // and append to it on every account creation (wallets, party accounts).
   // Users never edit ERPNext directly, so this is authoritative for the

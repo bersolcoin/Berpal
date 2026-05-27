@@ -13,7 +13,8 @@ const { query } = require('../db');
 const { ts } = require('../log');
 const { resolvePartyAccount } = require('./party-account');
 const { linkCounterparty } = require('../links/counterparty-match');
-const { assertPhoneUnused } = require('./contact-guard');
+const { filterByNameMatch } = require('../links/name-match');
+const { assertPhoneUnused, findExistingContactByPhone } = require('./contact-guard');
 const { getSupplierGroupName } = require('./party-group');
 const { abbrFromUser } = require('./item-group');
 
@@ -24,6 +25,18 @@ async function resolveOrCreateSupplier(
   { currency = null, phone = null, email = null, _skipEagerOtherSide = false } = {}
 ) {
   if (!name) throw new Error('supplier name required');
+
+  // Phone is the strongest identity signal — names drift ("SS & Co" /
+  // "SS and co" / "SS Trading"). If this owner already has a contact at
+  // this phone under a different name, treat that as canonical so we
+  // don't create a duplicate and trip the assertPhoneUnused guard later.
+  if (phone) {
+    const existing = await findExistingContactByPhone(user.id, phone);
+    if (existing && existing.name.trim().toLowerCase() !== name.trim().toLowerCase()) {
+      console.log(`• [conversation] [${ts()}] supplier identity by phone ${phone}: "${name}" → "${existing.name}"`);
+      name = existing.name;
+    }
+  }
 
   // 1a. exact-match cache hit?
   const exact = await query(
@@ -37,25 +50,26 @@ async function resolveOrCreateSupplier(
   }
 
   // 1b. fuzzy cache hit. Same disambiguation pattern as customer.js: 1 match
-  //     wins, 2+ throws so the LLM can ask the user.
-  const fuzzy = await query(
+  //     wins, 2+ throws so the LLM can ask the user. Normalized JS-side
+  //     so "SS & co" matches "SS and co" in the cache.
+  const cacheAll = await query(
     `SELECT name, erpnext_name FROM counterparty_cache
      WHERE owner_user_id = $1 AND erpnext_doctype = 'Supplier'
-       AND (LOWER(name) LIKE LOWER($2) OR LOWER($3) LIKE LOWER('%' || name || '%'))
      ORDER BY id DESC`,
-    [user.id, `%${name}%`, name]
+    [user.id]
   );
-  if (fuzzy.rowCount === 1 && fuzzy.rows[0].erpnext_name) {
-    console.log(`• [conversation] [${ts()}] supplier fuzzy-resolved "${name}" → "${fuzzy.rows[0].erpnext_name}"`);
-    return fuzzy.rows[0].erpnext_name;
+  const fuzzy = filterByNameMatch(cacheAll.rows, name, 'name');
+  if (fuzzy.length === 1 && fuzzy[0].erpnext_name) {
+    console.log(`• [conversation] [${ts()}] supplier fuzzy-resolved "${name}" → "${fuzzy[0].erpnext_name}"`);
+    return fuzzy[0].erpnext_name;
   }
-  if (fuzzy.rowCount > 1) {
-    const candidates = fuzzy.rows.map((r) => r.name).join(', ');
+  if (fuzzy.length > 1) {
+    const candidates = fuzzy.map((r) => r.name).join(', ');
     const err = new Error(
       `Multiple suppliers match "${name}": ${candidates}. Ask the user which one and resave with the full name.`
     );
     err.code = 'AMBIGUOUS_COUNTERPARTY';
-    err.candidates = fuzzy.rows.map((r) => ({ name: r.name, erpnext_name: r.erpnext_name }));
+    err.candidates = fuzzy.map((r) => ({ name: r.name, erpnext_name: r.erpnext_name }));
     throw err;
   }
 

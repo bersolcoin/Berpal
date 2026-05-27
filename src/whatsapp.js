@@ -87,9 +87,11 @@ async function processIncomingMessage({ from, body, raw = null }) {
       }
 
       // B2B link acceptance/rejection: buyer replies "yes LINK-N" / "no LINK-N"
-      // to a proposed linked Sales Invoice. Handled out-of-band from the LLM.
+      // (or taps Accept / Decline on the template) for a proposed linked
+      // Sales Invoice. Handled out-of-band from the LLM. `raw` is forwarded
+      // so the handler can read OriginalRepliedMessageSid for button replies.
       try {
-        const linkReply = await linkedTxn.tryHandleLinkCommand(user, body || '');
+        const linkReply = await linkedTxn.tryHandleLinkCommand(user, body || '', raw);
         if (linkReply) {
           await messageLog.logOutgoing(user.id, conv.id, linkReply);
           log.msgOut(from, linkReply, 'linked-txn');
@@ -98,6 +100,23 @@ async function processIncomingMessage({ from, body, raw = null }) {
         }
       } catch (err) {
         console.error('[whatsapp] link command handler error:', err.message);
+      }
+
+      // Follow-up state after Accept: if the buyer was asked "which wallet?"
+      // and has a parked pending_buyer_wallet_pick row, route their reply
+      // here (a number, a wallet name, or "skip"). Falls through to LLM
+      // if no parked row matches.
+      try {
+        const { tryHandleWalletPick } = require('./links/buyer-wallet-pick');
+        const walletReply = await tryHandleWalletPick(user, body || '', raw);
+        if (walletReply) {
+          await messageLog.logOutgoing(user.id, conv.id, walletReply);
+          log.msgOut(from, walletReply, 'linked-txn');
+          await twilioClient.sendText(from, walletReply);
+          return;
+        }
+      } catch (err) {
+        console.error('[whatsapp] wallet-pick handler error:', err.message);
       }
     }
 
