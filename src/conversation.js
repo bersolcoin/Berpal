@@ -1,512 +1,13 @@
 const OpenAI = require('openai');
 const { query } = require('./db');
-const exchange = require('./exchange');
-const erpnext = require('./erpnext');
-
-// Maps OUR internal category code → ERPNext account code prefix.
-// ERPNext's "Standard with Numbers" template uses different codes than our pre-pivot chart,
-// so we map across. Look-up at save time appends company abbreviation dynamically.
-const ERP_CODE_MAP = {
-  // Income
-  '4000': '4110', // Sales Revenue → Sales
-  '4100': '4120', // Service Revenue → Service
-  '4900': '4210', // Other Income → Interest Income (closest)
-  // COGS
-  '5000': '5111', // Cost of Goods Sold
-  // Expenses
-  '5100': '5204', // Meals & Entertainment → Entertainment Expenses
-  '5200': '5216', // Travel
-  '5210': '5216', // Vehicle → Travel (no specific)
-  '5300': '5211', // Office Supplies → Print and Stationery
-  '5350': '5223', // Insurance → Misc
-  '5400': '5209', // Rent → Office Rent
-  '5500': '5217', // Utilities
-  '5550': '5215', // Telephone & Internet
-  '5600': '5223', // Software → Misc
-  '5700': '5206', // Professional Services → Legal
-  '5800': '5207', // Marketing
-  '5900': '5223', // Other Expenses → Misc
-  '5950': '5221', // Bank Charges
-  // Wallets / assets
-  '1000': '1110', // Cash → Cash
-  // (1100 Bank requires picking a specific bank account; we'll handle when we add wallet picker)
-  '1200': '1310', // Accounts Receivable → Debtors
-  // Liabilities
-  '2000': '2110', // Accounts Payable → Creditors
-  // Equity
-  '3000': '3100', // Owner's Equity → Capital Stock
-  '3100': '3400', // Retained Earnings
-  '3200': '3300', // Opening Balance Equity
-};
-
-/**
- * Resolve an ERPNext account name from our internal category code, scoped to the user's company + currency.
- *
- * Cache strategy: Postgres `account_cache` table (persists across restarts, shared across instances).
- *  1. Look up cache row (user_id, name=ourCode, currency).
- *  2. Hit → return ERPNext name immediately. No API call.
- *  3. Miss → query ERPNext for the right account, then INSERT into cache.
- *
- * Manual refresh: just DELETE rows from account_cache for the user (or change the UI later
- * to expose a "resync chart" action).
- */
-async function resolveErpAccount(user, erp, ourCode, currency = null) {
-  const cur = currency || user.reporting_currency || 'THB';
-
-  // Cache hit?
-  const cached = await query(
-    `SELECT erpnext_account_name FROM account_cache
-     WHERE user_id = $1 AND name = $2 AND currency = $3 AND is_active = 1
-     LIMIT 1`,
-    [user.id, ourCode, cur]
-  );
-  if (cached.rowCount > 0 && cached.rows[0].erpnext_account_name) {
-    return cached.rows[0].erpnext_account_name;
-  }
-
-  // Cache miss — query ERPNext
-  const erpCodePrefix = ERP_CODE_MAP[ourCode];
-  if (!erpCodePrefix) return null;
-
-  const r = await erp.listAccounts({
-    filters: [
-      ['name', 'like', `${erpCodePrefix} - %`],
-      ['company', '=', erp.company],
-      ['is_group', '=', 0],
-    ],
-    limit: 1,
-  });
-  const erpName = r.data?.[0]?.name || null;
-  if (!erpName) return null;
-
-  // Write to cache (idempotent via ON CONFLICT)
-  const now = new Date().toISOString();
-  await query(
-    `INSERT INTO account_cache
-       (user_id, name, account_type, currency, erpnext_account_name, is_active, created_at, updated_at)
-     VALUES ($1, $2, NULL, $3, $4, 1, $5, $5)
-     ON CONFLICT (user_id, name, currency) DO UPDATE SET
-       erpnext_account_name = EXCLUDED.erpnext_account_name,
-       updated_at = EXCLUDED.updated_at`,
-    [user.id, ourCode, cur, erpName, now]
-  );
-
-  console.log(`• [conversation] [${ts()}] account_cache miss → wrote ${ourCode}/${cur} = "${erpName}"`);
-  return erpName;
-}
-
-function ts() {
-  return new Date().toTimeString().slice(0, 8);
-}
-
-/**
- * Strip the "<code> - " prefix and " - <abbr>" suffix from an ERPNext account
- * name, leaving just the human-readable middle.
- *   "1000 - Cash - TTC"                      → "Cash"
- *   "5223 - Miscellaneous Expenses - TTC"    → "Miscellaneous Expenses"
- *   "BBL Savings - TTC"                      → "BBL Savings"      (no code prefix)
- *   "Cash"                                   → "Cash"             (already friendly)
- */
-function friendlyAccountName(erpAccountName) {
-  if (!erpAccountName) return '';
-  return String(erpAccountName)
-    .replace(/^\d+\s*-\s*/, '')             // drop leading "1000 - "
-    .replace(/\s*-\s*[A-Z]{2,8}$/, '')      // drop trailing " - TTC"
-    .trim();
-}
-
-/**
- * Build the `title` field for an ERPNext Journal Entry (or any from→to ledger move).
- * Without this, ERPNext defaults the title to the first account name
- * (e.g. "5223 - Miscellaneous Expenses - TTC") — unhelpful in list views.
- *
- * Format: "<From>(<CUR>) to <To>(<CUR>)" — money flows source → destination.
- * Per-side currency is shown so multi-currency moves are unambiguous, e.g.
- * "Jameel Crest Gems(USD) to Cash(THB)" when a USD invoice is settled in THB cash.
- *
- *   Expense:   from = cash/bank/card wallet, to = expense category
- *   Income:    from = revenue category,      to = cash/bank/card wallet
- *   Transfer:  from = source wallet,         to = destination wallet
- *   Payment:   from = AR/AP party,           to = cash/bank/card wallet (or reverse)
- *
- * `currency` is the convenience arg when both sides match. Pass `fromCurrency`
- * and/or `toCurrency` to override per side.
- */
-function buildJournalTitle({ currency, fromCurrency, toCurrency, fromAccount, toAccount }) {
-  const from = friendlyAccountName(fromAccount) || 'Unknown';
-  const to = friendlyAccountName(toAccount) || 'Unknown';
-  const fc = fromCurrency || currency;
-  const tc = toCurrency || currency;
-  const fcTag = fc ? `(${fc})` : '';
-  const tcTag = tc ? `(${tc})` : '';
-  return `${from}${fcTag} to ${to}${tcTag}`.slice(0, 140);
-}
-
-/**
- * Resolve (or auto-create) a Receivable / Payable account in the given currency.
- * ERPNext rejects an invoice where the document currency doesn't match the
- * party account currency. For a multi-currency setup we need one Debtors /
- * Creditors leaf account per currency. The standard pattern:
- *
- *   Accounts Receivable (group)
- *     ├── Debtors          (THB, leaf)        <- company default
- *     ├── Debtors USD      (USD, leaf)        <- auto-created on first USD invoice
- *     └── Debtors EUR      (EUR, leaf)        <- etc.
- *
- * Per-process memo so repeated calls in the same run are cheap.
- *
- *   accountType: 'Receivable' | 'Payable'
- *   currency:    'USD' | 'THB' | …
- *   returns:     ERPNext account name (e.g. "Debtors USD - TTC")
- */
-const _partyAccountCache = new Map();
-async function resolvePartyAccount(erp, accountType, currency) {
-  const cacheKey = `${erp.company}|${accountType}|${currency}`;
-  if (_partyAccountCache.has(cacheKey)) return _partyAccountCache.get(cacheKey);
-
-  // 1. Existing leaf account in this currency?
-  const existing = await erp.listResource('Account', {
-    filters: [
-      ['company', '=', erp.company],
-      ['account_type', '=', accountType],
-      ['account_currency', '=', currency],
-      ['is_group', '=', 0],
-    ],
-    fields: ['name'],
-    limit: 1,
-  });
-  if (existing.data && existing.data.length > 0) {
-    _partyAccountCache.set(cacheKey, existing.data[0].name);
-    return existing.data[0].name;
-  }
-
-  // 2. Locate the parent group ("Accounts Receivable" / "Accounts Payable").
-  //    Prefer the is_group=1 account with this account_type. Fall back to
-  //    walking up from any existing leaf with the same type.
-  let parentAccount = null;
-  const groups = await erp.listResource('Account', {
-    filters: [
-      ['company', '=', erp.company],
-      ['account_type', '=', accountType],
-      ['is_group', '=', 1],
-    ],
-    fields: ['name'],
-    limit: 1,
-  });
-  if (groups.data && groups.data.length > 0) {
-    parentAccount = groups.data[0].name;
-  } else {
-    const anyLeaf = await erp.listResource('Account', {
-      filters: [
-        ['company', '=', erp.company],
-        ['account_type', '=', accountType],
-        ['is_group', '=', 0],
-      ],
-      fields: ['parent_account'],
-      limit: 1,
-    });
-    parentAccount = anyLeaf.data?.[0]?.parent_account || null;
-  }
-  if (!parentAccount) {
-    throw new Error(
-      `[erpnext] could not locate parent ${accountType} group account for company ${erp.company}`
-    );
-  }
-
-  // 3. Create the per-currency leaf.
-  const baseName = accountType === 'Receivable' ? 'Debtors' : 'Creditors';
-  const accountName = `${baseName} ${currency}`;
-  const result = await erp.createAccount({
-    account_name: accountName,
-    parent_account: parentAccount,
-    account_type: accountType,
-    account_currency: currency,
-  });
-  const erpName = result.data?.name;
-  console.log(
-    `• [conversation] [${ts()}] created ${accountType} account in ERPNext: ${erpName} (currency=${currency})`
-  );
-  _partyAccountCache.set(cacheKey, erpName);
-  return erpName;
-}
-
-/**
- * Resolve a counterparty name to its ERPNext Customer record name. Order:
- *   1. counterparty_cache hit → return immediately
- *   2. Search ERPNext for an existing Customer with that name → cache + return
- *   3. Create new Customer in ERPNext (with currency/phone/email if known) → cache + return
- */
-async function resolveOrCreateCustomer(user, erp, name, { currency = null, phone = null, email = null } = {}) {
-  if (!name) throw new Error('customer name required');
-
-  // 1. cache hit?
-  const cached = await query(
-    `SELECT erpnext_name FROM counterparty_cache
-     WHERE owner_user_id = $1 AND LOWER(name) = LOWER($2) AND erpnext_doctype = 'Customer'
-     LIMIT 1`,
-    [user.id, name]
-  );
-  if (cached.rowCount > 0 && cached.rows[0].erpnext_name) {
-    return cached.rows[0].erpnext_name;
-  }
-
-  // 2. exact-name match in ERPNext?
-  const found = await erp.listCustomers({
-    filters: [['customer_name', '=', name]],
-    limit: 1,
-  });
-
-  let erpName;
-  if (found.data?.length > 0) {
-    erpName = found.data[0].name;
-    console.log(`• [conversation] [${ts()}] customer match in ERPNext: ${erpName}`);
-  } else {
-    // 3. create
-    const customerData = {
-      customer_name: name,
-      customer_type: 'Individual',
-      customer_group: 'Individual',
-      territory: 'All Territories',
-    };
-    if (currency) customerData.default_currency = currency;
-    if (phone) customerData.mobile_no = phone;
-    if (email) customerData.email_id = email;
-
-    const result = await erp.createCustomer(customerData);
-    erpName = result.data.name;
-    console.log(`• [conversation] [${ts()}] created Customer in ERPNext: ${erpName} (currency=${currency || 'company default'})`);
-  }
-
-  // 4. cache
-  const now = new Date().toISOString();
-  await query(
-    `INSERT INTO counterparty_cache
-       (owner_user_id, name, phone, email, erpnext_doctype, erpnext_name, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, 'Customer', $5, $6, $6)
-     ON CONFLICT (owner_user_id, name) DO UPDATE SET
-       erpnext_name = EXCLUDED.erpnext_name,
-       erpnext_doctype = EXCLUDED.erpnext_doctype,
-       phone = COALESCE(counterparty_cache.phone, EXCLUDED.phone),
-       email = COALESCE(counterparty_cache.email, EXCLUDED.email),
-       updated_at = EXCLUDED.updated_at`,
-    [user.id, name, phone, email, erpName, now]
-  );
-
-  return erpName;
-}
-
-/**
- * Make sure a generic catch-all Item exists in ERPNext for use as the line-item placeholder
- * on Sales Invoices. ERPNext requires every invoice line to reference an Item — but for
- * service-style or one-off product sales we don't want to create an Item per gemstone.
- * The actual product description goes in the line's `description` field.
- *
- * Per-process memo so we don't hit the API repeatedly.
- */
-const _itemEnsured = new Set();
-async function ensureGenericSalesItem(erp) {
-  const ITEM_CODE = 'GEN-SALE';
-  if (_itemEnsured.has(ITEM_CODE)) return ITEM_CODE;
-
-  try {
-    await erp.getResource('Item', ITEM_CODE);
-    _itemEnsured.add(ITEM_CODE);
-    return ITEM_CODE;
-  } catch (err) {
-    if (err.status !== 404 && !String(err.message).includes('DoesNotExistError')) throw err;
-  }
-
-  // Item doesn't exist — create
-  await erp.createResource('Item', {
-    item_code: ITEM_CODE,
-    item_name: 'Generic Sale',
-    item_group: 'All Item Groups',
-    stock_uom: 'Nos',
-    is_stock_item: 0,
-    is_sales_item: 1,
-    description: 'Default item used by bot for sales line items',
-  });
-
-  _itemEnsured.add(ITEM_CODE);
-  console.log(`• [conversation] [${ts()}] created Item ${ITEM_CODE} in ERPNext`);
-  return ITEM_CODE;
-}
+const { TOOLS, executeTool } = require('./tools');
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   : null;
 
 const RECENT_MESSAGES_LIMIT = 20;
-const MAX_TOOL_LOOP_ITERATIONS = 5;
-const REQUIRED_FIELDS = ['amount', 'currency', 'direction', 'transaction_date'];
-
-const TOOLS = [
-  {
-    type: 'function',
-    function: {
-      name: 'update_draft',
-      description:
-        'Update fields on the in-progress transaction draft. Call this whenever you extract any information from the user, even partial. Only include fields you actually inferred from the conversation.',
-      parameters: {
-        type: 'object',
-        properties: {
-          transaction_date: {
-            type: 'string',
-            description:
-              'ISO date YYYY-MM-DD. Resolve relative phrases ("yesterday", "last Tuesday") to absolute dates using today as reference.',
-          },
-          direction: { type: 'string', enum: ['expense', 'income', 'transfer'] },
-          amount: {
-            type: 'number',
-            description: 'The transaction amount in transaction currency. Positive number.',
-          },
-          currency: { type: 'string', description: 'ISO 4217 currency code, e.g. THB, USD, EUR.' },
-          counterparty_name: {
-            type: 'string',
-            description: 'The other party (vendor name, customer name, person name).',
-          },
-          counterparty_phone: {
-            type: 'string',
-            description: 'Phone number of the counterparty if shared. For invoice_issued/bill_received with a NEW counterparty, ask for this.',
-          },
-          counterparty_nickname: {
-            type: 'string',
-            description: 'Casual identifier the user uses for this counterparty (e.g., "tall mike", "the regular customer", "Big J"). Capture when the user uses one. Used for fuzzy lookup later.',
-          },
-          counterparty_contact_skipped: {
-            type: 'boolean',
-            description: 'Set true when the user says "skip"/"no"/"later" in response to the new-counterparty contact ask. Lets request_confirmation proceed without a phone for invoice/bill flows.',
-          },
-          counterparty_id: {
-            type: 'number',
-            description: 'Existing counterparty record id, set after lookup_counterparty resolved which existing record the user meant. When set, transactions.save uses it directly instead of name-based find-or-create — preventing duplicate counterparty records.',
-          },
-          payment_account_id: {
-            type: 'number',
-            description: 'Specific user account instance id (from list_user_accounts) the cash/bank movement hits. Set after picker resolves which account. If user has only one matching account for the type+currency, transactions.save will auto-link — but setting it explicitly is preferred for clarity. For direction=transfer, this is the SOURCE wallet (where money leaves).',
-          },
-          transfer_destination_account_id: {
-            type: 'number',
-            description: 'For direction=transfer ONLY: the DESTINATION wallet id (where the money lands). Combined with payment_account_id (source), records the move in one transaction row. Both must be set for transfers.',
-          },
-          category_code: {
-            type: 'string',
-            description:
-              'Code from the chart of accounts (e.g. "5100"). YOU pick this based on context — never ask the user. If nothing reasonably fits, default to "5900" (Other Expenses) silently.',
-          },
-          payment_method: {
-            type: 'string',
-            enum: ['cash', 'bank_transfer', 'credit_card', 'debit_card', 'wallet', 'cheque', 'other'],
-          },
-          payment_account_code: {
-            type: 'string',
-            description:
-              'Code from the chart of accounts for the asset/liability account hit. YOU pick: default to "1000" (Cash) for small expenses unless user mentions card/bank. "bank"/"transfer" → "1100", "credit card"/"visa"/"mastercard" → "2100".',
-          },
-          description: {
-            type: 'string',
-            description: 'Free-text memo describing what the transaction was for.',
-          },
-          tax_amount: { type: 'number' },
-          tax_rate: { type: 'number', description: 'Tax rate as a percentage, e.g. 7 for 7%.' },
-          tax_inclusive: {
-            type: 'boolean',
-            description: 'True if amount already includes tax; false if tax is on top.',
-          },
-          transaction_type: {
-            type: 'string',
-            enum: ['cash', 'invoice_issued', 'bill_received', 'payment', 'advance_given', 'advance_received'],
-            description: 'Default cash. invoice_issued = you sent an invoice (you are owed). bill_received = you got a bill (you owe). payment = settles a prior invoice/bill/advance. advance_given = simple journal entry: you gave money to a counterparty for any non-trade reason (prepay, advance, friendly cash, refund) — cash leaves your wallet, an open balance is recorded against them. advance_received = mirror: someone gave you money for any non-trade reason — cash arrives, an open balance recorded.',
-          },
-          payment_terms: {
-            type: 'string',
-            enum: ['net_0', 'net_7', 'net_15', 'net_30', 'net_60', 'custom'],
-            description: 'For invoices/bills only. "due immediately"/"on receipt" = net_0; "net 30"/"due in 30 days" = net_30, etc.',
-          },
-          due_date: {
-            type: 'string',
-            description: 'For invoices/bills: ISO date YYYY-MM-DD when payment is due. Compute from payment_terms + transaction_date if not explicitly stated.',
-          },
-          delivery_date: {
-            type: 'string',
-            description: 'When goods/services were/will be delivered (often ≠ transaction_date for invoices). ISO date YYYY-MM-DD.',
-          },
-          parent_transaction_id: {
-            type: 'number',
-            description: 'For payment transactions only: the ID of the invoice/bill being settled, if known. Optional.',
-          },
-          invoice_number: {
-            type: 'string',
-            description: "External invoice/bill reference number (the supplier's number for bill_received, your own number for invoice_issued).",
-          },
-          exchange_rate: {
-            type: 'number',
-            description: 'Exchange rate from transaction currency to user reporting currency (1 unit of currency = N units of reporting_currency). Set after calling fetch_exchange_rate, or when user explicitly states a rate ("use rate 36.5").',
-          },
-          exchange_rate_source: {
-            type: 'string',
-            description: 'Where the rate came from: "frankfurter" (auto-fetched), "manual" (user override), or "same_currency".',
-          },
-        },
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'request_confirmation',
-      description:
-        'Indicates you have all required fields and your text reply contains a clean summary for the user to confirm. Use only when amount, currency, direction, and transaction_date are all set in the draft.',
-      parameters: { type: 'object', properties: {} },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'save_transaction',
-      description:
-        'Save the draft as a confirmed transaction. ONLY call after the user has explicitly confirmed (yes/save/ok in response to your confirmation summary). Never auto-save.',
-      parameters: { type: 'object', properties: {} },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'cancel_transaction',
-      description:
-        'Discard the current draft and reset. Call if user says cancel, forget it, never mind, etc.',
-      parameters: { type: 'object', properties: {} },
-    },
-  },
-  // ─── ERPNext-pivot temporary slim-down ────────────────────────────
-  // The following tools were removed and will be re-added as ERPNext-backed
-  // equivalents during incremental rebuild:
-  //   query_open_invoices, query_balance_with_counterparty, query_upcoming,
-  //   query_transaction_summary, lookup_counterparty, create_contact,
-  //   list_user_accounts, create_user_account, query_cash_bank_balance.
-  // fetch_exchange_rate is kept (pure HTTP, no DB).
-  // ──────────────────────────────────────────────────────────────────
-  {
-    type: 'function',
-    function: {
-      name: 'fetch_exchange_rate',
-      description:
-        'Fetch the exchange rate from one currency to another for a given date (ECB reference rates via frankfurter.app). Call this when the transaction currency differs from the user\'s reporting currency, BEFORE request_confirmation. After getting the rate, call update_draft with exchange_rate + exchange_rate_source so the saved transaction stores the conversion.',
-      parameters: {
-        type: 'object',
-        required: ['from_currency', 'to_currency'],
-        properties: {
-          from_currency: { type: 'string', description: 'ISO 4217 code, e.g. "USD".' },
-          to_currency: { type: 'string', description: 'ISO 4217 code, e.g. "THB".' },
-          date: {
-            type: 'string',
-            description: 'ISO YYYY-MM-DD; the transaction_date works best. Defaults to today if omitted. Frankfurter may return the previous business day for weekends.',
-          },
-        },
-      },
-    },
-  },
-];
+const MAX_TOOL_LOOP_ITERATIONS = 10;
 
 // Static categorization hint — replaces the old query against the dropped chart_of_accounts table.
 // Now used by the LLM to extract a category_code that the push worker maps to ERPNext accounts.
@@ -614,7 +115,7 @@ If they also owe him something:
 If nothing:
 "Nothing outstanding with Jameel."
 
-QUERY ANSWER EXAMPLES:
+QUERY ANSWER EXAMPLES (#N in examples = the row's ref, e.g. ACC-SINV-2026-00001; in replies you may shorten it to the trailing number when unambiguous):
 
 (query_open_invoices, both, no filter)
 "You have 2 unpaid items:
@@ -705,21 +206,21 @@ TRANSACTION TYPE DETECTION (set transaction_type explicitly):
 - "I sent invoice to X", "I invoiced X", "I issued bill to X for ..." → transaction_type=invoice_issued, direction=income
 - "got a bill from X", "X invoiced me", "received invoice from X" → transaction_type=bill_received, direction=expense
 - Receipt of money from a named counterparty: "X paid me Y", "received Y from X", "X transferred Y", "Jameel paid 45000" → BEFORE setting transaction_type, call query_open_invoices(direction='receivable', counterparty_search='<X>'):
-  * Exactly 1 open invoice for that counterparty with amount matching (exact or within ~1% of) Y → transaction_type='payment', parent_transaction_id=<invoice id>, direction='income'. Confirmation Account line: "Cash → Receivable from <counterparty>". Add a "Settles:" line: "Settles: Invoice #N (YYYY/MM/DD, original amount)".
+  * Exactly 1 open invoice for that counterparty with amount matching (exact or within ~1% of) Y → transaction_type='payment', parent_invoice_name=<row ref>, parent_invoice_doctype=<row doctype>, direction='income'. Confirmation Account line: "Receivable from <counterparty> → <wallet_name>". Add a "Settles:" line: "Settles: Invoice <ref> (YYYY/MM/DD, original amount)".
   * Multiple open invoices → present a NUMBERED LIST of up to 5 (newest first by id) and ask the user to pick by number. Format example:
        "Multiple open invoices from Jameel Crest Gems — which to settle?
-        1. Invoice #4 — 45,000 USD, dated 2026/05/03
-        2. Invoice #7 — 22,000 USD, dated 2026/04/12
-        3. Invoice #9 — 15,000 USD, dated 2026/03/28
+        1. ACC-SINV-2026-00004 — 45,000 USD, dated 2026/05/03
+        2. ACC-SINV-2026-00007 — 22,000 USD, dated 2026/04/12
+        3. ACC-SINV-2026-00009 — 15,000 USD, dated 2026/03/28
         Reply with a number (1-3)."
        If there are MORE than 5 open: show top 5 and add "(plus N more — reply 'show more' or filter by amount/date)". On 'show more', present the next batch.
-       Once user picks a number, set parent_transaction_id to that invoice's id and proceed to request_confirmation.
+       Once user picks a number, set parent_invoice_name + parent_invoice_doctype from that row and proceed to request_confirmation.
   * No open invoices → SEE MISSED-SALE FLOW BELOW (do NOT silently save as cash income if the user mentioned "for a sale" / "for an invoice" / "settling" / similar settlement language).
 - Outgoing money to a named counterparty/vendor: "I paid X", "paid Y to X", "sent Y to X" → similarly call query_open_invoices(direction='payable', counterparty_search='<X>'):
-  * Exactly 1 open bill matching → transaction_type='payment', parent_transaction_id=<bill id>, direction='expense'. Account line: "Payable to <counterparty> → Cash". Add Settles line.
+  * Exactly 1 open bill matching → transaction_type='payment', parent_invoice_name=<row ref>, parent_invoice_doctype='Purchase Invoice', direction='expense'. Account line: "<wallet_name> → Payable to <counterparty>". Add Settles line.
   * Multiple → numbered list, same pattern as above.
   * No open bills + missed-bill language → mirror the missed-sale flow below (gather bill details, then payment).
-- Explicit reference like "X paid invoice #N" → use that invoice id directly as parent_transaction_id, no lookup needed.
+- Explicit reference like "X paid invoice ACC-SINV-2026-00004" (or just "invoice 4" when it uniquely matches an open row's ref) → use that ref as parent_invoice_name.
 - Payment currency: the payment should typically be in the SAME currency as the parent invoice. If user pays in a different currency, ASK to clarify before confirming.
 
 CASH MOVEMENT WITH A COUNTERPARTY (simple journal entry — no goods/services exchanged):
@@ -749,8 +250,9 @@ Confirmation card examples:
    Note: deposit for upcoming work
 
 SETTLEMENT (when the open balance is squared):
-- "Jackie returned my 5000" / "Jackie paid back" → query_open_invoices(direction='receivable', counterparty_search='Jackie') finds the advance_given → transaction_type='payment', parent_transaction_id=<advance id>, direction='income'.
-- "I returned Mike's 10k" / "paid back Mike" → query for advance_received from Mike → settle with direction='expense'.
+Advances are not invoices, so they do NOT appear in query_open_invoices — they show in query_balance_with_counterparty.
+- "Jackie returned my 5000" / "Jackie paid back" → lookup_counterparty('Jackie') → query_balance_with_counterparty(counterparty_id) shows owes_you → transaction_type='payment', counterparty_id=<id>, direction='income', NO parent_invoice_name. Settles line: "Settles: advance to Jackie".
+- "I returned Mike's 10k" / "paid back Mike" → same, you_owe side → direction='expense'.
 
 If the user prefers a generic "Type: Money Out / Money In" label instead of "Advance Out/In", that's also fine — pick whichever reads cleaner for the situation.
 
@@ -767,9 +269,9 @@ DO NOT trigger missed-sale flow just because lookup_counterparty returns 0 — t
         2) Payment received today — 20,000 USD, settles the invoice above
         Confirm to save both, or tell me what to fix."
 3. On user Confirm, perform a CHAINED SAVE in the same turn:
-   a) Call update_draft with the INVOICE fields (transaction_type='invoice_issued', back-dated transaction_date, etc.). Then save_transaction. The tool result returns the invoice's transaction_id.
-   b) Then call update_draft for the PAYMENT (transaction_type='payment', transaction_date=today, parent_transaction_id=<id from step a>, same currency/amount). Then save_transaction.
-4. Reply: "Saved ✓ Invoice #<a> + Payment #<b>" (single line).
+   a) Call update_draft with the INVOICE fields (transaction_type='invoice_issued', back-dated transaction_date, etc.). Then save_transaction. The tool result returns the invoice's erpnext_name and doctype.
+   b) Then call update_draft for the PAYMENT (transaction_type='payment', transaction_date=today, parent_invoice_name=<erpnext_name from step a>, parent_invoice_doctype='Sales Invoice', same currency/amount). Then save_transaction.
+4. Reply: "Saved ✓ <invoice erpnext_name> + <payment erpnext_name>" (single line).
 The system clears the draft after each save_transaction, so chained saves in one turn work cleanly.
 
 COUNTERPARTY DISAMBIGUATION (avoid duplicate records):
@@ -805,7 +307,7 @@ Workflow:
         3. Add new wallet
         Reply with a number."
      User picks 1-N → set payment_account_id. User picks "Add new wallet" / last option → call create_user_account inline (ask for name + parent_code + currency).
-   - 0 matches → ask: "No <currency> wallet on file. Want to add one? Reply with the name (e.g. 'BBL THB') or 'skip' to save without linking." If user gives a name, call create_user_account, then set payment_account_id and proceed. If 'skip', proceed without payment_account_id (transaction won't show in cash balance).
+   - 0 matches → ask: "No <currency> wallet on file. Want to add one? Reply with the name (e.g. 'BBL THB') or 'skip' to save without linking." If user gives a name, call create_user_account, then set payment_account_id and proceed. If 'skip', call update_draft with wallet_skipped=true and proceed (it posts to the generic Cash account).
 3. The Account line in the confirmation card should reference the WALLET NAME, not the generic type. Example: "Account: BBL Savings → Meals & Entertainment" instead of "Cash → Meals & Entertainment".
 
 This picker does NOT apply to invoice_issued / bill_received (those hit AR/AP, not cash). Only cash + payment transactions.
@@ -840,7 +342,7 @@ When user says "I opened a new bank account and deposited 5000 baht into it" or 
 1. First create the new wallet via create_user_account (ask name + currency if not in message).
 2. After creation, immediately compose the transfer transaction: source = existing matching-currency wallet (or ask if multiple), destination = newly created wallet, amount = stated amount.
 3. Present the transfer confirmation card with the standard format.
-4. On Confirm → save the transfer transaction. Reply "Saved ✓ Wallet + Tx #N".
+4. On Confirm → save the transfer transaction. Reply "Saved ✓ Wallet + <erpnext_name>".
 
 OPENING BALANCE for a NEW or EXISTING wallet (NOT money moved from another tracked wallet):
 Trigger phrases: "I have KBank with 657000 baht balance", "BBL has 50000 in it currently", "as of today my Cash is 12000", "opening balance 5000 in <wallet>", or any "I have $X in <wallet>" framing.
@@ -1010,7 +512,7 @@ Type: <Expense | Income | Invoice Sent | Bill Received | Payment | Transfer>
 Account: <source_name> → <destination_name>
 Counterparty: <name>          (omit this line entirely if no counterparty)
 Due: YYYY/MM/DD (Net N)       (ONLY include for Invoice Sent or Bill Received; otherwise omit)
-Settles: Invoice #N from YYYY/MM/DD for X,XXX CCY    (ONLY include for Payment when parent_transaction_id is set; otherwise omit)
+Settles: Invoice <ref> from YYYY/MM/DD for X,XXX CCY    (ONLY include for Payment; when settling an advance write "Settles: advance to/from <counterparty>"; otherwise omit)
 Note: <description>           (omit this line entirely if no description)
 
 Choose below or tell me what to fix.
@@ -1098,213 +600,6 @@ async function saveConversationState(userId, { draft, recentMessages, state }) {
 
 async function resetConversation(userId) {
   await saveConversationState(userId, { draft: null, recentMessages: [], state: 'idle' });
-}
-
-function validateDraft(draft) {
-  const missing = [];
-  for (const field of REQUIRED_FIELDS) {
-    if (draft[field] == null || draft[field] === '') missing.push(field);
-  }
-  const tt = draft.transaction_type;
-
-  // category_code is required for everything except wallet-to-wallet transfers
-  if (tt !== 'transfer' && (draft.category_code == null || draft.category_code === '')) {
-    missing.push('category_code');
-  }
-  // counterparty_name is required for invoice/bill flows (they need a Customer/Supplier in ERPNext)
-  if ((tt === 'invoice_issued' || tt === 'bill_received') && !draft.counterparty_name) {
-    missing.push('counterparty_name');
-  }
-  return missing;
-}
-
-async function executeTool(toolName, args, ctx) {
-  switch (toolName) {
-    case 'update_draft':
-      ctx.draft = { ...ctx.draft, ...args };
-      console.log(`• [conversation] [${ts()}] tool=update_draft draft=${JSON.stringify(ctx.draft)}`);
-      return { ok: true, current_draft: ctx.draft };
-
-    case 'request_confirmation': {
-      const missing = validateDraft(ctx.draft);
-      if (missing.length) {
-        return {
-          ok: false,
-          error: `Required fields still missing: ${missing.join(', ')}. Ask the user for them before requesting confirmation.`,
-        };
-      }
-      // ERPNEXT-PIVOT TEMP: counterparty + wallet checks were removed (they referenced dropped tables).
-      // Will be re-added as ERPNext-backed checks during incremental rebuild.
-      ctx.confirmationRequested = true;
-      console.log(`• [conversation] [${ts()}] tool=request_confirmation user_id=${ctx.user.id}`);
-      return { ok: true };
-    }
-
-    case 'save_transaction': {
-      const missing = validateDraft(ctx.draft);
-      if (missing.length) {
-        return { ok: false, error: `Cannot save; missing required fields: ${missing.join(', ')}.` };
-      }
-      try {
-        const erp = erpnext.forUser(ctx.user);
-        const { draft } = ctx;
-        const tt = draft.transaction_type || 'cash';
-
-        // ── INVOICE_ISSUED → ERPNext Sales Invoice ────────────────────
-        if (tt === 'invoice_issued') {
-          if (!draft.counterparty_name) {
-            return { ok: false, error: 'invoice requires counterparty_name' };
-          }
-
-          const customerName = await resolveOrCreateCustomer(ctx.user, erp, draft.counterparty_name, {
-            currency: draft.currency,
-            phone: draft.counterparty_phone,
-            email: draft.counterparty_email,
-          });
-
-          const itemCode = await ensureGenericSalesItem(erp);
-
-          // Resolve income account from category_code (4000 → 4110 - Sales - TTC)
-          const incomeAccount = await resolveErpAccount(
-            ctx.user, erp, draft.category_code, ctx.user.reporting_currency
-          );
-
-          // Compute due_date from payment_terms if not set
-          const postingDate = draft.transaction_date;
-          let dueDate = draft.due_date;
-          if (!dueDate && typeof draft.payment_terms === 'string' && draft.payment_terms.startsWith('net_')) {
-            const days = parseInt(draft.payment_terms.slice(4), 10);
-            if (!isNaN(days)) {
-              const d = new Date(postingDate);
-              d.setDate(d.getDate() + days);
-              dueDate = d.toISOString().slice(0, 10);
-            }
-          }
-          if (!dueDate) dueDate = postingDate;
-
-          const invoicePayload = {
-            customer: customerName,
-            posting_date: postingDate,
-            due_date: dueDate,
-            currency: draft.currency,
-            items: [
-              {
-                item_code: itemCode,
-                qty: 1,
-                rate: draft.amount,
-                description: draft.description || `${customerName} invoice`,
-                ...(incomeAccount ? { income_account: incomeAccount } : {}),
-              },
-            ],
-            docstatus: 1, // submit on create
-          };
-
-          // Multi-currency: if invoice currency != company currency, ERPNext needs
-          //   (a) conversion_rate so it can compute base totals, AND
-          //   (b) a Receivable account in the invoice's currency (debit_to).
-          //       Without (b), ERPNext rejects with "Party Account currency and
-          //       document currency should be same".
-          if (draft.currency !== ctx.user.reporting_currency) {
-            invoicePayload.conversion_rate = draft.exchange_rate || 1;
-            invoicePayload.debit_to = await resolvePartyAccount(erp, 'Receivable', draft.currency);
-          }
-
-          const result = await erp.createSalesInvoice(invoicePayload);
-          const erpName = result.data?.name;
-
-          ctx.saved = { erpnext_name: erpName };
-          ctx.savedIds = [...(ctx.savedIds || []), erpName];
-          ctx.draft = {};
-          ctx.confirmationRequested = false;
-
-          console.log(
-            `• [conversation] [${ts()}] saved Sales Invoice to ERPNext: ${erpName} ` +
-              `(${draft.amount} ${draft.currency} for ${customerName}, due ${dueDate})`
-          );
-          return { ok: true, erpnext_name: erpName, doctype: 'Sales Invoice' };
-        }
-
-        // ── CASH (income/expense) → ERPNext Journal Entry ─────────────
-        // Resolve cash-side account (defaults to '1000' Cash)
-        const cashCode = draft.payment_account_code || '1000';
-        const cashAccount = await resolveErpAccount(ctx.user, erp, cashCode, draft.currency);
-
-        const categoryAccount = await resolveErpAccount(
-          ctx.user, erp, draft.category_code, draft.currency
-        );
-
-        if (!cashAccount || !categoryAccount) {
-          return {
-            ok: false,
-            error: `Could not find ERPNext accounts (cash=${cashCode}→${cashAccount}, category=${draft.category_code}→${categoryAccount})`,
-          };
-        }
-
-        const entries =
-          draft.direction === 'expense'
-            ? [
-                { account: categoryAccount, debit_in_account_currency: draft.amount },
-                { account: cashAccount, credit_in_account_currency: draft.amount },
-              ]
-            : [
-                { account: cashAccount, debit_in_account_currency: draft.amount },
-                { account: categoryAccount, credit_in_account_currency: draft.amount },
-              ];
-
-        // For the title, follow the money: expense flows cash→category;
-        // income flows category→cash. (Transfers, when wired, pass source→dest directly.)
-        const fromAccount = draft.direction === 'expense' ? cashAccount : categoryAccount;
-        const toAccount   = draft.direction === 'expense' ? categoryAccount : cashAccount;
-
-        const result = await erp.createJournalEntry({
-          voucher_type: 'Journal Entry',
-          posting_date: draft.transaction_date,
-          title: buildJournalTitle({
-            currency: draft.currency,
-            fromAccount,
-            toAccount,
-          }),
-          user_remark: draft.description || 'Bot entry',
-          accounts: entries,
-          docstatus: 1,
-        });
-
-        const erpName = result.data?.name;
-        ctx.saved = { erpnext_name: erpName };
-        ctx.savedIds = [...(ctx.savedIds || []), erpName];
-        ctx.draft = {};
-        ctx.confirmationRequested = false;
-
-        console.log(
-          `• [conversation] [${ts()}] saved JE to ERPNext: ${erpName} ` +
-            `(${draft.direction} ${draft.amount} ${draft.currency})`
-        );
-        return { ok: true, erpnext_name: erpName, doctype: 'Journal Entry' };
-      } catch (err) {
-        console.error('[conversation] save error:', err.message);
-        return { ok: false, error: `Save failed: ${err.message}` };
-      }
-    }
-
-    case 'cancel_transaction':
-      ctx.cancelled = true;
-      console.log(`• [conversation] [${ts()}] tool=cancel_transaction user_id=${ctx.user.id}`);
-      return { ok: true };
-
-    case 'fetch_exchange_rate': {
-      const result = await exchange.fetchRate(args?.from_currency, args?.to_currency, args?.date);
-      console.log(`• [conversation] [${ts()}] tool=fetch_exchange_rate ${args?.from_currency}->${args?.to_currency} date=${args?.date || 'today'} rate=${result.rate ?? 'err'} source=${result.source || 'n/a'}`);
-      return result;
-    }
-
-
-
-
-
-
-    default:
-      return { ok: false, error: `Unknown tool: ${toolName}` };
-  }
 }
 
 async function handle(user, userMessage) {

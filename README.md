@@ -2,7 +2,7 @@
 
 WhatsApp-first bookkeeping bot for small businesses. Users log transactions in plain language ("paid 850 for lunch", "sold ruby 7.68ct to Jameel Crest Gems for 45000 USD net 30"), the bot extracts the structured fields, shows a confirmation card, and posts the transaction to **ERPNext** as the accounting backend.
 
-> **Status:** active development. Sales-invoice and cash-journal flows work end-to-end against ERPNext. Purchase-invoice, payment-entry (settlement), and transfer/opening-balance journals are next. The codebase is mid-refactor toward a modular `erp-sync/` + `erp-query/` + `tools/` layout — expect churn.
+> **Status:** all transaction flows post to ERPNext: sales invoices, purchase invoices (bills), payments against either (incl. partial and multi-currency), cash income/expense, wallet transfers, advances given/received, and opening balances. All query tools (open invoices, upcoming, counterparty balance, period summary, cash/bank balance) read live from ERPNext. Tested against an in-memory ERPNext stand-in (`npm test`); verify against a real instance before relying on it.
 
 ## Architecture (one paragraph)
 
@@ -69,16 +69,27 @@ Run `node scripts/check-fx-account.js` to verify your Company's multi-currency s
 ## Project layout
 
 ```
+server.js                   Express + /webhook
 src/
-  server.js                 Express + /webhook
   whatsapp.js               phone → user routing, vCard parsing, chitchat short-circuit
-  conversation.js           LLM tool loop + prompt (being refactored — see below)
+  conversation.js           LLM tool loop + system prompt + conversation state
+  tools/                    LLM tool definitions + dispatch, one file per tool (index.js = registry)
+    validate.js             draft checks shared by request_confirmation / save_transaction
+  erp-sync/                 WRITE side, one file per ERPNext doctype
+    index.js                routes a confirmed draft → handler
+    sales-invoice.js        invoice_issued
+    purchase-invoice.js     bill_received
+    payment-entry.js        payment (settles invoices, bills and advances)
+    journal-entry.js        cash income/expense, transfers, advances, opening balances
+    common.js               account resolution, per-currency party accounts, generic items
+  erp-query/                READ side, one file per query
+  counterparties.js         contacts ↔ ERPNext Customer/Supplier (one contact can be both)
+  wallets.js                cash/bank/credit-card wallets ↔ ERPNext Accounts
   erpnext.js                thin REST client for ERPNext
   exchange.js               frankfurter.app FX rates
   twilio-client.js          REST API for Twilio (template + plain text)
   chitchat.js               regex-based pre-LLM filter
   vcard.js                  minimal vCard parser
-  counterparties.js         find-or-create cache
   users.js, messages.js, db.js, log.js
 
 scripts/
@@ -88,22 +99,20 @@ scripts/
   list-receivables.js       list all Receivable/Payable accounts with currency
   ping-db.js                standalone Postgres connectivity test
   show-inv.js <name>        pretty-print an ERPNext Sales Invoice
-  dedupe-wallets.js         find/clean duplicate user wallets
+
+test/
+  fake-erpnext.js           in-memory ERPNext that enforces the validations the bot relies on
+  flows.test.js             end-to-end tool flows (Postgres via pg-mem)
 ```
 
-The `src/` tree is **being broken apart**. Target structure:
-
-```
-src/
-  erp-sync/                 WRITE side, one file per ERPNext doctype handler
-  erp-query/                READ side, one file per query type
-  tools/                    LLM tool definitions + dispatch, one file per tool
-  conversation.js           shrinks to LLM loop + prompt only
-  …                         everything else stays
-```
+Wallets map to ERPNext leaf Accounts (Cash / Bank account types; credit cards are liability
+accounts). Contacts become an ERPNext Customer on first invoice/advance-given and a Supplier
+on first bill/advance-received. Invoices are referenced by their ERPNext name
+(e.g. `ACC-SINV-2026-00004`) everywhere the bot talks about them.
 
 ## Development
 
+- `npm test` — run the end-to-end flow tests (no network, no real ERPNext/Postgres needed)
 - `node scripts/ping-db.js` — confirm DB connectivity before debugging server-start issues
 - `node scripts/migrate.js` — apply schema changes (idempotent)
 - `node scripts/show-inv.js ACC-SINV-2026-00001` — verify an invoice landed in ERPNext correctly

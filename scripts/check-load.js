@@ -7,6 +7,10 @@ try {
   console.log('✓ whatsapp.js loads');
   require('../src/erpnext');
   console.log('✓ erpnext.js loads');
+  require('../src/tools');
+  console.log('✓ tools/ loads');
+  require('../src/erp-sync');
+  console.log('✓ erp-sync/ loads');
   console.log('all good');
   process.exit(0);
 } catch (err) {

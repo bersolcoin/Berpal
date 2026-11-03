@@ -151,6 +151,15 @@ CREATE TABLE IF NOT EXISTS counterparty_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_cp_cache_owner ON counterparty_cache(owner_user_id);
 
+-- One contact can be both a Customer (we sell to them / they owe us) and a Supplier
+-- (we buy from them / we owe them). Track both ERPNext records on the same row.
+ALTER TABLE counterparty_cache ADD COLUMN IF NOT EXISTS erpnext_customer TEXT;
+ALTER TABLE counterparty_cache ADD COLUMN IF NOT EXISTS erpnext_supplier TEXT;
+UPDATE counterparty_cache SET erpnext_customer = erpnext_name
+  WHERE erpnext_doctype = 'Customer' AND erpnext_customer IS NULL;
+UPDATE counterparty_cache SET erpnext_supplier = erpnext_name
+  WHERE erpnext_doctype = 'Supplier' AND erpnext_supplier IS NULL;
+
 -- Lookup cache for wallets (Account in ERPNext).
 CREATE TABLE IF NOT EXISTS account_cache (
   id SERIAL PRIMARY KEY,
@@ -232,4 +241,9 @@ async function init() {
   console.log('[db] ready');
 }
 
-module.exports = { query, withTransaction, init };
+/** Tests only: swap in an in-memory pool (e.g. pg-mem). */
+function _setPoolForTests(pool) {
+  _pool = pool;
+}
+
+module.exports = { query, withTransaction, init, migrate, _setPoolForTests };
