@@ -20,6 +20,8 @@ const definition = {
 
 async function execute(args, ctx) {
   const list = await wallets.list(ctx.user, getErp(ctx), args);
+  // Remember what was offered so request_confirmation can reject stale ids (see validate.js).
+  ctx.draft.wallet_options = [...new Set([...(ctx.draft.wallet_options || []), ...list.map((w) => w.id)])];
   return { ok: true, count: list.length, accounts: list.map(({ erpnext_account, ...w }) => w) };
 }
 

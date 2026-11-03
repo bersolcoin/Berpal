@@ -1,6 +1,7 @@
 const OpenAI = require('openai');
 const { query } = require('./db');
 const { TOOLS, executeTool } = require('./tools');
+const { ts } = require('./erp-sync/common');
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -204,7 +205,7 @@ This intake DOES NOT apply to operational expenses (lunch, coffee, gas, taxi, ho
 TRANSACTION TYPE DETECTION (set transaction_type explicitly):
 - "paid for X", "bought X", "filled gas", "got X cash" (no counterparty involved) → transaction_type=cash
 - "I sent invoice to X", "I invoiced X", "I issued bill to X for ..." → transaction_type=invoice_issued, direction=income
-- "got a bill from X", "X invoiced me", "received invoice from X" → transaction_type=bill_received, direction=expense
+- "got a bill from X", "X invoiced me", "received invoice from X" → transaction_type=bill_received, direction=expense. X IS the counterparty — call update_draft with counterparty_name=X immediately; NEVER ask "who was the bill from" when a name follows "from".
 - Receipt of money from a named counterparty: "X paid me Y", "received Y from X", "X transferred Y", "Jameel paid 45000" → BEFORE setting transaction_type, call query_open_invoices(direction='receivable', counterparty_search='<X>'):
   * Exactly 1 open invoice for that counterparty with amount matching (exact or within ~1% of) Y → transaction_type='payment', parent_invoice_name=<row ref>, parent_invoice_doctype=<row doctype>, direction='income'. Confirmation Account line: "Receivable from <counterparty> → <wallet_name>". Add a "Settles:" line: "Settles: Invoice <ref> (YYYY/MM/DD, original amount)".
   * Multiple open invoices → present a NUMBERED LIST of up to 5 (newest first by id) and ask the user to pick by number. Format example:
@@ -458,7 +459,7 @@ INVOICE / BILL RULES (when transaction_type is invoice_issued or bill_received):
 - payment_terms: detect from "net 30", "due in 7 days", "due immediately"/"on receipt" → net_30, net_7, net_0. If unstated, ASK.
 - due_date: compute from payment_terms + transaction_date (e.g., transaction_date + 30 days for net_30). User can override with explicit date.
 - delivery_date: if user mentions when goods/services were/will be delivered, capture it.
-- invoice_number: if user gives a reference number, capture it.
+- invoice_number: if user gives a reference number, capture it — "their ref ACME-77", "invoice no 123", "bill #B-9" → invoice_number="ACME-77" etc.
 - Product/SKU details: capture in description (e.g., "pa2293 ruby 2.5ct" or "pa2293"). No separate SKU field for now.
 
 CHART OF ACCOUNTS:
@@ -512,7 +513,7 @@ Type: <Expense | Income | Invoice Sent | Bill Received | Payment | Transfer>
 Account: <source_name> → <destination_name>
 Counterparty: <name>          (omit this line entirely if no counterparty)
 Due: YYYY/MM/DD (Net N)       (ONLY include for Invoice Sent or Bill Received; otherwise omit)
-Settles: Invoice <ref> from YYYY/MM/DD for X,XXX CCY    (ONLY include for Payment; when settling an advance write "Settles: advance to/from <counterparty>"; otherwise omit)
+Settles: Invoice <ref> dated YYYY/MM/DD for X,XXX CCY   (the row's 'date' field, not its due date)    (ONLY include for Payment; when settling an advance write "Settles: advance to/from <counterparty>"; otherwise omit)
 Note: <description>           (omit this line entirely if no description)
 
 Choose below or tell me what to fix.
@@ -602,6 +603,41 @@ async function resetConversation(userId) {
   await saveConversationState(userId, { draft: null, recentMessages: [], state: 'idle' });
 }
 
+/**
+ * Short replies to the bot's own yes/no asks that the model has proven unreliable at
+ * turning into draft flags. Applied before the LLM sees the message, so the flag is
+ * already in CURRENT DRAFT. Only fires when the draft is actually waiting on that ask.
+ */
+const CONTACT_SKIP_RE = /^\s*(skip|no|nope|later|not now|no phone|no number|don'?t (have|know) (it|his|her|their)( number)?|just the name)\s*[.!]?\s*$/i;
+function applyDeterministicReplies(draft, userMessage) {
+  const tt = draft.transaction_type;
+  const awaitingContact = (tt === 'invoice_issued' || tt === 'bill_received')
+    && draft.counterparty_name && !draft.counterparty_phone && !draft.counterparty_contact_skipped;
+  if (awaitingContact && CONTACT_SKIP_RE.test(userMessage || '')) {
+    draft.counterparty_contact_skipped = true;
+    return;
+  }
+  // Wallet picker was shown (wallet_options set) and the user chose to skip linking a wallet.
+  const awaitingWallet = ['cash', 'payment', 'advance_given', 'advance_received'].includes(tt || 'cash')
+    && draft.amount != null && !draft.payment_account_id && Array.isArray(draft.wallet_options) && !draft.wallet_skipped;
+  if (awaitingWallet && /^\s*skip\s*[.!]?\s*$/i.test(userMessage || '')) {
+    draft.wallet_skipped = true;
+  }
+}
+
+/**
+ * The prompt bans markdown and empty card lines, but the model still emits them.
+ * WhatsApp renders trailing spaces and asterisks literally, so strip them here.
+ */
+function cleanReply(text) {
+  return text
+    .replace(/\*\*/g, '')
+    .split('\n')
+    .map((l) => l.trimEnd())
+    .filter((l) => !/^(Counterparty|Note|Due|Settles):$/.test(l))
+    .join('\n');
+}
+
 async function handle(user, userMessage) {
   if (!openai) {
     return "Sorry, the bookkeeping AI isn't available right now. Please try again later.";
@@ -609,6 +645,7 @@ async function handle(user, userMessage) {
 
   const conv = await loadConversation(user.id);
   const draft = conv.draft_transaction ? JSON.parse(conv.draft_transaction) : {};
+  applyDeterministicReplies(draft, userMessage);
   const history = JSON.parse(conv.recent_messages || '[]');
   const today = new Date().toISOString().slice(0, 10);
 
@@ -685,6 +722,7 @@ async function handle(user, userMessage) {
   }
 
   if (!finalText) finalText = 'Got it. Anything else?';
+  finalText = cleanReply(finalText);
 
   if (ctx.saved || ctx.cancelled) {
     await resetConversation(user.id);
@@ -694,6 +732,8 @@ async function handle(user, userMessage) {
       { role: 'user', content: userMessage, ts: new Date().toISOString() },
       { role: 'assistant', content: finalText, ts: new Date().toISOString() },
     ].slice(-RECENT_MESSAGES_LIMIT);
+    // Marks that a card went out for this draft; save_transaction requires it on a later turn.
+    if (ctx.confirmationRequested) ctx.draft.confirmation_pending = true;
     await saveConversationState(user.id, {
       draft: ctx.draft,
       recentMessages: newHistory,

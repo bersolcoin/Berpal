@@ -14,6 +14,12 @@ const definition = {
 
 async function execute(args, ctx) {
   const matches = await counterparties.search(ctx.user, getErp(ctx), args.search);
+  if (matches.length === 0) {
+    return {
+      ok: true, count: 0, matches,
+      hint: `No contact named "${args.search}" — they are NEW. For an invoice/bill, ask for their phone + nickname (or 'skip') ONCE. If counterparty_contact_skipped is already true in the draft, do NOT ask again: call request_confirmation now.`,
+    };
+  }
   return { ok: true, count: matches.length, matches };
 }
 

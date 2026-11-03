@@ -18,7 +18,10 @@ const definition = {
 
 async function execute(args, ctx) {
   const r = await wallets.create(ctx.user, getErp(ctx), args);
-  if (r.wallet) delete r.wallet.erpnext_account;
+  if (r.wallet) {
+    delete r.wallet.erpnext_account;
+    ctx.draft.wallet_options = [...new Set([...(ctx.draft.wallet_options || []), r.wallet.id])];
+  }
   return r;
 }
 

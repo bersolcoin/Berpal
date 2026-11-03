@@ -5,6 +5,7 @@
  */
 const counterparties = require('../counterparties');
 const wallets = require('../wallets');
+const exchange = require('../exchange');
 const { companyCurrency } = require('../erp-sync/common');
 
 const REQUIRED_FIELDS = ['amount', 'currency', 'direction', 'transaction_date'];
@@ -38,6 +39,32 @@ function validateDraft(draft) {
   return missing;
 }
 
+/**
+ * Fill the fields the prompt tells the model to default silently (today's date, fallback
+ * category, auto-fetched FX rate) so a terse model turn still produces a card instead of a
+ * round trip. Never overrides a value the model set.
+ */
+async function applyDefaults(user, draft) {
+  const tt = draft.transaction_type || 'cash';
+  if (!draft.transaction_date && draft.amount != null) {
+    draft.transaction_date = new Date().toISOString().slice(0, 10);
+  }
+  if (!draft.currency && draft.amount != null && user.default_currency) {
+    draft.currency = user.default_currency;
+  }
+  const needsCategory = draft.direction !== 'transfer' && ['cash', 'invoice_issued', 'bill_received'].includes(tt);
+  if (needsCategory && !draft.category_code && (draft.direction === 'income' || draft.direction === 'expense')) {
+    draft.category_code = draft.direction === 'income' ? '4000' : '5900';
+  }
+  if (draft.currency && draft.currency !== companyCurrency(user) && !(Number(draft.exchange_rate) > 0)) {
+    const r = await exchange.fetchRate(draft.currency, companyCurrency(user), draft.transaction_date);
+    if (r.rate) {
+      draft.exchange_rate = r.rate;
+      draft.exchange_rate_source = r.source;
+    }
+  }
+}
+
 async function readinessError(user, draft) {
   const tt = draft.transaction_type || 'cash';
   const isTransfer = draft.direction === 'transfer';
@@ -59,8 +86,14 @@ async function readinessError(user, draft) {
   if (!isTransfer && WALLET_TYPES.includes(tt) && !draft.payment_account_id && !draft.wallet_skipped) {
     return 'No wallet linked. Call list_user_accounts for this currency and set payment_account_id (or set wallet_skipped=true if the user said skip).';
   }
+  // Only accept wallet ids that list_user_accounts / create_user_account offered for THIS draft.
+  // The model otherwise reuses ids from earlier conversation history, which may point at the wrong wallet.
+  const offered = Array.isArray(draft.wallet_options) ? draft.wallet_options.map(Number) : [];
   for (const field of ['payment_account_id', 'transfer_destination_account_id']) {
     if (!draft[field]) continue;
+    if (!offered.includes(Number(draft[field]))) {
+      return `${field}=${draft[field]} was not offered by list_user_accounts for this draft (ids from earlier conversations may be stale). Call list_user_accounts and pick an id from its result.`;
+    }
     const w = await wallets.getById(user, draft[field]);
     if (!w || !w.is_active) {
       return `${field}=${draft[field]} is not an active wallet. Call list_user_accounts again and use a current id.`;
@@ -69,4 +102,4 @@ async function readinessError(user, draft) {
   return null;
 }
 
-module.exports = { validateDraft, readinessError };
+module.exports = { validateDraft, readinessError, applyDefaults };

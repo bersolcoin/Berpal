@@ -1,5 +1,5 @@
 const { saveDraft } = require('../erp-sync');
-const { validateDraft, readinessError } = require('./validate');
+const { validateDraft, readinessError, applyDefaults } = require('./validate');
 const { getErp } = require('./context');
 
 const definition = {
@@ -10,6 +10,17 @@ const definition = {
 };
 
 async function execute(args, ctx) {
+  // A card must have gone out in an EARLIER turn (handle() sets confirmation_pending when it
+  // persists the draft). The only exception is a chained save right after a confirmed save
+  // in this turn (missed-sale flow). Stops the model from saving without the user's tap.
+  const chained = (ctx.savedIds || []).length > 0;
+  if (!ctx.draft.confirmation_pending && !chained) {
+    return {
+      ok: false,
+      error: 'No confirmation card has been sent for this draft. Call request_confirmation, send the summary, and wait for the user to confirm in their next message.',
+    };
+  }
+  await applyDefaults(ctx.user, ctx.draft);
   const missing = validateDraft(ctx.draft);
   if (missing.length) {
     return { ok: false, error: `Cannot save; missing required fields: ${missing.join(', ')}.` };

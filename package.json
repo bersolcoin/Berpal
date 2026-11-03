@@ -8,7 +8,8 @@
     "dev": "node --watch server.js",
     "create-template": "node scripts/create-confirmation-template.js",
     "reset": "node scripts/reset-conversations.js",
-    "test": "node --test test/"
+    "test": "node --test test/",
+    "test:llm": "node test/llm-harness.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

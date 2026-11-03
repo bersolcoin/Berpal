@@ -49,7 +49,7 @@ const definition = {
       },
       wallet_skipped: {
         type: 'boolean',
-        description: "Set true only when the user explicitly said 'skip' to the wallet picker. The entry then posts to the generic Cash account.",
+        description: "Set automatically when the user replies 'skip' to the wallet picker. Never set this yourself — ask the user instead.",
       },
       category_code: {
         type: 'string',
@@ -119,7 +119,10 @@ const definition = {
 };
 
 async function execute(args, ctx) {
-  ctx.draft = { ...ctx.draft, ...args };
+  // wallet_skipped is only ever set from the user's own 'skip' reply (conversation.js).
+  const { wallet_skipped, ...accepted } = args;
+  if (wallet_skipped) accepted.wallet_skip_requested_by_model = true;
+  ctx.draft = { ...ctx.draft, ...accepted };
   console.log(`• [tools] [${ts()}] tool=update_draft draft=${JSON.stringify(ctx.draft)}`);
   return { ok: true, current_draft: ctx.draft };
 }

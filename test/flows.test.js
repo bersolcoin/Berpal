@@ -26,7 +26,9 @@ function addDays(iso, n) {
 
 /** Run one tool with a fresh per-turn ctx, like conversation.handle does. */
 async function tool(name, args = {}, draft = {}) {
-  const ctx = { user, draft: { ...draft }, saved: null, cancelled: false, confirmationRequested: false };
+  // Every wallet created so far counts as 'offered' — the tests set payment_account_id directly.
+  const walletOptions = Object.values(ids).filter(Number.isInteger);
+  const ctx = { user, draft: { wallet_options: walletOptions, confirmation_pending: true, ...draft }, saved: null, cancelled: false, confirmationRequested: false };
   const result = await executeTool(name, args, ctx);
   return { result, ctx };
 }
