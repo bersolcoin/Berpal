@@ -25,7 +25,7 @@ async function execute(args, ctx) {
   if (missing.length) {
     return { ok: false, error: `Cannot save; missing required fields: ${missing.join(', ')}.` };
   }
-  const problem = await readinessError(ctx.user, ctx.draft);
+  const problem = await readinessError(ctx.user, ctx.draft, () => getErp(ctx));
   if (problem) return { ok: false, error: `Cannot save; ${problem}` };
 
   try {

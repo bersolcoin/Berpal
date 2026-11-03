@@ -10,14 +10,15 @@ const {
   ts, round2, companyCurrency, txRate, resolveErpAccount, resolvePartyAccount,
   getAccountCurrency, buildJournalTitle,
 } = require('./common');
+const { computeTotals, resolveTaxAccount, vatTreatment } = require('./taxes');
 
 /**
  * Turn [{ account, debit|credit (in tx currency), party_type?, party? }] into ERPNext JE rows.
  *
  * Each account is posted in its own currency: accounts held in the tx currency get the
  * tx amount at the tx rate; accounts held in the company currency get the converted amount
- * at rate 1. The company-currency debit/credit is computed once per line so the entry
- * always balances. Any third currency is rejected rather than guessed.
+ * at rate 1. Any satang lost converting line by line is absorbed by the largest company-currency
+ * line, so the entry always balances. Any third currency is rejected rather than guessed.
  */
 async function buildRows(erp, lines, { currency, rate, baseCurrency }) {
   let multiCurrency = false;
@@ -49,6 +50,21 @@ async function buildRows(erp, lines, { currency, rate, baseCurrency }) {
         : { credit_in_account_currency: inAccount, credit: base }),
       ...(line.party ? { party_type: line.party_type, party: line.party } : {}),
     });
+  }
+
+  // Converting each line separately can leave the entry a satang out of balance (e.g. a USD wallet
+  // paying net + VAT: flt(gross×rate) ≠ flt(net×rate) + flt(vat×rate)), and ERPNext rejects it.
+  // Absorb the difference on the largest company-currency line: ERPNext recomputes a foreign
+  // line's base from amount × exchange_rate, so only a rate-1 line can take an arbitrary base.
+  const diff = round2(rows.reduce((s, r) => s + (r.debit || 0) - (r.credit || 0), 0));
+  if (diff !== 0) {
+    const fixable = rows.filter((r) => r.account_currency === baseCurrency)
+      .sort((a, b) => (b.debit || b.credit) - (a.debit || a.credit))[0];
+    if (!fixable || Math.abs(diff) > 0.05) {
+      throw new Error(`journal entry is out of balance by ${diff} ${baseCurrency} after conversion`);
+    }
+    if (fixable.debit != null) fixable.debit = fixable.debit_in_account_currency = round2(fixable.debit - diff);
+    else fixable.credit = fixable.credit_in_account_currency = round2(fixable.credit + diff);
   }
   return { rows, multiCurrency };
 }
@@ -82,9 +98,23 @@ async function saveCash(user, erp, draft) {
   }
 
   const expense = draft.direction === 'expense';
+  // VAT splits the P&L line into net + Input/Output VAT (non-claimable VAT stays in the expense);
+  // WHT (expenses only) keeps part of the payment back as a liability to the Revenue Department,
+  // so the wallet moves by gross − WHT.
+  const t = computeTotals(draft);
+  const treatment = vatTreatment(user, draft);
+  const splitVat = t.vat && (treatment === 'input' || treatment === 'output');
+  const pnl = splitVat ? t.net : t.gross;
   const lines = expense
-    ? [{ account: categoryAccount, debit: draft.amount }, { account: walletAccount, credit: draft.amount }]
-    : [{ account: walletAccount, debit: draft.amount }, { account: categoryAccount, credit: draft.amount }];
+    ? [{ account: categoryAccount, debit: pnl }, { account: walletAccount, credit: t.due }]
+    : [{ account: walletAccount, debit: t.gross }, { account: categoryAccount, credit: pnl }];
+  if (splitVat) {
+    const vatAccount = await resolveTaxAccount(erp, expense ? 'input_vat' : 'output_vat');
+    lines.push(expense ? { account: vatAccount, debit: t.vat } : { account: vatAccount, credit: t.vat });
+  }
+  if (t.wht && expense) {
+    lines.push({ account: await resolveTaxAccount(erp, 'wht_payable'), credit: t.wht });
+  }
 
   const name = await postJournal(user, erp, draft, {
     lines,
@@ -92,7 +122,7 @@ async function saveCash(user, erp, draft) {
     toAccount: expense ? categoryAccount : walletAccount,
     remark: 'Bot entry',
   });
-  console.log(`• [erp-sync] [${ts()}] saved JE ${name} (${draft.direction} ${draft.amount} ${draft.currency})`);
+  console.log(`• [erp-sync] [${ts()}] saved JE ${name} (${draft.direction} ${t.gross} ${draft.currency}${t.vat ? `, VAT ${t.vat}` : ''}${t.wht ? `, WHT ${t.wht}` : ''})`);
   return { erpnext_name: name, doctype: 'Journal Entry' };
 }
 

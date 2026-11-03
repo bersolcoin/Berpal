@@ -35,7 +35,7 @@ const SORTS = {
   newest: (a, b) => (b.date || '').localeCompare(a.date || '') || b.ref.localeCompare(a.ref),
 };
 
-async function fetchSide(erp, side, { partyName, search, dueOnOrBefore }) {
+async function fetchSide(erp, side, { partyName, search, dueOnOrBefore, today }) {
   const s = SIDES[side];
   const filters = [
     ['company', '=', erp.company],
@@ -53,7 +53,6 @@ async function fetchSide(erp, side, { partyName, search, dueOnOrBefore }) {
     limit: FETCH_CAP,
     orderBy: 'due_date asc',
   });
-  const today = todayStr();
   return (r.data || []).map((d) => {
     const daysUntilDue = d.due_date ? daysBetween(today, d.due_date) : null;
     return {
@@ -79,19 +78,22 @@ async function fetchSide(erp, side, { partyName, search, dueOnOrBefore }) {
  *   counterparty_id:    cache id (preferred — exact party)
  *   counterparty_search: name fragment (only when unambiguous)
  *   due_within_days:    only items due on/before today + N (overdue included)
+ *   today:              ISO date to count days from (default: server UTC date). Pass the user's
+ *                       local date when it matters, e.g. the morning digest in UTC+9.
  *   sort:               'due_date_asc' | 'amount_desc' | 'newest'
  */
 async function getOpenInvoices(user, erp, {
   direction = 'both', counterparty_id = null, counterparty_search = null,
-  due_within_days = null, sort = 'due_date_asc', limit = 5,
+  due_within_days = null, sort = 'due_date_asc', limit = 5, today = null,
 } = {}) {
+  const asOf = today || todayStr();
   const sides = direction === 'both' ? ['receivable', 'payable'] : [direction];
   let contact = null;
   if (counterparty_id) {
     contact = await counterparties.getById(user, counterparty_id);
     if (!contact) return { ok: false, error: `counterparty_id ${counterparty_id} not found` };
   }
-  const dueOnOrBefore = due_within_days != null ? addDays(todayStr(), Number(due_within_days)) : null;
+  const dueOnOrBefore = due_within_days != null ? addDays(asOf, Number(due_within_days)) : null;
 
   let rows = [];
   for (const side of sides) {
@@ -100,7 +102,7 @@ async function getOpenInvoices(user, erp, {
       partyName = contact[SIDES[side].role];
       if (!partyName) continue; // this contact has never been a customer/supplier
     }
-    rows.push(...(await fetchSide(erp, side, { partyName, search: contact ? null : counterparty_search, dueOnOrBefore })));
+    rows.push(...(await fetchSide(erp, side, { partyName, search: contact ? null : counterparty_search, dueOnOrBefore, today: asOf })));
   }
 
   rows.sort(SORTS[sort] || SORTS.due_date_asc);

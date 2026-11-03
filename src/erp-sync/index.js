@@ -6,8 +6,22 @@ const { saveSalesInvoice } = require('./sales-invoice');
 const { savePurchaseInvoice } = require('./purchase-invoice');
 const { savePayment } = require('./payment-entry');
 const { saveCash, saveTransfer, saveAdvance } = require('./journal-entry');
+const taxes = require('./taxes');
+const items = require('./items');
 
 async function saveDraft(user, erp, draft) {
+  try {
+    return await route(user, erp, draft);
+  } catch (err) {
+    // A memoised tax account / warehouse may have been renamed or deleted in ERPNext since we
+    // cached it; drop the memos so the retry resolves them afresh.
+    taxes.clearCaches(erp.company);
+    items.clearCaches(erp.company);
+    throw err;
+  }
+}
+
+async function route(user, erp, draft) {
   const tt = draft.transaction_type || 'cash';
   if (draft.direction === 'transfer') return saveTransfer(user, erp, draft);
   switch (tt) {

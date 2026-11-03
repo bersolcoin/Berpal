@@ -44,8 +44,11 @@ function ts() {
   return new Date().toTimeString().slice(0, 8);
 }
 
+// Frappe's flt(n, 2) with the default "Banker's Rounding (legacy)" method: pre-round to 8 dp to
+// shed float noise, then an exact half rounds UP (toward +∞). Number.EPSILON is useless here —
+// 1234.5 × 0.03 = 37.034999… must still come out 37.04, as ERPNext posts it.
 function round2(n) {
-  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+  return Math.round(Number((Number(n) * 100).toFixed(8))) / 100;
 }
 
 /** The ERPNext Company's base currency. One Company per user, so this is the user's reporting currency. */

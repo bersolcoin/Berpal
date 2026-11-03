@@ -5,22 +5,17 @@ const twilioClient = require('./twilio-client');
 const vcard = require('./vcard');
 const chitchat = require('./chitchat');
 const log = require('./log');
+const mediaIntake = require('./media');
+const { downloadMedia } = require('./media/download');
 
 const REGISTRATION_LINK_REPLY =
   "Hi! It looks like your number isn't registered yet. Please sign up at https://your-app.com/signup to link your WhatsApp number to your account.";
 
+// Goes through the media downloader so vCards get the same Twilio-host allowlist, timeout and
+// size cap as photos — MediaUrl* is attacker-controllable and carries our Twilio credentials.
 async function fetchTwilioMedia(url) {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-  if (!accountSid || !authToken) return null;
-  const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
   try {
-    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
-    if (!response.ok) {
-      console.error(`[whatsapp] failed to fetch media: ${response.status} ${url}`);
-      return null;
-    }
-    return await response.text();
+    return (await downloadMedia(url)).toString('utf8');
   } catch (err) {
     console.error('[whatsapp] media fetch error:', err.message);
     return null;
@@ -45,11 +40,30 @@ async function extractContactShare(raw) {
   return null;
 }
 
-async function processIncomingMessage({ from, body, raw = null }) {
+// Per-user FIFO: a receipt scan or transcription takes seconds, and a typed follow-up ("put it on
+// the AmEx") must not reach the conversation before the scan it refers to. Messages from
+// different users still run concurrently.
+const queues = new Map();
+
+function processIncomingMessage(args) {
+  const key = users.normalizePhone(args.from) || String(args.from);
+  const prev = queues.get(key) || Promise.resolve();
+  const run = prev.then(() => processOne(args));
+  const tail = run.catch(() => {});
+  queues.set(key, tail);
+  tail.then(() => {
+    if (queues.get(key) === tail) queues.delete(key);
+  });
+  return run;
+}
+
+async function processOne({ from, body, raw = null }) {
+  let user = null;
+  let mediaIds = [];
   try {
     log.msgIn(from, body);
 
-    const user = await users.findByPhone(from);
+    user = await users.findByPhone(from);
 
     if (!user) {
       log.msgOut(from, REGISTRATION_LINK_REPLY, 'unknown_phone');
@@ -73,8 +87,29 @@ async function processIncomingMessage({ from, body, raw = null }) {
       }
     }
 
-    // If the user shared a WhatsApp contact (vCard attachment), parse it and inject into the message.
+    // Receipt photos / PDFs are scanned and voice notes transcribed before the LLM sees the
+    // message, so the model only ever deals with text (same idea as the vCard line below).
+    const media = await mediaIntake.intake(user, raw, body);
+    mediaIds = media.mediaIds;
+    if (media.silent) return;
+    if (media.reply) {
+      await messageLog.logOutgoing(user.id, conv.id, media.reply);
+      log.msgOut(from, media.reply, 'media');
+      await twilioClient.sendText(from, media.reply);
+      return;
+    }
+
     let augmentedBody = body || '';
+    if (media.transcript) {
+      // The prefix tells the model this came from speech, so it echoes back what it understood.
+      const spoken = `[voice note] ${media.transcript}`;
+      augmentedBody = augmentedBody ? `${augmentedBody}\n${spoken}` : spoken;
+    }
+    for (const line of media.lines) {
+      augmentedBody = augmentedBody ? `${augmentedBody}\n${line}` : line;
+    }
+
+    // If the user shared a WhatsApp contact (vCard attachment), parse it and inject into the message.
     const contact = await extractContactShare(raw);
     if (contact) {
       const parts = [];
@@ -92,6 +127,8 @@ async function processIncomingMessage({ from, body, raw = null }) {
       result = await conversation.handle(user, augmentedBody);
     } catch (err) {
       console.error('[whatsapp] conversation error:', err);
+      // The draft that would have carried these receipts never formed; don't keep the images.
+      await mediaIntake.discard(user.id, mediaIds);
       await twilioClient.sendText(from, 'Sorry, something went wrong. Please try again.');
       return;
     }
@@ -109,6 +146,7 @@ async function processIncomingMessage({ from, body, raw = null }) {
     }
   } catch (err) {
     console.error('[whatsapp] processing error:', err);
+    if (user && mediaIds.length) await mediaIntake.discard(user.id, mediaIds);
     try {
       await twilioClient.sendText(from, 'Sorry, something went wrong. Please try again.');
     } catch (sendErr) {

@@ -1,16 +1,23 @@
 /** WRITE side — bill_received → ERPNext Purchase Invoice (you owe). */
 const counterparties = require('../counterparties');
 const {
-  ts, companyCurrency, txRate, resolveErpAccount, resolvePartyAccount, ensureGenericItem, computeDueDate,
+  ts, companyCurrency, txRate, resolveErpAccount, resolvePartyAccount, computeDueDate,
 } = require('./common');
+const { buildTaxRows, computeTotals } = require('./taxes');
+const { buildInvoiceLines } = require('./invoice-lines');
 
 async function savePurchaseInvoice(user, erp, draft) {
   const supplier = await counterparties.resolveParty(user, erp, draft, 'Supplier');
-  const itemCode = await ensureGenericItem(erp, 'purchase');
 
-  // Expense side from category_code (5000 COGS for inventory, 5xxx for operating bills)
+  // Expense side from category_code (5000 COGS for inventory, 5xxx for operating bills).
+  // Stock lines ignore it: ERPNext debits the warehouse's stock account instead.
   const expenseAccount = await resolveErpAccount(user, erp, draft.category_code, companyCurrency(user));
   const dueDate = computeDueDate(draft);
+  const totals = computeTotals(draft, `${supplier} bill`);
+  const lines = await buildInvoiceLines(user, erp, draft, 'purchase', { lineAccount: expenseAccount, totals });
+  // VAT (Input VAT) and WHT (deducted to WHT Payable). The WHT row lowers grand_total, so the
+  // bill's outstanding — what the supplier is actually paid — is gross − WHT.
+  const taxes = await buildTaxRows(user, erp, draft, 'purchase', totals);
 
   const payload = {
     supplier,
@@ -19,17 +26,15 @@ async function savePurchaseInvoice(user, erp, draft) {
     bill_date: draft.transaction_date,
     due_date: dueDate,
     currency: draft.currency,
-    update_stock: 0,
+    // Stock lines receive into the warehouse on submit (no separate Purchase Receipt).
+    update_stock: lines.updateStock,
+    ...(lines.updateStock ? { set_warehouse: lines.warehouse } : {}),
     ...(draft.invoice_number ? { bill_no: draft.invoice_number } : {}),
-    items: [
-      {
-        item_code: itemCode,
-        qty: 1,
-        rate: draft.amount,
-        description: draft.description || `${supplier} bill`,
-        ...(expenseAccount ? { expense_account: expenseAccount } : {}),
-      },
-    ],
+    items: lines.rows,
+    ...(taxes.length ? { taxes } : {}),
+    // Always: VAT/WHT produce satang amounts, and ERPNext's default rounded total would round the
+    // outstanding to whole baht (diff to Round Off) so it no longer matches the card.
+    disable_rounded_total: 1,
     docstatus: 1,
   };
 
@@ -42,8 +47,10 @@ async function savePurchaseInvoice(user, erp, draft) {
 
   const result = await erp.createPurchaseInvoice(payload);
   const name = result.data?.name;
+  const t = totals;
   console.log(
-    `• [erp-sync] [${ts()}] saved Purchase Invoice ${name} (${draft.amount} ${draft.currency} from ${supplier}, due ${dueDate})`
+    `• [erp-sync] [${ts()}] saved Purchase Invoice ${name} (${t.gross} ${draft.currency} from ${supplier}` +
+      `${t.vat ? `, VAT ${t.vat}` : ''}${t.wht ? `, WHT ${t.wht}` : ''}${lines.updateStock ? ', stock in' : ''}, due ${dueDate})`
   );
   return { erpnext_name: name, doctype: 'Purchase Invoice' };
 }

@@ -11,6 +11,7 @@
 const wallets = require('../wallets');
 const counterparties = require('../counterparties');
 const { ts, round2, companyCurrency, txRate, resolvePartyAccount, getAccountCurrency } = require('./common');
+const { whtOnInvoice } = require('./taxes');
 
 const INVOICE_FIELDS = {
   'Sales Invoice': { party: 'customer', account: 'debit_to', partyType: 'Customer' },
@@ -130,4 +131,28 @@ async function savePayment(user, erp, draft) {
   return { erpnext_name: name, doctype: 'Payment Entry', settles: reference?.reference_name || null };
 }
 
-module.exports = { savePayment };
+/**
+ * A bill with withholding tax is owed gross − WHT; the WHT goes to the Revenue Department, not the
+ * supplier. Paying the gross would leave the WHT as an unallocated advance to the supplier.
+ * Called from validate.readinessError (so the card is refused before the user confirms).
+ * Returns an error string or null.
+ */
+async function whtOverpaymentError(erp, draft) {
+  if (!draft.parent_invoice_name || draft.direction !== 'expense') return null;
+  let parent;
+  try {
+    parent = await loadParent(erp, draft.parent_invoice_name, draft.parent_invoice_doctype);
+  } catch {
+    return null; // missing parent is reported by savePayment with its own message
+  }
+  if (parent.doctype !== 'Purchase Invoice') return null;
+  const wht = whtOnInvoice(parent.doc);
+  const owed = parent.doc.outstanding_amount;
+  if (wht > 0 && Number(draft.amount) > owed + 0.005) {
+    return `${parent.doc.name} had ${wht} ${parent.doc.currency} withholding tax deducted; ${parent.doc.supplier} is owed ` +
+      `${owed} ${parent.doc.currency}, not ${draft.amount}. Set amount=${owed} and re-issue the card (WHT is paid to the Revenue Department separately).`;
+  }
+  return null;
+}
+
+module.exports = { savePayment, whtOverpaymentError };

@@ -4,9 +4,27 @@ const { TOOLS, executeTool } = require('./tools');
 const { ts } = require('./erp-sync/common');
 const promptSections = require('./prompt');
 
-const openai = process.env.OPENAI_API_KEY
+let openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   : null;
+
+/** Tests only: inject a stub with the chat.completions.create shape. */
+function _setOpenAIForTests(client) {
+  openai = client;
+}
+
+/**
+ * Draft keys that gate side effects. Only server code may set them: save_transaction needs
+ * confirmation_pending/confirmation_sig, wallet pickers need wallet_options, outbound sends need
+ * outreach_preview. They are stripped from update_draft arguments (so the model can't forge them
+ * even if it copies them from a tool result) and hidden from the prompt's CURRENT DRAFT.
+ */
+const PROTECTED_DRAFT_KEYS = ['confirmation_pending', 'confirmation_sig', 'wallet_options', 'outreach_preview'];
+function stripProtected(obj) {
+  const out = { ...obj };
+  for (const k of PROTECTED_DRAFT_KEYS) delete out[k];
+  return out;
+}
 
 const RECENT_MESSAGES_LIMIT = 20;
 const MAX_TOOL_LOOP_ITERATIONS = 10;
@@ -37,7 +55,7 @@ function getCategorizationHint() {
 
 async function buildSystemPrompt({ user, draft, today }) {
   const coaListing = getCategorizationHint();
-  const draftJson = JSON.stringify(draft || {}, null, 2);
+  const draftJson = JSON.stringify(stripProtected(draft || {}), null, 2);
   return `You are a bookkeeping assistant accessed via WhatsApp. You help the user log accounting transactions AND answer questions about their existing books. You only help with bookkeeping. If asked about anything else (weather, news, opinions), politely redirect.
 
 THREE MODES — pick the right one based on what the user is doing:
@@ -461,7 +479,7 @@ INVOICE / BILL RULES (when transaction_type is invoice_issued or bill_received):
 - due_date: compute from payment_terms + transaction_date (e.g., transaction_date + 30 days for net_30). User can override with explicit date.
 - delivery_date: if user mentions when goods/services were/will be delivered, capture it.
 - invoice_number: if user gives a reference number, capture it — "their ref ACME-77", "invoice no 123", "bill #B-9" → invoice_number="ACME-77" etc.
-- Product/SKU details: capture in description (e.g., "pa2293 ruby 2.5ct" or "pa2293"). No separate SKU field for now.
+- Product/SKU details: a named stock id ("pa2293", "lot R-17") goes in items[].item_code, the rest in the item description — see TAX, LINE ITEMS & STOCK. Several things on one invoice → items.
 
 CHART OF ACCOUNTS:
 ${coaListing}
@@ -513,6 +531,8 @@ Amount: X,XXX ${user.reporting_currency} (Y,YYY <foreign_ccy> @ R.RR)   (foreign
 Type: <Expense | Income | Invoice Sent | Bill Received | Payment | Transfer>
 Account: <source_name> → <destination_name>
 Counterparty: <name>          (omit this line entirely if no counterparty)
+Net: X,XXX CCY / VAT <vat_rate>%: X,XXX CCY   (ONLY when request_confirmation returned totals; Amount line then shows totals.gross)
+WHT <wht_rate>%: X,XXX CCY (pay <name> X,XXX CCY)   (ONLY when totals.wht is set)
 Due: YYYY/MM/DD (Net N)       (ONLY include for Invoice Sent or Bill Received; otherwise omit)
 Settles: Invoice <ref> dated YYYY/MM/DD for X,XXX CCY   (the row's 'date' field, not its due date)    (ONLY include for Payment; when settling an advance write "Settles: advance to/from <counterparty>"; otherwise omit)
 Note: <description>           (omit this line entirely if no description)
@@ -649,6 +669,14 @@ async function handle(user, userMessage) {
   const conv = await loadConversation(user.id);
   const draft = conv.draft_transaction ? JSON.parse(conv.draft_transaction) : {};
   applyDeterministicReplies(draft, userMessage);
+  // A preview armed at the START of this turn was for exactly this user message. If the turn
+  // ends with that same preview still pending, the user didn't confirm it — drop it.
+  // Identified by preview_id (random), never by timestamp: a re-preview issued in the same
+  // millisecond must not be mistaken for the stale one.
+  const previewKey = (p) => (p ? p.preview_id || p.created_at : null);
+  const armedPreviewAtStart = draft.outreach_preview && draft.outreach_preview.armed
+    ? previewKey(draft.outreach_preview)
+    : null;
   const history = JSON.parse(conv.recent_messages || '[]');
   const today = new Date().toISOString().slice(0, 10);
 
@@ -703,6 +731,7 @@ async function handle(user, userMessage) {
           let args;
           try {
             args = JSON.parse(tc.function.arguments || '{}');
+            if (tc.function.name === 'update_draft') args = stripProtected(args);
           } catch {
             args = {};
           }
@@ -737,6 +766,17 @@ async function handle(user, userMessage) {
     ].slice(-RECENT_MESSAGES_LIMIT);
     // Marks that a card went out for this draft; save_transaction requires it on a later turn.
     if (ctx.confirmationRequested) ctx.draft.confirmation_pending = true;
+    // Same idea for outbound messages to third parties: a tool stores the previewed plan in
+    // draft.outreach_preview during its turn; only once this turn has ended (and the user has
+    // replied) is it "armed", so confirmed:true can never land in the same turn as the preview.
+    const preview = ctx.draft.outreach_preview;
+    if (preview && typeof preview === 'object') {
+      if (armedPreviewAtStart && previewKey(preview) === armedPreviewAtStart) {
+        delete ctx.draft.outreach_preview; // the one-turn window has passed
+      } else {
+        preview.armed = true;
+      }
+    }
     await saveConversationState(user.id, {
       draft: ctx.draft,
       recentMessages: newHistory,
@@ -754,4 +794,4 @@ async function handle(user, userMessage) {
   };
 }
 
-module.exports = { handle, loadConversation };
+module.exports = { handle, loadConversation, _setOpenAIForTests, PROTECTED_DRAFT_KEYS };

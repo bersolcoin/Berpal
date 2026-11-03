@@ -15,7 +15,7 @@ const definition = {
       direction: { type: 'string', enum: ['expense', 'income', 'transfer'] },
       amount: {
         type: 'number',
-        description: 'The transaction amount in transaction currency. Positive number.',
+        description: 'The transaction amount in transaction currency, exactly as the user stated it (with VAT: gross if tax_inclusive, net otherwise). Positive number. With items it must equal Σ qty×rate — you may omit it.',
       },
       currency: { type: 'string', description: 'ISO 4217 currency code, e.g. THB, USD, EUR.' },
       counterparty_name: {
@@ -69,11 +69,52 @@ const definition = {
         type: 'string',
         description: 'Free-text memo describing what the transaction was for.',
       },
-      tax_amount: { type: 'number' },
-      tax_rate: { type: 'number', description: 'Tax rate as a percentage, e.g. 7 for 7%.' },
+      tax_amount: {
+        type: 'number',
+        description: 'Informational only — request_confirmation recomputes VAT from tax_rate/tax_inclusive and overwrites this.',
+      },
+      tax_rate: {
+        type: 'number',
+        description: 'VAT rate as a percentage (Thailand: 7). Set ONLY when the user mentions VAT/tax/a tax invoice; otherwise leave unset (no VAT).',
+      },
       tax_inclusive: {
         type: 'boolean',
-        description: 'True if amount already includes tax; false if tax is on top.',
+        description: 'With tax_rate: true if the stated amount/rates already include VAT ("incl VAT", "รวม VAT", a receipt total); false if VAT is added on top ("+VAT", "plus 7%", "ex VAT").',
+      },
+      wht_rate: {
+        type: 'number',
+        enum: [0, 1, 2, 3, 5],
+        description: 'Thai withholding tax % the USER deducts when paying a supplier (bill_received or cash expense only): 3 services/professional fees/contractors, 1 transport, 5 rent, 2 advertising. 0 removes it. Set only when the user withholds (they are a company/juristic person paying ≥1,000 THB) or says so ("withheld 3%", "หัก ณ ที่จ่าย"). Never on goods or sales.',
+      },
+      wht_form: {
+        type: 'string',
+        enum: ['PND3', 'PND53'],
+        description: 'Required with wht_rate: PND53 if the payee is a company/juristic person (Co., Ltd., บริษัท, หจก.), PND3 if an individual.',
+      },
+      paid_after_wht: {
+        type: 'number',
+        description: 'When the user states what they actually transferred AFTER withholding ("sent 9,700 after 3%"): that figure. Leave amount unset — the gross is computed. 0 clears it (setting amount also clears it).',
+      },
+      vat_claimable: {
+        type: 'boolean',
+        description: 'false when the purchase VAT cannot be claimed (abbreviated tax invoice ใบกำกับภาษีอย่างย่อ, plain receipt). Leave unset otherwise.',
+      },
+      items: {
+        type: 'array',
+        description: 'Line items for invoice_issued / bill_received. Use when the user lists several things, or names a SKU/stone id (then one row with item_code). Rates are on the same VAT basis as the amount. amount must equal Σ qty×rate — omit amount and it is computed. Replaces the whole list on every call.',
+        items: {
+          type: 'object',
+          properties: {
+            description: { type: 'string', description: 'What the line is, e.g. "ruby 7.68ct" or "cutting service".' },
+            qty: { type: 'number', description: 'Quantity (default 1).' },
+            rate: { type: 'number', description: 'Price per unit in transaction currency.' },
+            item_code: {
+              type: 'string',
+              description: 'Stock id ONLY when the user names one ("pa2293", "lot R-17", "SKU 4471") — makes it a tracked stock item. Never invent one; leave unset for services and untracked goods.',
+            },
+          },
+          required: ['rate'],
+        },
       },
       transaction_type: {
         type: 'string',
@@ -123,6 +164,9 @@ async function execute(args, ctx) {
   const { wallet_skipped, ...accepted } = args;
   if (wallet_skipped) accepted.wallet_skip_requested_by_model = true;
   ctx.draft = { ...ctx.draft, ...accepted };
+  // A newly stated amount supersedes an earlier "paid N after WHT" — otherwise applyDefaults
+  // would keep re-deriving the old figure over what the user just said.
+  if (args.amount != null && args.paid_after_wht === undefined) delete ctx.draft.paid_after_wht;
   console.log(`• [tools] [${ts()}] tool=update_draft draft=${JSON.stringify(ctx.draft)}`);
   return { ok: true, current_draft: ctx.draft };
 }
