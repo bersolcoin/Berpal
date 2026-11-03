@@ -13,6 +13,8 @@ const { newDb } = require('pg-mem');
 const { FakeErpNext, COMPANY, TODAY } = require('./fake-erpnext');
 const db = require('../src/db');
 const { TOOLS, executeTool } = require('../src/tools');
+const { cardSignature } = require('../src/tools/request-confirmation');
+const { applyDefaults } = require('../src/tools/validate');
 
 const erp = new FakeErpNext();
 let user;
@@ -33,11 +35,22 @@ async function tool(name, args = {}, draft = {}) {
   return { result, ctx };
 }
 
+/**
+ * save_transaction on a draft the card signed as-is — for exercising the save path's own checks
+ * (same wallet, wrong currency) that request_confirmation may not reach first.
+ */
+async function saveSigned(draft) {
+  const signed = { ...draft };
+  await applyDefaults(user, signed);
+  return tool('save_transaction', {}, { ...draft, confirmation_pending: cardSignature(signed) });
+}
+
 /** update_draft → request_confirmation → save_transaction, asserting each step succeeds. */
 async function confirmAndSave(draft) {
   const confirm = await tool('request_confirmation', {}, draft);
   assert.equal(confirm.result.ok, true, `request_confirmation: ${confirm.result.error}`);
-  const { result } = await tool('save_transaction', {}, draft);
+  // Next turn: handle() has stored the signature of the card the user saw in confirmation_pending.
+  const { result } = await tool('save_transaction', {}, { ...confirm.ctx.draft, confirmation_pending: confirm.ctx.draft.confirmation_sig });
   assert.equal(result.ok, true, `save_transaction: ${result.error}`);
   return result;
 }
@@ -138,7 +151,7 @@ test('transfer between wallets, and same-wallet transfer is rejected', async () 
   assert.equal(walletBalance('BBL Savings'), 45000);
   assert.equal(walletBalance('1110 - Cash'), 4150);
 
-  const { result } = await tool('save_transaction', {}, { ...draft, transfer_destination_account_id: ids.bbl });
+  const { result } = await saveSigned({ ...draft, transfer_destination_account_id: ids.bbl });
   assert.equal(result.ok, false);
   assert.match(result.error, /same wallet/);
 });
@@ -191,7 +204,7 @@ test('payment: wrong currency is refused; settles USD invoice into USD bank at a
     parent_invoice_name: ids.sinv, parent_invoice_doctype: 'Sales Invoice', counterparty_id: ids.jameel,
     exchange_rate: 33, payment_account_id: ids.dbs,
   };
-  let { result } = await tool('save_transaction', {}, { ...draft, currency: 'THB', exchange_rate: undefined });
+  let { result } = await saveSigned({ ...draft, currency: 'THB', exchange_rate: undefined });
   assert.equal(result.ok, false);
   assert.match(result.error, /balance is in USD/);
 
@@ -233,7 +246,7 @@ test('bill from a supplier, then paid in full from the bank', async () => {
   assert.equal(result.rows[0].ref, bill.erpnext_name);
 
   // An incoming payment can't settle a bill.
-  ({ result } = await tool('save_transaction', {}, {
+  ({ result } = await saveSigned({
     transaction_type: 'payment', direction: 'income', amount: 12000, currency: 'THB', transaction_date: TODAY,
     parent_invoice_name: bill.erpnext_name, payment_account_id: ids.bbl,
   }));

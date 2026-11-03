@@ -4,8 +4,7 @@ const db = require('./src/db');
 const { processIncomingMessage } = require('./src/whatsapp');
 const scheduler = require('./src/jobs/scheduler');
 const { jobsDisabled } = require('./src/jobs');
-
-const EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+const { webhookHandler, webhookUrl } = require('./src/webhook');
 
 (async () => {
   await db.init();
@@ -36,25 +35,24 @@ const EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>
   // like 63016 on job_runs. Signature-checked against PUBLIC_BASE_URL.
   app.post('/twilio/status', scheduler.twilioStatusHandler());
 
-  app.post('/webhook', (req, res) => {
-    // Ack Twilio immediately so the 15s webhook timeout never kicks in.
-    res.set('Content-Type', 'text/xml');
-    res.send(EMPTY_TWIML);
-
-    // Process and send the actual reply via Twilio REST API in the background.
-    processIncomingMessage({
-      from: req.body.From || 'unknown',
-      body: req.body.Body || '',
-      raw: req.body,
-    }).catch((err) => {
-      console.error('[webhook async] processing error:', err);
-    });
-  });
+  // Inbound messages. X-Twilio-Signature is checked against TWILIO_WEBHOOK_URL (or
+  // PUBLIC_BASE_URL + '/webhook'); a malformed URL throws here and stops the boot. With neither
+  // set: production refuses every request, dev skips the check (see src/webhook.js).
+  const signedUrl = webhookUrl();
+  if (!signedUrl && process.env.NODE_ENV === 'production') {
+    console.error('[server] ✖ NODE_ENV=production without TWILIO_WEBHOOK_URL / PUBLIC_BASE_URL: POST /webhook will refuse every request (403).');
+  } else if (!signedUrl) {
+    console.warn('');
+    console.warn('[server] ⚠⚠⚠ WARNING: PUBLIC_BASE_URL / TWILIO_WEBHOOK_URL not set — POST /webhook accepts UNSIGNED requests.');
+    console.warn('[server] ⚠⚠⚠ Anyone who knows the URL can post as any registered user. Fine for local ngrok dev; refused when NODE_ENV=production.');
+    console.warn('');
+  }
+  app.post('/webhook', webhookHandler({ processMessage: processIncomingMessage, url: signedUrl }));
 
   const port = process.env.PORT || 3000;
   app.listen(port, () => {
     console.log(`[server] listening on http://localhost:${port}`);
-    console.log(`[server] webhook path: POST /webhook`);
+    console.log(`[server] webhook path: POST /webhook${signedUrl ? ` (signed as ${signedUrl})` : ' (signature check OFF)'}`);
   });
 })().catch((err) => {
   console.error('[server] startup failed:', err);

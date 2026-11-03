@@ -581,6 +581,11 @@ test('send_invoice: preview shows message, masked payee, message count, notes; n
     assert.ok(result.notes.some((n) => /one attachment per message/.test(n)));
     assert.ok(result.notes.some((n) => /24 hours/.test(n)));
     assert.doesNotMatch(JSON.stringify(result), /transaction/i, 'a preview is not a transaction');
+    // The ready-to-show text the prompt says to send verbatim: recipient + number, body, attachments, count.
+    assert.match(result.preview_text, /^Send to Jameel Crest Gems \(\+66899999999\):\n/);
+    assert.ok(result.preview_text.includes(result.preview.message));
+    assert.match(result.preview_text, /\+ invoice PDF ACC-SINV-2026-00001, PromptPay QR for THB 10,000\.00 → payee ••••5678 — 2 WhatsApp messages/);
+    assert.match(result.preview_text, /Note: .*24 hours[\s\S]*\n\nSend\?$/);
   }
   assert.equal(sent.length + uploads.length, 0);
 });
@@ -859,6 +864,10 @@ test('send_payment_reminder: scope preview → yes → sends exactly the preview
   [r] = await say('remind Jameel about overdue ones', [['send_payment_reminder', { scope: 'overdue', counterparty_id: 1 }]]);
   assert.deepEqual(r.previews.map((p) => p.refs), [['ACC-SINV-2026-00010', 'ACC-SINV-2026-00015', 'ACC-SINV-2026-00017']]);
   assert.equal(r.previews[0].whatsapp_messages, 4, '3 PDFs + QR');
+  // preview_text: one block per customer, with recipient + number, the exact body, attachments and count.
+  const p0 = r.previews[0];
+  assert.ok(r.preview_text.startsWith(`Send to ${p0.to} (${p0.phone}):\n${p0.message}\n+ ${p0.attachments.join(', ')} — 4 WhatsApp messages`), r.preview_text);
+  assert.match(r.preview_text, /\n\nSend\?$/);
   // A new overdue invoice appears between preview and yes → not what the user approved.
   seedInvoice('ACC-SINV-2026-00016', { customer: 'Jameel', total: 50, due: addDays(TODAY, -2) });
   [r] = await say('yes', [['send_payment_reminder', { scope: 'overdue', counterparty_id: 1, confirmed: true }]]);

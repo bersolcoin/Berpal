@@ -3,27 +3,19 @@ const { query } = require('./db');
 const { TOOLS, executeTool } = require('./tools');
 const { ts } = require('./erp-sync/common');
 const promptSections = require('./prompt');
+// Server-only draft keys (see tools/validate.js): stripped from update_draft and hidden from the prompt.
+const { PROTECTED_DRAFT_KEYS, stripProtected } = require('./tools/validate');
+const mediaIntake = require('./media');
+const wallets = require('./wallets');
 
+// 30s/1 retry: a hung completion must not stall a WhatsApp turn (the SDK default is 10 min × 3).
 let openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 30000, maxRetries: 1 })
   : null;
 
 /** Tests only: inject a stub with the chat.completions.create shape. */
 function _setOpenAIForTests(client) {
   openai = client;
-}
-
-/**
- * Draft keys that gate side effects. Only server code may set them: save_transaction needs
- * confirmation_pending/confirmation_sig, wallet pickers need wallet_options, outbound sends need
- * outreach_preview. They are stripped from update_draft arguments (so the model can't forge them
- * even if it copies them from a tool result) and hidden from the prompt's CURRENT DRAFT.
- */
-const PROTECTED_DRAFT_KEYS = ['confirmation_pending', 'confirmation_sig', 'wallet_options', 'outreach_preview'];
-function stripProtected(obj) {
-  const out = { ...obj };
-  for (const k of PROTECTED_DRAFT_KEYS) delete out[k];
-  return out;
 }
 
 const RECENT_MESSAGES_LIMIT = 20;
@@ -204,7 +196,7 @@ For product sale language ("sold X", "sale of X", "X went out today", "moved X f
    - Counterparty present? (look for "to <name>", "from <name>", or any explicit person/business name in the message)
    - Payment terms clear? ("cash", "today", "now", "net X", "in N days", "on credit" — all count as terms-stated)
 
-3. If BOTH counterparty AND terms ARE in the message → DO NOT ask. Proceed straight to the rest of the flow (new-counterparty contact ask if applicable, then request_confirmation). Don't re-ask info the user already gave.
+3. If BOTH counterparty AND terms ARE in the message → DO NOT ask. E.g. "bought ruby PA2293 from Gem Source for 50,000 THB cash" names the supplier (Gem Source) and the terms (cash); "sold PA2293 to Jameel for 80,000 USD net 30" names the buyer (Jameel) and the terms (net 30) — asking "who'd you buy it from / sell it to?" there is a bug. Proceed straight to the rest of the flow (new-counterparty contact ask if applicable, then request_confirmation). Don't re-ask info the user already gave.
 
 4. If EITHER is missing → briefly acknowledge ("Nice." / "Got it.") and ask in ONE message ONLY for what's missing. Don't re-ask what was provided. Examples:
    - Both missing: "Nice — who'd you sell it to, and was it cash now or on terms?"
@@ -224,7 +216,7 @@ This intake DOES NOT apply to operational expenses (lunch, coffee, gas, taxi, ho
 TRANSACTION TYPE DETECTION (set transaction_type explicitly):
 - "paid for X", "bought X", "filled gas", "got X cash" (no counterparty involved) → transaction_type=cash
 - "I sent invoice to X", "I invoiced X", "I issued bill to X for ..." → transaction_type=invoice_issued, direction=income
-- "got a bill from X", "X invoiced me", "received invoice from X" → transaction_type=bill_received, direction=expense. X IS the counterparty — call update_draft with counterparty_name=X immediately; NEVER ask "who was the bill from" when a name follows "from".
+- "got a bill from X", "X invoiced me", "received invoice from X" → transaction_type=bill_received, direction=expense (set transaction_type in that first update_draft — a bill is NOT cash and needs no wallet). X IS the counterparty — call update_draft with counterparty_name=X immediately; NEVER ask "who was the bill from" when a name follows "from".
 - Receipt of money from a named counterparty: "X paid me Y", "received Y from X", "X transferred Y", "Jameel paid 45000" → BEFORE setting transaction_type, call query_open_invoices(direction='receivable', counterparty_search='<X>'):
   * Exactly 1 open invoice for that counterparty with amount matching (exact or within ~1% of) Y → transaction_type='payment', parent_invoice_name=<row ref>, parent_invoice_doctype=<row doctype>, direction='income'. Confirmation Account line: "Receivable from <counterparty> → <wallet_name>". Add a "Settles:" line: "Settles: Invoice <ref> (YYYY/MM/DD, original amount)".
   * Multiple open invoices → present a NUMBERED LIST of up to 5 (newest first by id) and ask the user to pick by number. Format example:
@@ -271,8 +263,9 @@ Confirmation card examples:
 
 SETTLEMENT (when the open balance is squared):
 Advances are not invoices, so they do NOT appear in query_open_invoices — they show in query_balance_with_counterparty.
-- "Jackie returned my 5000" / "Jackie paid back" → lookup_counterparty('Jackie') → query_balance_with_counterparty(counterparty_id) shows owes_you → transaction_type='payment', counterparty_id=<id>, direction='income', NO parent_invoice_name. Settles line: "Settles: advance to Jackie".
-- "I returned Mike's 10k" / "paid back Mike" → same, you_owe side → direction='expense'.
+- "Jackie returned my 5000" / "Jackie paid back" → lookup_counterparty('Jackie') → query_balance_with_counterparty(counterparty_id) shows owes_you → transaction_type='payment', counterparty_id=<id>, direction='income', settles_advance=true, NO parent_invoice_name. Settles line: "Settles: advance to Jackie".
+- "I returned Mike's 10k" / "paid back Mike" → same (settles_advance=true), you_owe side → direction='expense'.
+- A payment with NO parent_invoice_name is refused while the counterparty has open invoices/bills, unless settles_advance=true. Set settles_advance=true only for these advance repayments; for an invoice or bill payment set parent_invoice_name instead.
 
 If the user prefers a generic "Type: Money Out / Money In" label instead of "Advance Out/In", that's also fine — pick whichever reads cleaner for the situation.
 
@@ -283,15 +276,16 @@ Trigger — ALL of these MUST be true:
   (c) AND query_open_invoices returned zero matches.
 DO NOT trigger missed-sale flow just because lookup_counterparty returns 0 — that's just a new counterparty for a normal sale. A NEW SALE to a NEW BUYER is the standard sale-intake path, not missed-sale.
 1. Ask for the missing details: "I don't have a record of that sale to <counterparty>. Quick details to back-fill: what did you sell, roughly when, and the original amount? I'll log the sale then this payment will settle it."
-2. After getting details, present a TWO-PART confirmation summary BEFORE saving anything:
-       "I'll log two transactions:
-        1) Invoice to Jameel Crest Gems — paraiba 16ct, 20,000 USD, dated 2026/04/15 (back-dated)
-        2) Payment received today — 20,000 USD, settles the invoice above
-        Confirm to save both, or tell me what to fix."
-3. On user Confirm, perform a CHAINED SAVE in the same turn:
-   a) Call update_draft with the INVOICE fields (transaction_type='invoice_issued', back-dated transaction_date, etc.). Then save_transaction. The tool result returns the invoice's erpnext_name and doctype.
-   b) Then call update_draft for the PAYMENT (transaction_type='payment', transaction_date=today, parent_invoice_name=<erpnext_name from step a>, parent_invoice_doctype='Sales Invoice', same currency/amount). Then save_transaction.
-4. Reply: "Saved ✓ <invoice erpnext_name> + <payment erpnext_name>" (single line).
+   Also ask which wallet the money went into (or came out of) if it isn't clear.
+2. After getting details, CARD THE INVOICE (part 1/2) — nothing is saved before the user confirms it:
+   a) update_draft with the INVOICE fields: transaction_type='invoice_issued' (or 'bill_received'), back-dated transaction_date, counterparty, description/items, amount, currency, payment_terms='net_0'.
+   b) request_confirmation, then reply with its card.lines verbatim, then these two lines, then "Choose below or tell me what to fix.":
+        1/2: back-dated invoice — confirm to save it.
+        2/2: the payment of <amount> <currency> received <today> into <wallet> will be logged right after, settling it.
+3. When the user confirms, in that SAME turn:
+   a) save_transaction — saves the invoice the user saw. The result has its erpnext_name.
+   b) list_user_accounts(currency=<payment currency>), then update_draft with the PAYMENT fields: transaction_type='payment', direction, transaction_date=today, amount, currency, payment_account_id=<the wallet they named>, parent_invoice_name=<erpnext_name from 3a>, parent_invoice_doctype='Sales Invoice' (or 'Purchase Invoice'). Then save_transaction. A payment settling the document saved earlier in this turn needs no second card; anything else does.
+4. Reply: "Saved ✓ <invoice erpnext_name> + <payment erpnext_name>" (single line). If the payment save fails, say the invoice is saved and show what's needed for the payment.
 The system clears the draft after each save_transaction, so chained saves in one turn work cleanly.
 
 COUNTERPARTY DISAMBIGUATION (avoid duplicate records):
@@ -326,7 +320,7 @@ Workflow:
         2. Bangkok Cash THB
         3. Add new wallet
         Reply with a number."
-     User picks 1-N → set payment_account_id. User picks "Add new wallet" / last option → call create_user_account inline (ask for name + parent_code + currency).
+     User picks 1-N → the server has already set payment_account_id to that wallet's id (you'll see it in CURRENT DRAFT): don't change it, just continue to request_confirmation. If you set it yourself, use the wallet's \`id\`, never its option number. User picks "Add new wallet" / last option → call create_user_account inline (ask for name + parent_code + currency).
    - 0 matches → ask: "No <currency> wallet on file. Want to add one? Reply with the name (e.g. 'BBL THB') or 'skip' to save without linking." If user gives a name, call create_user_account, then set payment_account_id and proceed. If 'skip', call update_draft with wallet_skipped=true and proceed (it posts to the generic Cash account).
 3. The Account line in the confirmation card should reference the WALLET NAME, not the generic type. Example: "Account: BBL Savings → Meals & Entertainment" instead of "Cash → Meals & Entertainment".
 
@@ -434,7 +428,7 @@ LISTING:
 - "list my contacts" / "show counterparties" → currently no list_contacts tool; tell user briefly that contact list isn't available via chat yet (use the website when ready).
 
 STANDALONE VCARD SHARE (user shares a WhatsApp contact card with no other transaction context):
-When the user's message body is JUST a vCard share (you'll see "[contact shared — name: ..., phone: ..., ...]" with no surrounding transaction language like "sold/bought/paid/received"), interpret it as the user wanting to add the contact and possibly start a transaction with them. Workflow:
+When the user's message body is JUST a vCard share (you'll see a "[contact shared] {"name":…,"phone":…}" line with no surrounding transaction language like "sold/bought/paid/received"), interpret it as the user wanting to add the contact and possibly start a transaction with them. Workflow:
 1. Call lookup_counterparty(search='<name from vCard>').
 2. If 0 matches → call create_contact with name + phone + email from the vCard. Reply: "Added new contact: <name>. Did you buy or sell with <name>?"
 3. If 1 EXACT-name match → don't create a duplicate. Just reply: "Did you buy or sell anything with <name>?" (existing contact, prompt them to log a transaction).
@@ -470,7 +464,7 @@ INVOICE / BILL RULES (when transaction_type is invoice_issued or bill_received):
         <counterparty_name>
         Share his contact number and nickname for future reference, or reply 'skip'."
     Don't say "tap the attachment icon", don't explain the WhatsApp UI, don't pad with "I'll save it for next time" — the user knows what they're doing.
-  * If user shares a vCard, you'll see "[contact shared — name: ..., phone: ..., email: ..., organization: ...]" appended to their next message. Use those values to populate counterparty_phone (and email/org) via update_draft, then proceed.
+  * If user shares a vCard, you'll see "[contact shared] {"name":…,"phone":…,"email":…,"organization":…}" (JSON, keys present only when known) appended to their next message. Use those values to populate counterparty_phone (and email/org) via update_draft, then proceed.
   * If user types a phone number, capture it as counterparty_phone.
   * Phone-skip phrasings — accept ANY of: "skip", "no", "later", "don't have it", "don't know his/her number", "no phone", "save without phone", "make an account but no number", "create them without number", "just the name", or similar. On any of these → call update_draft with counterparty_contact_skipped=true, then call request_confirmation. The counterparty record will still be created with the name (and nickname if given) — only the phone is left blank, to be filled in later.
   * If the counterparty is already in our system (you've seen them before in this conversation, or system check passes), the contact ask is skipped automatically.
@@ -521,23 +515,14 @@ PAYMENT METHOD KEYWORDS:
 NEVER expose codes (like "5210" or "1000") to the user. Show only the readable NAMES.
 
 WORKFLOW:
-1. Each user message → call update_draft with EVERY field you can extract or infer.
+1. Each user message → call update_draft with EVERY field you can extract or infer, ALWAYS including transaction_type (cash / invoice_issued / bill_received / payment / advance_*), in the SAME turn — before you ask the user anything (a contact ask, a wallet picker, a missing field). Never reply with a question about a transaction you haven't put in the draft yet.
 2. If required fields are still missing after extraction, ask ONE concise question for what's missing (never bundle questions).
-3. Every time you send the confirmation summary text — INITIAL or RE-ISSUE after any edit (rate change, amount fix, wallet swap, terms update, anything) — you MUST call request_confirmation in the SAME turn, BEFORE the text. The tool call is what triggers the WhatsApp Confirm/Reject button card; without it, your text reply goes out plain and the user has no buttons to tap. This rule applies on every re-summary, no exceptions: edited draft → request_confirmation → summary text. Use plain newlines only — NO trailing spaces, NO markdown soft-breaks, NO asterisks. Do NOT compose a "confirm to save?" style summary in plain text without first calling the tool — that's a bug, not the workflow:
-
-Date: YYYY/MM/DD
-Amount: X,XXX CCY                                                  (transaction currency = reporting currency)
-Amount: X,XXX ${user.reporting_currency} (Y,YYY <foreign_ccy> @ R.RR)   (foreign currency — base PRIMARY, original in brackets with rate; rate is REQUIRED, never omit)
-Type: <Expense | Income | Invoice Sent | Bill Received | Payment | Transfer>
-Account: <source_name> → <destination_name>
-Counterparty: <name>          (omit this line entirely if no counterparty)
-Net: X,XXX CCY / VAT <vat_rate>%: X,XXX CCY   (ONLY when request_confirmation returned totals; Amount line then shows totals.gross)
-WHT <wht_rate>%: X,XXX CCY (pay <name> X,XXX CCY)   (ONLY when totals.wht is set)
-Due: YYYY/MM/DD (Net N)       (ONLY include for Invoice Sent or Bill Received; otherwise omit)
-Settles: Invoice <ref> dated YYYY/MM/DD for X,XXX CCY   (the row's 'date' field, not its due date)    (ONLY include for Payment; when settling an advance write "Settles: advance to/from <counterparty>"; otherwise omit)
-Note: <description>           (omit this line entirely if no description)
+3. Every time you send the confirmation summary text — INITIAL or RE-ISSUE after any edit (rate change, amount fix, wallet swap, terms update, anything) — you MUST call request_confirmation in the SAME turn, BEFORE the text. The tool call is what triggers the WhatsApp Confirm/Reject button card; without it, your text reply goes out plain and the user has no buttons to tap. This rule applies on every re-summary, no exceptions: edited draft → request_confirmation → summary text. Use plain newlines only — NO trailing spaces, NO markdown soft-breaks, NO asterisks. Do NOT compose a "confirm to save?" style summary in plain text without first calling the tool — that's a bug, not the workflow.
+THE CARD TEXT COMES FROM THE TOOL: request_confirmation returns \`card.lines\` (Date, Amount, item/tax lines, Type, Account, Counterparty, Due, Settles, Note — computed by the server from the draft, wallet and category names included). Reply with those lines VERBATIM, one per line, in that order — never retype, reorder, rename accounts or recompute amounts — then a blank line and:
 
 Choose below or tell me what to fix.
+
+The only allowed edit: append " (assumed)" to the Amount line when the user named no currency (see CURRENCY ASSUMPTION). For reference, the server's lines follow the conventions below.
 
 ACCOUNT ARROW DIRECTIONS — convention: "<credit side> → <debit side>" (source flows to destination):
 - Income (cash):              Sales Revenue → <wallet_name>          (revenue recognized, money lands in wallet)
@@ -553,7 +538,7 @@ ACCOUNT ARROW DIRECTIONS — convention: "<credit side> → <debit side>" (sourc
 
 The key principle: for ANY income, the revenue/receivable side comes FIRST, the wallet/asset increase comes SECOND. NEVER write "Cash → Sales Revenue" for an income transaction — that's backward.
 
-For invoice/bill/payment flows, ALWAYS include the counterparty name on the receivable/payable side of the arrow — never write the bare phrase "Accounts Receivable" or "Accounts Payable" alone. This makes it clear who owes whom. Example: "Account: Receivable from Jameel Crest Gems → Sales Revenue".
+For invoice/bill/payment flows, ALWAYS include the counterparty name on the receivable/payable side of the arrow — never write the bare phrase "Accounts Receivable" or "Accounts Payable" alone. This makes it clear who owes whom. Example: "Account: Sales Revenue → Receivable from Jameel Crest Gems".
 
 4. User replies yes/save/ok/confirm/Confirm (case-insensitive — they may have tapped a button) → call save_transaction. The tool now pushes to ERPNext and returns an erpnext_name field (e.g. "ACC-JV-2026-00001"). Reply with EXACTLY these two lines, using that name:
 
@@ -622,7 +607,20 @@ async function saveConversationState(userId, { draft, recentMessages, state }) {
   );
 }
 
+/**
+ * Clear the draft and history. A receipt still held for the dropped draft is deleted now rather
+ * than left for the 7-day purge (after a save it was already attached and deleted — this is a no-op).
+ */
 async function resetConversation(userId) {
+  const r = await query('SELECT draft_transaction FROM conversations WHERE user_id = $1', [userId]);
+  const raw = r.rows[0] && r.rows[0].draft_transaction;
+  let mediaId = null;
+  try {
+    mediaId = raw ? JSON.parse(raw).receipt_media_id : null;
+  } catch {
+    mediaId = null;
+  }
+  if (mediaId) await mediaIntake.discard(userId, [mediaId]);
   await saveConversationState(userId, { draft: null, recentMessages: [], state: 'idle' });
 }
 
@@ -632,7 +630,9 @@ async function resetConversation(userId) {
  * already in CURRENT DRAFT. Only fires when the draft is actually waiting on that ask.
  */
 const CONTACT_SKIP_RE = /^\s*(skip|no|nope|later|not now|no phone|no number|don'?t (have|know) (it|his|her|their)( number)?|just the name)\s*[.!]?\s*$/i;
-function applyDeterministicReplies(draft, userMessage) {
+function applyDeterministicReplies(draft, userMessage, { shownWallets = null } = {}) {
+  // A spoken "skip" arrives as "[voice note] Skip." — match on what was said, not the prefix.
+  userMessage = String(userMessage || '').replace(/^\[voice note\] /, '');
   const tt = draft.transaction_type;
   const awaitingContact = (tt === 'invoice_issued' || tt === 'bill_received')
     && draft.counterparty_name && !draft.counterparty_phone && !draft.counterparty_contact_skipped;
@@ -645,7 +645,46 @@ function applyDeterministicReplies(draft, userMessage) {
     && draft.amount != null && !draft.payment_account_id && Array.isArray(draft.wallet_options) && !draft.wallet_skipped;
   if (awaitingWallet && /^\s*skip\s*[.!]?\s*$/i.test(userMessage || '')) {
     draft.wallet_skipped = true;
+    return;
   }
+  // A bare number answering the wallet picker: resolve it to the wallet the user saw at that
+  // number. The model otherwise sometimes passes the position as the id. `shownWallets` is the
+  // picker as it appeared in the bot's last reply ({ k: walletId }, see shownWalletOptions). It
+  // fires ONLY when that reply listed offered wallets by number — "How many stones?" → "3" must
+  // never pick a wallet. Not for transfers, which pick two wallets.
+  const pick = /^\s*(\d{1,2})\s*[.!]?\s*$/.exec(userMessage || '');
+  if (pick && shownWallets && !draft.payment_account_id && draft.direction !== 'transfer'
+      && ['cash', 'payment', 'advance_given', 'advance_received'].includes(tt || 'cash')) {
+    const id = shownWallets[Number(pick[1])];
+    if (id) draft.payment_account_id = id;
+  }
+}
+
+/**
+ * The wallet picker as the user saw it: numbered lines in the bot's last reply ("1. KBank",
+ * "1) KBank", "1 - KBank", "**1.** KBank", optional emoji), matched to the wallets offered for
+ * this draft. A label matches a wallet when it IS the wallet's name or starts with it followed by
+ * a non-word character ("KBank (THB)"; but "Cashbox savings" is not "Cash"); the longest unique
+ * match wins. Returns { k: walletId } for matching lines, or null when nothing matched.
+ */
+async function shownWalletOptions(user, draft, lastReply) {
+  const offered = Array.isArray(draft.wallet_options) ? draft.wallet_options : [];
+  const lines = [...String(lastReply || '').matchAll(/^[\s>*_•-]*(?:\*\*)?(\d{1,2})(?:\*\*)?\s*(?:[.)]|[-–—:])(?:\*\*)?\s+(.+?)\s*$/gm)];
+  if (!offered.length || !lines.length) return null;
+  const named = [];
+  for (const id of offered) {
+    const w = await wallets.getById(user, id);
+    if (w && w.name) named.push({ id: Number(w.id), name: w.name.toLowerCase() });
+  }
+  const out = {};
+  for (const [, k, raw] of lines) {
+    const label = raw.replace(/^[\p{Extended_Pictographic}\uFE0F\u200D*_`\s]+/u, '').replace(/[*_`]+/g, '').trim().toLowerCase();
+    const hits = named
+      .filter((w) => label === w.name || (label.startsWith(w.name) && /^[^\p{L}\p{N}]/u.test(label.slice(w.name.length))))
+      .sort((a, b) => b.name.length - a.name.length);
+    if (hits.length && (hits.length === 1 || hits[0].name.length > hits[1].name.length)) out[Number(k)] = hits[0].id;
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /**
@@ -661,14 +700,57 @@ function cleanReply(text) {
     .join('\n');
 }
 
-async function handle(user, userMessage) {
+/** media_id values of the "[receipt scanned] {json}" lines in a message (whatsapp.js stored those blobs). */
+function scannedMediaIds(userMessage) {
+  const ids = [];
+  for (const m of String(userMessage || '').matchAll(/^\[receipt scanned\] (\{.*\})$/gm)) {
+    try {
+      const id = Number(JSON.parse(m[1]).media_id);
+      if (Number.isInteger(id) && id > 0) ids.push(id);
+    } catch {
+      // not JSON — a typed imitation; nothing stored for it
+    }
+  }
+  return ids;
+}
+
+/**
+ * Voice notes: the reply must say what was heard so the user can catch a mis-transcription.
+ * The prompt asks for it; the model skips it often enough (e.g. when it jumps to a wallet picker)
+ * that it's added here when missing. `transcript` comes only from whatsapp.js's voice path, so a
+ * typed "[voice note] …" never triggers it.
+ */
+function withVoiceEcho(transcript, text) {
+  if (!transcript || /heard:/i.test(text)) return text;
+  const heard = transcript.length > 120 ? `${transcript.slice(0, 120)}…` : transcript;
+  return `Heard: "${heard}"\n${text}`;
+}
+
+/**
+ * opts.voiceTranscript: set by whatsapp.js when the message came from a voice note (the same
+ * text also appears in userMessage as a "[voice note] …" line).
+ */
+async function handle(user, userMessage, { voiceTranscript = null } = {}) {
   if (!openai) {
-    return "Sorry, the bookkeeping AI isn't available right now. Please try again later.";
+    return { text: "Sorry, the bookkeeping AI isn't available right now. Please try again later.", isConfirmation: false };
   }
 
   const conv = await loadConversation(user.id);
   const draft = conv.draft_transaction ? JSON.parse(conv.draft_transaction) : {};
-  applyDeterministicReplies(draft, userMessage);
+  const history = JSON.parse(conv.recent_messages || '[]');
+  const lastReply = [...history].reverse().find((h) => h.role === 'assistant')?.content || '';
+  const walletBefore = draft.payment_account_id;
+  const shownWallets = await shownWalletOptions(user, draft, lastReply);
+  applyDeterministicReplies(draft, userMessage, { shownWallets });
+  // The user's own pick this turn (a bare number): update_draft won't let the model swap in
+  // another wallet in this turn.
+  const pickedWallet = draft.payment_account_id !== walletBefore ? draft.payment_account_id : null;
+  // A new scan replaces any receipt previously attached to the draft: hide the old id so the
+  // model re-sets receipt_media_id from the new line. The old blob is only deleted once the turn
+  // has ended with a different id (below) — an OpenAI failure keeps the old draft as it was.
+  const previousMediaId = draft.receipt_media_id || null;
+  const newMediaIds = scannedMediaIds(userMessage);
+  if (newMediaIds.length || /^\[receipt scanned\] /m.test(userMessage || '')) delete draft.receipt_media_id;
   // A preview armed at the START of this turn was for exactly this user message. If the turn
   // ends with that same preview still pending, the user didn't confirm it — drop it.
   // Identified by preview_id (random), never by timestamp: a re-preview issued in the same
@@ -677,7 +759,6 @@ async function handle(user, userMessage) {
   const armedPreviewAtStart = draft.outreach_preview && draft.outreach_preview.armed
     ? previewKey(draft.outreach_preview)
     : null;
-  const history = JSON.parse(conv.recent_messages || '[]');
   const today = new Date().toISOString().slice(0, 10);
 
   const systemPrompt = await buildSystemPrompt({ user, draft, today });
@@ -694,6 +775,7 @@ async function handle(user, userMessage) {
     saved: null,
     cancelled: false,
     confirmationRequested: false,
+    pickedWallet,
   };
 
   let finalText = null;
@@ -750,22 +832,45 @@ async function handle(user, userMessage) {
     }
   } catch (err) {
     console.error('[conversation] OpenAI error:', err.message);
-    return "Sorry, I'm having trouble right now. Please try again in a moment.";
+    // Something was already posted (or the draft cancelled) before the failure: the stored draft
+    // must not survive, or the user's next "yes" would post it a second time.
+    const savedIds = ctx.savedIds || [];
+    if (savedIds.length || ctx.saved || ctx.cancelled) {
+      await resetConversation(user.id);
+      await mediaIntake.discard(user.id, newMediaIds);
+      if (savedIds.length || ctx.saved) {
+        const refs = savedIds.length ? savedIds.join(' + ') : ctx.saved.erpnext_name;
+        // A chained save cut short: the next part was in progress and is lost.
+        const unfinished = ctx.draft && (ctx.draft.transaction_type || ctx.draft.amount != null) ? "\nI couldn't finish the next step — please send it again." : '';
+        return { text: `Saved ✓\nRef: ${refs}${unfinished}`, isConfirmation: false };
+      }
+      return { text: "Cancelled. Send me the next transaction whenever you're ready.", isConfirmation: false };
+    }
+    // Nothing from this turn is persisted, so the receipts it brought are orphaned; the stored
+    // draft keeps its previous receipt.
+    await mediaIntake.discard(user.id, newMediaIds.filter((id) => id !== previousMediaId));
+    return { text: "Sorry, I'm having trouble right now. Please try again in a moment.", isConfirmation: false };
   }
 
   if (!finalText) finalText = 'Got it. Anything else?';
   finalText = cleanReply(finalText);
+  finalText = withVoiceEcho(voiceTranscript, finalText);
 
   if (ctx.saved || ctx.cancelled) {
     await resetConversation(user.id);
   } else {
+    // The draft's receipt was replaced (or dropped) this turn: the previous image is unreferenced.
+    if (previousMediaId && ctx.draft.receipt_media_id !== previousMediaId) {
+      await mediaIntake.discard(user.id, [previousMediaId]);
+    }
     const newHistory = [
       ...history,
       { role: 'user', content: userMessage, ts: new Date().toISOString() },
       { role: 'assistant', content: finalText, ts: new Date().toISOString() },
     ].slice(-RECENT_MESSAGES_LIMIT);
-    // Marks that a card went out for this draft; save_transaction requires it on a later turn.
-    if (ctx.confirmationRequested) ctx.draft.confirmation_pending = true;
+    // The card the user is now looking at: save_transaction on a later turn requires the draft to
+    // still match this signature (a string, never `true`).
+    if (ctx.confirmationRequested) ctx.draft.confirmation_pending = ctx.draft.confirmation_sig;
     // Same idea for outbound messages to third parties: a tool stores the previewed plan in
     // draft.outreach_preview during its turn; only once this turn has ended (and the user has
     // replied) is it "armed", so confirmed:true can never land in the same turn as the preview.
@@ -794,4 +899,6 @@ async function handle(user, userMessage) {
   };
 }
 
-module.exports = { handle, loadConversation, _setOpenAIForTests, PROTECTED_DRAFT_KEYS };
+module.exports = {
+  handle, loadConversation, resetConversation, applyDeterministicReplies, shownWalletOptions, withVoiceEcho, _setOpenAIForTests, PROTECTED_DRAFT_KEYS,
+};

@@ -9,10 +9,26 @@ const exchange = require('../exchange');
 const { companyCurrency, round2 } = require('../erp-sync/common');
 const { computeTotals, amountFromPaidAfterWht, vatTreatment, WHT_RATES, WHT_FORMS } = require('../erp-sync/taxes');
 const { splitLine } = require('../erp-sync/invoice-lines');
-const { stockShortfall, itemCodeProblem } = require('../erp-sync/items');
+const { stockShortfall, itemCodeProblem, normalizeItemCode } = require('../erp-sync/items');
+const { getOpenInvoices } = require('../erp-query/open-invoices');
 const { whtOverpaymentError } = require('../erp-sync/payment-entry');
 
 const REQUIRED_FIELDS = ['amount', 'currency', 'direction', 'transaction_date'];
+
+/**
+ * Draft keys that gate side effects. Only server code may set them: save_transaction needs
+ * confirmation_pending/confirmation_sig, wallet pickers need wallet_options, outbound sends need
+ * outreach_preview. update_draft strips them from its arguments (so the model can't forge them
+ * even if it copies them from a tool result) and from the draft it echoes back; conversation.js
+ * hides them from the prompt's CURRENT DRAFT. Lives here (not conversation.js) so tools can
+ * import it without a require cycle.
+ */
+const PROTECTED_DRAFT_KEYS = ['confirmation_pending', 'confirmation_sig', 'wallet_options', 'outreach_preview'];
+function stripProtected(obj) {
+  const out = { ...obj };
+  for (const k of PROTECTED_DRAFT_KEYS) delete out[k];
+  return out;
+}
 const WALLET_TYPES = ['cash', 'payment', 'advance_given', 'advance_received'];
 const PARTY_TYPES = ['invoice_issued', 'bill_received', 'payment', 'advance_given', 'advance_received'];
 
@@ -64,6 +80,13 @@ function paidAfterWhtProblem(draft) {
  * round trip. Never overrides a value the model set.
  */
 async function applyDefaults(user, draft) {
+  // Payment terms / a due date only exist on invoices and bills. When the model left
+  // transaction_type out ("got a bill from X … due in 30 days"), defaulting to cash would post
+  // a cash JE and ask for a wallet; the terms say which document it is.
+  if (!draft.transaction_type && (draft.payment_terms || draft.due_date) && (draft.counterparty_name || draft.counterparty_id)
+      && (draft.direction === 'income' || draft.direction === 'expense')) {
+    draft.transaction_type = draft.direction === 'income' ? 'invoice_issued' : 'bill_received';
+  }
   const tt = draft.transaction_type || 'cash';
   // Multi-item drafts: the model may omit amount and let us sum the lines (no model arithmetic).
   if (draft.amount == null && Array.isArray(draft.items) && draft.items.length && itemsProblem(draft.items) == null) {
@@ -126,6 +149,12 @@ function itemsProblem(items) {
     if (it.item_code) {
       const p = itemCodeProblem(it.item_code);
       if (p) return `items[${i}]: ${p}`;
+      // Stock ids users give carry a number (PA2293, R-17, SKU 4471, ทับทิม01). A bare word is
+      // usually the model turning a gem name ("ruby") into a stock item, which then fails as "not
+      // in stock". Soft: force_item_code=true accepts it when the user said it IS their code.
+      if (!/\p{N}/u.test(normalizeItemCode(it.item_code)) && it.force_item_code !== true) {
+        return `items[${i}].item_code "${it.item_code}" has no digits, so it looks like a description (e.g. a gem name), not a stock id. Remove item_code from that line and keep the description. Only if the user explicitly said "${it.item_code}" is their stock code, keep it and set items[${i}].force_item_code=true.`;
+      }
     }
   }
   return null;
@@ -232,7 +261,7 @@ async function readinessError(user, draft, getErp = null) {
   for (const field of ['payment_account_id', 'transfer_destination_account_id']) {
     if (!draft[field]) continue;
     if (!offered.includes(Number(draft[field]))) {
-      return `${field}=${draft[field]} was not offered by list_user_accounts for this draft (ids from earlier conversations may be stale). Call list_user_accounts and pick an id from its result.`;
+      return `${field}=${draft[field]} is not a wallet id offered for this draft — you passed a list position (option number) or a stale id. Valid ids are [${offered.join(', ')}]; use the \`id\` of the wallet the user picked (or call list_user_accounts again).`;
     }
     const w = await wallets.getById(user, draft[field]);
     if (!w || !w.is_active) {
@@ -245,6 +274,20 @@ async function readinessError(user, draft, getErp = null) {
     const short = await stockShortfall(user, getErp(), draft.items, draft.transaction_date);
     if (short) return short;
   }
+  // A payment with no parent document settles an advance. If the party has open invoices/bills,
+  // the model has most likely skipped setting parent_invoice_name — which would leave the invoice
+  // open and book the money as an advance. Ask it to choose explicitly.
+  if (getErp && tt === 'payment' && !draft.parent_invoice_name && !draft.settles_advance) {
+    const contact = await counterparties.forDraft(user, draft);
+    if (contact) {
+      const side = draft.direction === 'income' ? 'receivable' : 'payable';
+      const open = await getOpenInvoices(user, getErp(), { direction: side, counterparty_id: contact.id, limit: 5 });
+      if (open.ok && open.rows.length) {
+        const list = open.rows.map((r) => `${r.ref} (${r.doctype}, ${r.outstanding} ${r.currency})`).join('; ');
+        return `${contact.name} has open ${side === 'receivable' ? 'invoices' : 'bills'}: ${list}. Set parent_invoice_name and parent_invoice_doctype to the one this payment settles (ask the user if several could match). Only if the user said it settles an advance, set settles_advance=true instead.`;
+      }
+    }
+  }
   // Paying a WHT bill: the supplier is owed gross − WHT. Refuse the gross before the card goes out.
   if (getErp && tt === 'payment' && draft.parent_invoice_name) {
     const over = await whtOverpaymentError(getErp(), draft);
@@ -253,4 +296,6 @@ async function readinessError(user, draft, getErp = null) {
   return null;
 }
 
-module.exports = { validateDraft, readinessError, applyDefaults, itemsSum, taxAndItemsError };
+module.exports = {
+  validateDraft, readinessError, applyDefaults, itemsSum, taxAndItemsError, PROTECTED_DRAFT_KEYS, stripProtected,
+};

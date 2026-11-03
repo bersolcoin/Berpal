@@ -266,6 +266,21 @@ function previewEntry(m) {
   };
 }
 
+/**
+ * The preview exactly as the user should see it — the tools return it as preview_text and the
+ * prompt says to show it verbatim, so the recipient's number and the message can't be dropped
+ * or paraphrased by the model.
+ */
+function previewText(messages) {
+  const blocks = messages.map((m) => {
+    const extra = m.attachments.length ? `+ ${m.attachments.join(', ')} — ` : '';
+    const count = `${m.messageCount} WhatsApp message${m.messageCount === 1 ? '' : 's'}`;
+    return `Send to ${m.customer} (${m.phone}):\n${m.body}\n${extra}${count}`;
+  });
+  const freeform = messages.some((m) => !m.template) ? [`Note: ${FREEFORM_NOTE}`] : [];
+  return [...blocks, ...freeform, 'Send?'].join('\n\n');
+}
+
 function previewNotes(messages) {
   const notes = [PDF_NOTE, ONE_MEDIA_NOTE];
   if (messages.some((m) => !m.template)) notes.push(FREEFORM_NOTE);
@@ -407,7 +422,7 @@ async function customerAttempts(user, customer, refs) {
 }
 
 module.exports = {
-  planInvoice, planReminders, deliver, previewView, previewEntry, previewNotes, listOpenReceivables,
+  planInvoice, planReminders, deliver, previewView, previewEntry, previewNotes, previewText, listOpenReceivables,
   customerRemindedWithin, customerAttempts, localToday, dueLabel, daysBetween, maskPayee,
   MAX_PDFS_PER_MESSAGE,
 };

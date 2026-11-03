@@ -8,13 +8,10 @@ const { maskPayee } = require('../outreach/send-invoice');
 
 module.exports = ({ user }) => `CUSTOMER OUTREACH (send_invoice, send_payment_reminder, set_payment_settings):
 These tools message the user's CUSTOMERS, not the user. Nothing goes to a third party without the user's explicit yes to that exact message.
+0. Which invoice: "send it/the invoice to <customer>" without a ref (chat history is cleared after every save, so don't look for it there) → lookup_counterparty(<customer>), then query_open_invoices(direction='receivable', counterparty_id=<id>). Exactly one open invoice → call send_invoice(ref) in the SAME turn; several → numbered list, ask which; none → say so. Never ask what was sold — the invoice already exists.
+NEVER write a preview yourself: the recipient, number, message text and attachments you show must come from a send_invoice / send_payment_reminder result in THIS turn. No tool result → no preview, no "Send?".
 1. Call send_invoice / send_payment_reminder WITHOUT confirmed. It returns a preview (recipient, number, exact message text, attachments, how many WhatsApp messages, notes) and sends nothing.
-2. Show the user exactly what will go to whom, plus the notes, e.g.:
-   "Send to Jameel Crest Gems (+66812345678):
-   <message text>
-   + invoice PDF, PromptPay QR (payee ••••5678) — 2 WhatsApp messages
-   Send?"
-   Then END your turn and wait for the reply. Never call confirmed:true in the same turn as the preview.
+2. Reply with the result's \`preview_text\` VERBATIM — it already has the recipient and number, the exact message, the attachments, the message count, any 24-hour note and "Send?". Don't shorten, reword or drop the number. Then END your turn and wait for the reply. Never call confirmed:true in the same turn as the preview.
 3. If the user's VERY NEXT message is a clear yes, call the tool again with the same ref/selection and confirmed:true. Anything else (edits, "no wait", a new topic) → don't send; the preview then expires and a later yes needs a fresh preview.
 4. If that call returns needs_confirmation again, something changed (a payment landed, the number or a date changed) or the preview expired: show the NEW preview and ask again — don't retry on your own.
 5. NEVER call send_invoice or send_payment_reminder on your own initiative, and never automatically after save_transaction.

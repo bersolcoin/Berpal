@@ -20,9 +20,24 @@ const definition = {
 
 async function execute(args, ctx) {
   const list = await wallets.list(ctx.user, getErp(ctx), args);
+  const ids = list.map((w) => w.id);
   // Remember what was offered so request_confirmation can reject stale ids (see validate.js).
-  ctx.draft.wallet_options = [...new Set([...(ctx.draft.wallet_options || []), ...list.map((w) => w.id)])];
-  return { ok: true, count: list.length, accounts: list.map(({ erpnext_account, ...w }) => w) };
+  // A bare "2" next turn is resolved against the picker as the user saw it in the reply
+  // (conversation.js shownWalletOptions), matched by wallet name among these offers.
+  ctx.draft.wallet_options = [...new Set([...ids, ...(ctx.draft.wallet_options || [])])];
+  const result = {
+    ok: true,
+    count: list.length,
+    accounts: list.map(({ erpnext_account, ...w }, i) => ({ option: i + 1, ...w })),
+    picker: 'If you show a picker, list these wallets in THIS order numbered by `option` (1..N), each line starting with the wallet name exactly, e.g. "1. BBL Savings". The user\'s number is resolved to the wallet for you. payment_account_id takes the wallet `id`, never the option number.',
+  };
+  // The model sometimes runs the wallet picker for an invoice/bill, which never touches a wallet
+  // (AR/AP only) — and then loops on it. Say so where it will read it.
+  const tt = ctx.draft.transaction_type;
+  if (tt === 'invoice_issued' || tt === 'bill_received') {
+    result.note = `The current draft is ${tt}: it posts to receivables/payables and needs NO wallet. Do not show a wallet picker for it — call request_confirmation (or answer the user's question).`;
+  }
+  return result;
 }
 
 module.exports = { definition, execute };

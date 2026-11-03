@@ -1,6 +1,6 @@
 /**
  * Attach a stored receipt image (media_blobs row) to a saved ERPNext document, then drop the blob.
- * Call after save_transaction succeeds, with the doctype + name it returned. See NOTES-A.md.
+ * Called by save_transaction after a successful save, with the doctype + name it returned.
  */
 const store = require('./store');
 const { ts } = require('../erp-sync/common');

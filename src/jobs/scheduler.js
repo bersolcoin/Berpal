@@ -23,6 +23,7 @@ const { query } = require('../db');
 const erpnext = require('../erpnext');
 const { ts } = require('../erp-sync/common');
 const { normalizeTime, localClock, parseJobPrefs, addDays, toMinutes, windowMinutes } = require('./index');
+const { twilioSignatureOk, defaultValidate } = require('../twilio-signature');
 
 const DEFAULT_INTERVAL_MS = 60 * 1000;
 const DEFAULT_WINDOW_MIN = 120;
@@ -163,8 +164,7 @@ const _late = new Set(); // promises of overrun jobs, so stop() can wait for the
  * it eventually settles its REAL outcome (status, result, message_sid) overwrites the row —
  * a message it did send is still on record for the status callback.
  */
-async function runWithTimeout(job, user, deps, runId, timeoutMs) {
-  const ac = new AbortController();
+async function runWithTimeout(job, user, deps, runId, timeoutMs, ac = new AbortController()) {
   const run = Promise.resolve().then(() => job.run(user, { ...deps, signal: ac.signal }));
   let timer;
   const timedOut = new Promise((resolve) => {
@@ -224,7 +224,6 @@ async function runDue({
     if (isStopping()) break;
     // A job that overran its timeout for this user is still running: don't pile another on.
     if (_overrun.has(user.id)) continue;
-    let erp = null;
     for (const job of jobs) {
       if (_overrun.has(user.id)) break;
       let runId = null;
@@ -245,12 +244,14 @@ async function runDue({
         if (!runId) continue; // claimed by another instance / overlapping tick
 
         out = { user_id: user.id, job: job.name, run_date: runDate };
-        // Built lazily so a user with nothing due costs no ERPNext client.
-        if (!erp) erp = erpFor(user);
+        // Built per claimed run (a user with nothing due costs no ERPNext client), carrying this
+        // run's timeout signal so every ERPNext call the job makes is cancelled when it fires.
+        const ac = new AbortController();
+        const erp = erpFor(user, { signal: ac.signal });
         // clock.date is the REAL local date (use it for "today"); run_date is the day the run
         // belongs to — the previous date when a window crosses midnight.
         const deps = { erp, twilio: twilio || defaultTwilio(), now: at, clock: { ...clock, run_date: runDate } };
-        const res = await runWithTimeout(job, user, deps, runId, Number(job.timeoutMs) > 0 ? Number(job.timeoutMs) : jobTimeoutMs);
+        const res = await runWithTimeout(job, user, deps, runId, Number(job.timeoutMs) > 0 ? Number(job.timeoutMs) : jobTimeoutMs, ac);
         if (res === TIMED_OUT) {
           out.status = 'failed';
           out.error = 'timeout';
@@ -331,13 +332,12 @@ async function recordDeliveryStatus({ sid, status, errorCode = null }) {
 function twilioStatusHandler({
   authToken = process.env.TWILIO_AUTH_TOKEN,
   publicBaseUrl = process.env.PUBLIC_BASE_URL,
-  validate = (...args) => require('twilio').validateRequest(...args),
+  validate = defaultValidate,
 } = {}) {
   return async (req, res) => {
     const params = req.body || {};
-    const url = `${String(publicBaseUrl || '').replace(/\/$/, '')}/twilio/status`;
-    const signature = (req.headers && req.headers['x-twilio-signature']) || '';
-    if (!authToken || !publicBaseUrl || !validate(authToken, signature, url, params)) {
+    const url = publicBaseUrl ? `${String(publicBaseUrl).replace(/\/$/, '')}/twilio/status` : null;
+    if (!twilioSignatureOk(req, { authToken, url, validate })) {
       console.error(`• [jobs] [${ts()}] /twilio/status rejected: bad signature or PUBLIC_BASE_URL/TWILIO_AUTH_TOKEN unset`);
       return res.status(403).send('invalid signature');
     }

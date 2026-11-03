@@ -5,7 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const NOT_TOOLS = new Set(['index.js', 'context.js', 'validate.js']);
+const NOT_TOOLS = new Set(['index.js', 'context.js', 'validate.js', 'card.js']);
 
 const tools = fs
   .readdirSync(__dirname)

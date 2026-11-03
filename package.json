@@ -1,7 +1,7 @@
 {
   "name": "ber-accounting-whatsapp-bot",
   "version": "0.1.0",
-  "description": "WhatsApp bot via Twilio Sandbox — phase 1: echo reply over TwiML",
+  "description": "WhatsApp bookkeeping bot: plain-language transactions, receipts and voice notes posted to ERPNext, with customer outreach, Thai VAT/WHT, stock and a daily digest",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

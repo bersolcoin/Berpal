@@ -51,8 +51,10 @@ function stripHtml(text) {
 }
 
 class ErpNextClient {
-  constructor(user) {
+  /** `signal` (optional) is a default AbortSignal for every request, e.g. a scheduler job's timeout. */
+  constructor(user, { signal = null } = {}) {
     this.user = user;
+    this.signal = signal;
     this.baseUrl = resolveBaseUrl(user);
     if (!this.baseUrl) {
       throw new Error('[erpnext] no base URL — set ERPNEXT_URL in .env or users.erpnext_url');
@@ -71,7 +73,7 @@ class ErpNextClient {
         ...(body ? { 'Content-Type': 'application/json' } : {}),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: withTimeout(signal, timeoutMs),
+      signal: withTimeout(signal || this.signal, timeoutMs),
     };
     const res = await fetch(url, opts);
     const text = await res.text();
@@ -109,7 +111,7 @@ class ErpNextClient {
     const res = await fetch(url, {
       method: 'GET',
       headers: { Authorization: this.authHeader, Accept: '*/*' },
-      signal: withTimeout(signal, timeoutMs),
+      signal: withTimeout(signal || this.signal, timeoutMs),
     });
     if (!res.ok) {
       const text = await res.text();
@@ -131,7 +133,7 @@ class ErpNextClient {
       method: 'POST',
       headers: { Authorization: this.authHeader, Accept: 'application/json' },
       body: form,
-      signal: withTimeout(signal, timeoutMs),
+      signal: withTimeout(signal || this.signal, timeoutMs),
     });
     const text = await res.text();
     let json;
@@ -305,9 +307,12 @@ class ErpNextClient {
   }
 }
 
-/** Build a per-user client. user must have erpnext_api_key + erpnext_api_secret + erpnext_company. */
-function forUser(user) {
-  return new ErpNextClient(user);
+/**
+ * Build a per-user client. user must have erpnext_api_key + erpnext_api_secret + erpnext_company.
+ * `signal` (optional) aborts every request the client makes (the scheduler passes deps.signal).
+ */
+function forUser(user, { signal = null } = {}) {
+  return new ErpNextClient(user, { signal });
 }
 
 module.exports = { forUser, ErpNextClient };

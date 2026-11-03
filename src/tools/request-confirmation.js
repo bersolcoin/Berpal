@@ -1,7 +1,8 @@
 const { ts } = require('../erp-sync/common');
-const { validateDraft, readinessError, applyDefaults } = require('./validate');
+const { validateDraft, readinessError, applyDefaults, stripProtected } = require('./validate');
 const { computeTotals, vatTreatment } = require('../erp-sync/taxes');
 const { getErp } = require('./context');
+const { buildCard } = require('./card');
 
 const definition = {
   name: 'request_confirmation',
@@ -11,10 +12,24 @@ const definition = {
 };
 
 // Fields that change what the card says. Flags and bookkeeping keys are left out.
+// receipt_media_id is deliberately IN the signature: swapping the receipt after the card must
+// invalidate it (save_transaction compares). outreach_preview is a separate consent flow.
 const IGNORED = new Set(['wallet_options', 'confirmation_pending', 'confirmation_sig', 'counterparty_contact_skipped',
-  'wallet_skipped', 'wallet_skip_requested_by_model', 'exchange_rate_source']);
+  'wallet_skipped', 'wallet_skip_requested_by_model', 'exchange_rate_source', 'outreach_preview']);
+/** What the user saw on the card, as a comparable string. save_transaction re-checks it. */
+// Ids the model may pass as "9" or 9: the same wallet / contact / receipt either way.
+const NUMERIC_IDS = new Set(['payment_account_id', 'transfer_destination_account_id', 'counterparty_id', 'receipt_media_id']);
+// Flags where false is NOT the same as absent (false = not claimable / VAT on top), so they keep
+// their false in the signature. Every other false is treated like an unset field.
+const FALSE_MEANINGFUL = new Set(['vat_claimable', 'tax_inclusive']);
+
 function cardSignature(draft) {
-  return JSON.stringify(Object.keys(draft).filter((k) => !IGNORED.has(k)).sort().map((k) => [k, draft[k]]));
+  const entries = Object.keys(draft)
+    .filter((k) => !IGNORED.has(k))
+    .map((k) => [k, NUMERIC_IDS.has(k) && draft[k] != null && draft[k] !== '' ? Number(draft[k]) : draft[k]])
+    .filter(([k, v]) => v != null && v !== '' && !(v === false && !FALSE_MEANINGFUL.has(k)))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return JSON.stringify(entries);
 }
 
 async function execute(args, ctx) {
@@ -29,10 +44,14 @@ async function execute(args, ctx) {
   const problem = await readinessError(ctx.user, ctx.draft, () => getErp(ctx));
   if (problem) return { ok: false, error: problem };
 
-  // Same card as one already sent on an earlier turn? Then the user has most likely just
-  // confirmed it, and the model should save rather than re-issue the card.
+  // Same card as the one the user saw on an earlier turn (confirmation_pending holds its
+  // signature)? Then they have most likely just confirmed it: save rather than re-issue.
+  // confirmation_sig is THIS turn's card; handle() promotes it to confirmation_pending only when
+  // the turn ends, so re-signing here never authorises a save in the same turn.
+  // The card first: if building it fails, nothing is armed (no signature, no button card).
+  const card = await buildCard(ctx.user, ctx.draft, () => getErp(ctx));
   const sig = cardSignature(ctx.draft);
-  const duplicate = ctx.draft.confirmation_pending && ctx.draft.confirmation_sig === sig;
+  const duplicate = ctx.draft.confirmation_pending === sig;
   ctx.draft.confirmation_sig = sig;
   ctx.confirmationRequested = true;
   console.log(`• [tools] [${ts()}] tool=request_confirmation user_id=${ctx.user.id}${duplicate ? ' (duplicate card)' : ''}`);
@@ -46,7 +65,8 @@ async function execute(args, ctx) {
   const taxed = t.vat > 0 || t.wht > 0;
   return {
     ok: true,
-    draft: ctx.draft,
+    card,
+    draft: stripProtected(ctx.draft),
     base_amount: Math.round(t.gross * rate * 100) / 100,
     ...(taxed ? {
       totals: {
@@ -57,8 +77,8 @@ async function execute(args, ctx) {
     } : {}),
     note: duplicate
       ? 'This exact card was ALREADY sent to the user earlier. If their latest message is a confirmation (yes/ok/confirm/save), call save_transaction NOW instead of re-sending it.'
-      : `Render the summary from \`draft\` exactly (use exchange_rate and base_amount as given${taxed ? '; Net/VAT/Gross/WHT lines from `totals`' : ''}). Then WAIT for the user — do not call save_transaction in this turn.`,
+      : 'Reply with card.lines VERBATIM, one per line, in this order (you may append " (assumed)" to the Amount line if the user named no currency), then a blank line and "Choose below or tell me what to fix." Nothing else. Then WAIT for the user — do not call save_transaction in this turn.',
   };
 }
 
-module.exports = { definition, execute };
+module.exports = { definition, execute, cardSignature };

@@ -1,4 +1,4 @@
-const { planInvoice, deliver, previewView, previewEntry, previewNotes, localToday } = require('../outreach/send-invoice');
+const { planInvoice, deliver, previewView, previewEntry, previewNotes, previewText, localToday } = require('../outreach/send-invoice');
 const gate = require('../outreach/gate');
 const { getErp } = require('./context');
 
@@ -38,6 +38,7 @@ async function execute(args, ctx) {
       ok: false,
       needs_confirmation: true,
       error: blocked,
+      preview_text: previewText([m]),
       preview: { ref: m.refs[0], ...previewEntry(m) },
       notes: previewNotes([m]),
     };

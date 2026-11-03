@@ -7,6 +7,7 @@ const chitchat = require('./chitchat');
 const log = require('./log');
 const mediaIntake = require('./media');
 const { downloadMedia } = require('./media/download');
+const { cleanText } = require('./media/vision');
 
 const REGISTRATION_LINK_REPLY =
   "Hi! It looks like your number isn't registered yet. Please sign up at https://your-app.com/signup to link your WhatsApp number to your account.";
@@ -38,6 +39,21 @@ async function extractContactShare(raw) {
     }
   }
   return null;
+}
+
+/**
+ * The "[contact shared] {json}" line the model reads. vCard fields are sender-controlled, so they
+ * get the same treatment as scan values (src/media/vision.js): each value goes through cleanText
+ * (brackets, braces, newlines, control/bidi characters stripped) and the line is JSON, so a value
+ * can't close the line, fake another one, or pose as another key. null if nothing is left.
+ */
+function contactLine(contact) {
+  const out = {};
+  for (const [key, label] of [['name', 'name'], ['phone', 'phone'], ['email', 'email'], ['org', 'organization']]) {
+    const v = cleanText(contact[key]);
+    if (v) out[label] = v;
+  }
+  return Object.keys(out).length ? `[contact shared] ${JSON.stringify(out)}` : null;
 }
 
 // Per-user FIFO: a receipt scan or transcription takes seconds, and a typed follow-up ("put it on
@@ -111,20 +127,17 @@ async function processOne({ from, body, raw = null }) {
 
     // If the user shared a WhatsApp contact (vCard attachment), parse it and inject into the message.
     const contact = await extractContactShare(raw);
-    if (contact) {
-      const parts = [];
-      if (contact.name) parts.push(`name: ${contact.name}`);
-      if (contact.phone) parts.push(`phone: ${contact.phone}`);
-      if (contact.email) parts.push(`email: ${contact.email}`);
-      if (contact.org) parts.push(`organization: ${contact.org}`);
-      const synthetic = `[contact shared — ${parts.join(', ')}]`;
+    const synthetic = contact && contactLine(contact);
+    if (synthetic) {
       augmentedBody = augmentedBody ? `${augmentedBody}\n${synthetic}` : synthetic;
-      console.log(`[whatsapp] vcard parsed: ${parts.join(', ')}`);
+      // Contact details are personal data: log which fields arrived and their lengths, never values.
+      const lengths = ['name', 'phone', 'email', 'org'].filter((k) => contact[k]).map((k) => `${k}=${String(contact[k]).length}`);
+      console.log(`[whatsapp] vcard parsed: ${lengths.join(' ')}`);
     }
 
     let result;
     try {
-      result = await conversation.handle(user, augmentedBody);
+      result = await conversation.handle(user, augmentedBody, { voiceTranscript: media.transcript || null });
     } catch (err) {
       console.error('[whatsapp] conversation error:', err);
       // The draft that would have carried these receipts never formed; don't keep the images.
@@ -133,7 +146,8 @@ async function processOne({ from, body, raw = null }) {
       return;
     }
 
-    const { text, isConfirmation } = result;
+    // handle() returns { text, isConfirmation }; tolerate a bare string so a reply is never lost.
+    const { text, isConfirmation } = typeof result === 'string' ? { text: result, isConfirmation: false } : result || {};
 
     await messageLog.logOutgoing(user.id, conv.id, text);
 
@@ -155,4 +169,4 @@ async function processOne({ from, body, raw = null }) {
   }
 }
 
-module.exports = { processIncomingMessage };
+module.exports = { processIncomingMessage, contactLine };

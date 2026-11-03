@@ -13,6 +13,9 @@
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 process.env.ERPNEXT_URL = 'http://erp.test';
+// Free-form outreach (sendMedia): no approved templates in the harness.
+delete process.env.TWILIO_INVOICE_CONTENT_SID;
+delete process.env.TWILIO_REMINDER_CONTENT_SID;
 
 if (!process.env.OPENAI_API_KEY) {
   console.error('OPENAI_API_KEY is not set. Add it to .env and rerun.');
@@ -42,12 +45,34 @@ toolsModule.executeTool = async (name, args, ctx) => {
   return result;
 };
 const conversation = require('../src/conversation');
+const store = require('../src/media/store');
+const twilioClient = require('../src/twilio-client');
 
 const FX_RATE = 32.5;
 const erp = new FakeErpNext();
 erp.install();
 const erpFetch = global.fetch;
-global.fetch = async (url, opts) => {
+
+// Binary ERPNext paths (same adapter as test/outreach.test.js): multipart bodies are held aside
+// for the upload_file hook; download_pdf returns base64 that arrayBuffer() decodes.
+const uploads = [];
+let pendingForm = null;
+erp.methods['frappe.utils.print_format.download_pdf'] = (u) => ({ __binary: Buffer.from(`%PDF-1.4 ${u.searchParams.get('name')}`).toString('base64') });
+erp.methods.upload_file = () => {
+  const form = pendingForm;
+  const filename = form.get('file_name');
+  uploads.push({ filename, doctype: form.get('doctype'), docname: form.get('docname'), is_private: form.get('is_private') });
+  return { message: { name: `FILE-${uploads.length}`, file_url: `/files/${filename}` } };
+};
+
+// Outbound WhatsApp to customers: recorded, never sent.
+const twilioSent = [];
+twilioClient.sendMedia = async (to, body, urls) => {
+  twilioSent.push({ to, body, urls });
+  return { sids: (urls && urls.length ? urls : [null]).map((_, i) => `SMharness${twilioSent.length}-${i}`), errors: [] };
+};
+
+global.fetch = async (url, opts = {}) => {
   if (String(url).includes('frankfurter')) {
     const u = new URL(url);
     const from = u.searchParams.get('from') || u.searchParams.get('base') || 'USD';
@@ -55,7 +80,10 @@ global.fetch = async (url, opts) => {
     const body = { amount: 1, base: from, date: TODAY, rates: { [to]: FX_RATE } };
     return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
   }
-  return erpFetch(url, opts);
+  const isForm = opts.body instanceof FormData;
+  pendingForm = isForm ? opts.body : null;
+  const res = await erpFetch(url, isForm ? { ...opts, body: undefined } : opts);
+  return { ...res, arrayBuffer: async () => Buffer.from(JSON.parse(await res.text()).__binary, 'base64') };
 };
 
 let user;
@@ -70,7 +98,8 @@ async function setup() {
      VALUES ('+66000', 'Harness', $1, 'k', 's', 'THB', 'THB', 'TH', $2, $2) RETURNING *`,
     [COMPANY, now]
   );
-  user = r.rows[0];
+  // VAT-registered (the VAT bill scenario needs it); UTC so the user's local date = the fake's TODAY.
+  user = (await db.query(`UPDATE users SET vat_registered = 1, timezone = 'UTC' WHERE id = $1 RETURNING *`, [r.rows[0].id])).rows[0];
 }
 
 // ── Scenario runner ─────────────────────────────────────────────────────
@@ -91,12 +120,13 @@ async function scenario(title, steps) {
   realLog(`\n■ ${title}`);
   let lastReply = '';
   for (const step of steps) {
-    const text = typeof step.say === 'function' ? step.say(lastReply) : step.say;
+    // step.voice: a voice note as whatsapp.js would pass it (transcript line + the voice flag).
+    const text = step.voice ? `[voice note] ${step.voice}` : typeof step.say === 'function' ? step.say(lastReply) : step.say;
     calls.length = 0;
     turnCount++;
     let result;
     try {
-      result = await conversation.handle(user, text);
+      result = await conversation.handle(user, text, step.voice ? { voiceTranscript: step.voice } : {});
     } catch (err) {
       realLog(`   › ${text}\n   ✖ handle() threw: ${err.message}`);
       failures.push(`${title}: handle threw`);
@@ -104,6 +134,7 @@ async function scenario(title, steps) {
     }
     if (typeof result === 'string') result = { text: result, isConfirmation: false };
     lastReply = result.text;
+    replies.push(result);
     const toolNames = calls.map((c) => c.name);
     const shown = calls.map((c) => (c.name === 'update_draft' ? `update_draft${JSON.stringify(c.args)}` : c.name));
     realLog(`   › ${text}`);
@@ -132,6 +163,10 @@ function assertEq(label, actual, expected) {
 }
 
 const yes = 'Confirm';
+// Every bot reply this run, for checks that don't care which turn produced it.
+const replies = [];
+const lastText = () => replies[replies.length - 1]?.text || '';
+const receiptCardSeen = () => replies.some((r) => r.isConfirmation && /\b185(\.00)?\b/.test(r.text) && /Starbucks|coffee|latte/i.test(r.text));
 const usdBank = () => erp.all('Account').find((a) => a.account_type === 'Bank' && a.account_currency === 'USD');
 
 (async () => {
@@ -231,6 +266,123 @@ const usdBank = () => erp.all('Account').find((a) => a.account_type === 'Bank' &
   await scenario('Cash position', [
     { say: 'how much money do I have?', expect: { tools: ['query_cash_bank_balance'], reply: /KBank/ } },
   ]);
+
+  // ── New-feature scenarios. Synthetic lines are injected directly: the harness bypasses
+  // whatsapp.js / src/media, so "[receipt scanned]" and "[voice note]" arrive as they would
+  // after intake. Every expense scenario runs after 'Cancel mid-draft' (its 12,850 total).
+
+  const receiptId = await store.saveBlob(user.id, { contentType: 'image/jpeg', filename: 'receipt.jpg', bytes: Buffer.from('fake-jpeg-bytes') });
+  const scanLine = `[receipt scanned] ${JSON.stringify({
+    media_id: receiptId, type: 'receipt', merchant: 'Starbucks', date: TODAY, total: 185, currency: 'THB',
+    vat_amount: 12.1, vat_rate: 7, vat_claimable: true, paid_by: 'cash', items: '2 lattes', confidence: 0.93,
+  })}`;
+  const pickCash = (r) => {
+    if (/Choose below/i.test(r)) return yes;
+    const line = r.split('\n').find((l) => /^\s*\d+\.\s*Cash\b/i.test(l));
+    return line ? line.trim().match(/^(\d+)/)[1] : 'Cash';
+  };
+  await scenario('Receipt photo → wallet → card with the scanned total → save attaches the image', [
+    { say: `coffee with client\n${scanLine}`, expect: { tools: ['update_draft'],
+      after: () => {
+        const upd = calls.filter((c) => c.name === 'update_draft');
+        check('receipt_media_id set from the scan line', upd.some((c) => Number(c.args.receipt_media_id) === receiptId),
+          JSON.stringify(upd.map((c) => c.args)));
+      } } },
+    { say: pickCash, expect: {} },
+    { say: (r) => (/Saved/.test(r) ? 'ok' : yes),
+      expect: { after: () => {} } },
+    { say: (r) => (/Saved/.test(r) ? 'thanks' : yes), expect: { after: () => {
+      const att = uploads.find((u) => u.filename === 'receipt.jpg');
+      check('receipt uploaded to ERPNext', !!att, JSON.stringify(uploads));
+      if (att) {
+        assertEq('attached to doctype', att.doctype, 'Journal Entry');
+        check('attached to a saved JE', !!erp.get('Journal Entry', att.docname), att.docname);
+        assertEq('private file', att.is_private, '1');
+      }
+    } } },
+  ]);
+  // The card turn is whichever turn sent the card; check its total separately so it's reported once.
+  check('receipt card showed the scanned total 185', receiptCardSeen(), 'no card with 185 THB');
+
+  await scenario('Voice note goes through the normal flow', [
+    { voice: 'paid 300 for taxi', expect: { tools: ['update_draft'],
+      after: (r) => check('echoes what it heard', /heard/i.test(r.text), r.text.split('\n')[0]) } },
+    { say: pickCash, expect: {} },
+    // Card → confirm; picker again → pick again; saved → done. One extra turn for a recovery.
+    { say: (r) => (/Saved/.test(r) ? 'ok' : pickCash(r)), expect: {} },
+    { say: (r) => (/Saved/.test(r) ? 'ok' : pickCash(r)), expect: {} },
+    { say: (r) => (/Saved/.test(r) ? 'thanks' : pickCash(r)), expect: { after: () => {
+      assertEq('Travel Expenses', erp.balanceOn('5216 - Travel Expenses - TC', TODAY), 300);
+    } } },
+  ]);
+
+  let siamCard = '';
+  await scenario('VAT-registered user: bill incl VAT with 3% WHT', [
+    { say: 'got a bill from Siam Services for 10,700 incl VAT with 3% WHT, PND53, due in 30 days',
+      expect: { tools: ['update_draft'], reply: /contact|number|phone|skip|10,700/i } },
+    { say: (r) => (/Choose below/.test(r) ? yes : 'skip'),
+      expect: { after: (r) => { if (r.isConfirmation) siamCard = r.text; } } },
+    { say: (r) => (/Saved/.test(r) ? 'ok' : yes),
+      expect: { after: (r) => { if (!siamCard && r.isConfirmation) siamCard = r.text; } } },
+    { say: (r) => (/Saved|Anytime|Done/.test(r) ? 'ok' : yes), expect: { after: () => {
+      const bill = erp.all('Purchase Invoice').find((b) => /Siam/.test(b.supplier));
+      check('Siam bill exists', !!bill);
+      if (bill) assertEq('bill outstanding (gross − WHT)', bill.outstanding_amount, 10400);
+    } } },
+  ]);
+  siamCard = [...replies].reverse().find((r) => r.isConfirmation && /Siam/.test(r.text))?.text || siamCard;
+  check('card shows Net 10,000', /Net:?\s*10,?000(\.00)?\b/.test(siamCard), siamCard);
+  check('card shows VAT 700', /VAT[^\n]*?700(\.00)?\b/.test(siamCard), siamCard);
+  check('card shows WHT 300', /WHT[^\n]*?\b300(\.00)?\b/.test(siamCard), siamCard);
+  check('card shows pay 10,400', /10,?400/.test(siamCard), siamCard);
+
+  // Jameel's WhatsApp number (outreach only uses this user's contacts) and the nickname the user
+  // calls him by — "sold PA2293 to Jameel" then matches the existing contact exactly.
+  await toolsModule.executeTool('create_contact', { name: 'Jameel Crest Gems', nickname: 'Jameel', phone: '+66 81 234 5678' },
+    { user, draft: {}, saved: null, cancelled: false, confirmationRequested: false });
+  const bin = (code) => erp.all('Bin').find((b) => String(b.item_code).startsWith(code));
+  await scenario('Stock: buy a coded stone, sell it, ask what is in stock', [
+    { say: 'bought ruby PA2293 from Gem Source for 50,000 THB cash', expect: { tools: ['update_draft'] } },
+    // New supplier → contact ask (skip); a re-ask of the supplier → answer; a card → confirm; a payment follow-up → decline.
+    { say: (r) => (/Choose below/.test(r) ? yes : /contact|number|phone/i.test(r) ? 'skip' : /who/i.test(r) ? 'Gem Source' : yes), expect: {} },
+    { say: (r) => (/Saved/.test(r) ? 'no thanks' : yes), expect: {} },
+    { say: (r) => (/Saved/.test(r) ? 'no thanks' : /Choose below/.test(r) ? yes : 'ok'), expect: { after: () => {
+      const b = bin('PA2293');
+      check('PA2293 received into stock', !!b && b.actual_qty === 1, JSON.stringify(b || null));
+    } } },
+    { say: 'sold PA2293 to Jameel for 80,000 USD net 30', expect: { tools: ['update_draft'] } },
+    { say: (r) => (/Choose below/.test(r) ? yes : /who/i.test(r) ? 'Jameel Crest Gems' : /which|\b1\./i.test(r) ? '1' : yes), expect: {} },
+    { say: (r) => (/Saved/.test(r) ? 'ok' : yes), expect: { after: () => {
+      const inv = erp.all('Sales Invoice').find((i) => i.currency === 'USD' && i.grand_total === 80000);
+      check('USD 80,000 sales invoice exists', !!inv);
+      if (inv) assertEq('update_stock', inv.update_stock, 1);
+      const b = bin('PA2293');
+      assertEq('PA2293 on hand after the sale', b ? b.actual_qty : null, 0);
+    } } },
+    { say: "what's in stock?", expect: { tools: ['query_stock'], confirmation: false } },
+  ]);
+
+  await scenario('Outreach: preview, yes, sent once; "send it again" needs its own yes', [
+    { say: 'send it to Jameel', expect: { tools: ['send_invoice'], confirmation: false,
+      after: () => {
+        check('preview only — nothing sent yet', twilioSent.length === 0, `${twilioSent.length} sent`);
+        check('preview names the number', /\+?66\s?81\s?234\s?5678|\+66812345678/.test(lastText()), lastText());
+      } } },
+    { say: 'yes', expect: { tools: ['send_invoice'], after: () => {
+      assertEq('Twilio messages after yes', twilioSent.length, 1);
+      if (twilioSent[0]) assertEq('sent to', twilioSent[0].to, 'whatsapp:+66812345678');
+    } } },
+    { say: 'send it again', expect: { after: () => assertEq('nothing re-sent without a new yes', twilioSent.length, 1) } },
+    { say: 'yes', expect: { after: () => assertEq('second send after its own yes', twilioSent.length, 2) } },
+  ]);
+
+  await scenario('Settings: digest time and VAT registration', [
+    { say: 'send my digest at 7:30', expect: { tools: ['set_schedule_preferences'], after: async () => {} } },
+    { say: "I'm VAT registered", expect: { tools: ['set_tax_settings'] } },
+  ]);
+  const prefs = (await db.query('SELECT job_prefs, vat_registered FROM users WHERE id = $1', [user.id])).rows[0];
+  check('digest time stored as 07:30', /"07:30"/.test(prefs.job_prefs || ''), prefs.job_prefs);
+  assertEq('vat_registered', Number(prefs.vat_registered), 1);
 
   realLog(`\n${turnCount} turns in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   if (failures.length) {

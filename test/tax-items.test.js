@@ -31,7 +31,8 @@ async function tool(name, args = {}, draft = {}) {
 async function confirmAndSave(draft) {
   const confirm = await tool('request_confirmation', {}, draft);
   assert.equal(confirm.result.ok, true, `request_confirmation: ${confirm.result.error}`);
-  const { result } = await tool('save_transaction', {}, draft);
+  // Next turn: handle() has stored the signature of the card the user saw in confirmation_pending.
+  const { result } = await tool('save_transaction', {}, { ...confirm.ctx.draft, confirmation_pending: confirm.ctx.draft.confirmation_sig });
   assert.equal(result.ok, true, `save_transaction: ${result.error}`);
   return { ...result, confirm: confirm.result };
 }

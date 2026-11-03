@@ -1,4 +1,5 @@
 const { ts } = require('../erp-sync/common');
+const { stripProtected } = require('./validate');
 
 const definition = {
   name: 'update_draft',
@@ -95,6 +96,10 @@ const definition = {
         type: 'number',
         description: 'When the user states what they actually transferred AFTER withholding ("sent 9,700 after 3%"): that figure. Leave amount unset — the gross is computed. 0 clears it (setting amount also clears it).',
       },
+      receipt_media_id: {
+        type: 'number',
+        description: 'media_id from the latest "[receipt scanned] {…}" line. Set it whenever the draft comes from a scan so the image is attached to the saved ERPNext document. Never invent one.',
+      },
       vat_claimable: {
         type: 'boolean',
         description: 'false when the purchase VAT cannot be claimed (abbreviated tax invoice ใบกำกับภาษีอย่างย่อ, plain receipt). Leave unset otherwise.',
@@ -111,6 +116,10 @@ const definition = {
             item_code: {
               type: 'string',
               description: 'Stock id ONLY when the user names one ("pa2293", "lot R-17", "SKU 4471") — makes it a tracked stock item. Never invent one; leave unset for services and untracked goods.',
+            },
+            force_item_code: {
+              type: 'boolean',
+              description: 'true only when the user explicitly said a code WITHOUT digits is their stock code (request_confirmation otherwise treats it as a description).',
             },
           },
           required: ['rate'],
@@ -138,6 +147,10 @@ const definition = {
         type: 'string',
         description: 'For payment transactions only: the ref of the invoice/bill/advance being settled, exactly as returned by query_open_invoices or save_transaction (e.g. "ACC-SINV-2026-00004").',
       },
+      settles_advance: {
+        type: 'boolean',
+        description: 'For a payment with NO parent_invoice_name: true only when the user says it settles an advance (money given/received earlier as an advance, not an invoice).',
+      },
       parent_invoice_doctype: {
         type: 'string',
         enum: ['Sales Invoice', 'Purchase Invoice', 'Journal Entry'],
@@ -160,15 +173,21 @@ const definition = {
 };
 
 async function execute(args, ctx) {
+  // Server-only keys never come from the model, even if it copies them from a tool result.
   // wallet_skipped is only ever set from the user's own 'skip' reply (conversation.js).
-  const { wallet_skipped, ...accepted } = args;
+  const { wallet_skipped, ...accepted } = stripProtected(args);
+  // The user picked a wallet by number this turn (conversation.js resolved it): that pick stands.
+  if (ctx.pickedWallet && accepted.payment_account_id !== undefined && Number(accepted.payment_account_id) !== Number(ctx.pickedWallet)) {
+    console.log(`• [tools] [${ts()}] update_draft: kept the user's wallet pick ${ctx.pickedWallet} over payment_account_id=${accepted.payment_account_id}`);
+    delete accepted.payment_account_id;
+  }
   if (wallet_skipped) accepted.wallet_skip_requested_by_model = true;
   ctx.draft = { ...ctx.draft, ...accepted };
   // A newly stated amount supersedes an earlier "paid N after WHT" — otherwise applyDefaults
   // would keep re-deriving the old figure over what the user just said.
   if (args.amount != null && args.paid_after_wht === undefined) delete ctx.draft.paid_after_wht;
   console.log(`• [tools] [${ts()}] tool=update_draft draft=${JSON.stringify(ctx.draft)}`);
-  return { ok: true, current_draft: ctx.draft };
+  return { ok: true, current_draft: stripProtected(ctx.draft) };
 }
 
 module.exports = { definition, execute };

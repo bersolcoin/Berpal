@@ -1,6 +1,6 @@
 const counterparties = require('../counterparties');
 const {
-  planReminders, deliver, previewView, previewEntry, previewNotes, listOpenReceivables, localToday, daysBetween,
+  planReminders, deliver, previewView, previewEntry, previewNotes, previewText, listOpenReceivables, localToday, daysBetween,
 } = require('../outreach/send-invoice');
 const gate = require('../outreach/gate');
 const { getErp } = require('./context');
@@ -75,6 +75,7 @@ async function execute(args, ctx) {
       ok: false,
       needs_confirmation: true,
       error: blocked,
+      preview_text: previewText(messages),
       previews: messages.map(previewEntry),
       notes: previewNotes(messages),
       ...cannot,

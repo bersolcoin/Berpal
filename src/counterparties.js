@@ -23,18 +23,29 @@ function rowToContact(row) {
   };
 }
 
-async function upsert(user, { name, nickname = null, phone = null, email = null, customer = null, supplier = null }) {
+/**
+ * Insert or update a cache row by (owner, name).
+ *   source 'user' (default) — the user just stated these values (create_contact, a draft): a new
+ *     value replaces the stored one, a null keeps it.
+ *   source 'erp' — pulled from ERPNext (syncFromErp): every column keeps what the row already has
+ *     and only fills a blank. Customers/Suppliers are shared across tenants, so an ERPNext record
+ *     must never replace this user's own data or re-link an existing contact.
+ */
+async function upsert(user, { name, nickname = null, phone = null, email = null, customer = null, supplier = null }, { source = 'user' } = {}) {
   const now = new Date().toISOString();
+  const keep = (col) => (source === 'erp'
+    ? `COALESCE(counterparty_cache.${col}, EXCLUDED.${col})`
+    : `COALESCE(EXCLUDED.${col}, counterparty_cache.${col})`);
   const r = await query(
     `INSERT INTO counterparty_cache
        (owner_user_id, name, nickname, phone, email, erpnext_customer, erpnext_supplier, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
      ON CONFLICT (owner_user_id, name) DO UPDATE SET
-       nickname = COALESCE(EXCLUDED.nickname, counterparty_cache.nickname),
-       phone = COALESCE(EXCLUDED.phone, counterparty_cache.phone),
-       email = COALESCE(EXCLUDED.email, counterparty_cache.email),
-       erpnext_customer = COALESCE(EXCLUDED.erpnext_customer, counterparty_cache.erpnext_customer),
-       erpnext_supplier = COALESCE(EXCLUDED.erpnext_supplier, counterparty_cache.erpnext_supplier),
+       nickname = ${keep('nickname')},
+       phone = ${keep('phone')},
+       email = ${keep('email')},
+       erpnext_customer = ${keep('erpnext_customer')},
+       erpnext_supplier = ${keep('erpnext_supplier')},
        updated_at = EXCLUDED.updated_at
      RETURNING *`,
     [user.id, name, nickname, phone, email, customer, supplier, now]
@@ -69,10 +80,12 @@ async function syncFromErp(user, erp, term) {
     erp.listSuppliers({ filters: [['supplier_name', 'like', like]], limit: 20 }),
   ]);
   for (const c of customers.data || []) {
-    await upsert(user, { name: c.customer_name, phone: c.mobile_no || null, customer: c.name });
+    // No phone/email from ERPNext: Customers are shared across tenants, and outreach sends to
+    // the cache phone — it must only ever hold what this user entered.
+    await upsert(user, { name: c.customer_name, customer: c.name }, { source: 'erp' });
   }
   for (const s of suppliers.data || []) {
-    await upsert(user, { name: s.supplier_name, phone: s.mobile_no || null, supplier: s.name });
+    await upsert(user, { name: s.supplier_name, supplier: s.name }, { source: 'erp' });
   }
 }
 
@@ -165,4 +178,4 @@ async function resolveParty(user, erp, draft, role) {
   return erpName;
 }
 
-module.exports = { search, createContact, getById, findByName, forDraft, resolveParty, rowToContact };
+module.exports = { search, createContact, getById, findByName, forDraft, resolveParty, rowToContact, upsert, syncFromErp };

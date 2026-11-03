@@ -787,3 +787,39 @@ test('digest counts stay right with > 50 open items', async () => {
   assert.equal(lines[d + 1], '- 2 items, ask me for the list');
   assert.ok(lines.length <= 14);
 });
+
+test('scheduler: each run gets its own ERPNext client carrying the run\'s timeout signal', async () => {
+  const seen = [];
+  const job = { name: 'erpsignal', defaultTime: '08:00', run: async (user, { erp, signal }) => { seen.push({ user: user.id, erp, signal }); } };
+  const erpFor = (user, opts) => ({ forUser: user.id, opts });
+  const u = await makeUser('+66999');
+  await tick('2026-11-03T01:10:00Z', [job], [u], { erpFor });
+  const mine = seen.find((s) => s.user === u.id);
+  assert.ok(mine, 'job ran for the user');
+  assert.ok(mine.signal instanceof AbortSignal);
+  assert.equal(mine.erp.opts.signal, mine.signal, 'erpFor(user, { signal }) got this run\'s deps.signal');
+});
+
+test('erpnext.forUser(user, { signal }): the default signal reaches every request', async () => {
+  const ac = new AbortController();
+  const client = erpnext.forUser({ erpnext_api_key: 'k', erpnext_api_secret: 's', erpnext_company: COMPANY }, { signal: ac.signal });
+  const real = global.fetch;
+  const signals = [];
+  global.fetch = async (url, opts) => {
+    signals.push(opts.signal);
+    return { ok: true, status: 200, text: async () => '{"data":[]}' };
+  };
+  try {
+    await client.listResource('Customer');
+    assert.equal(signals[0].aborted, false);
+    ac.abort(new Error('timeout'));
+    await client.listResource('Customer');
+    assert.equal(signals[1].aborted, true, 'an aborted job signal aborts later ERPNext calls');
+    // A per-call signal still works alongside it.
+    const plain = erpnext.forUser({ erpnext_api_key: 'k', erpnext_api_secret: 's' });
+    await plain.listResource('Customer');
+    assert.equal(signals[2].aborted, false, 'no default signal → only the request timeout');
+  } finally {
+    global.fetch = real;
+  }
+});
