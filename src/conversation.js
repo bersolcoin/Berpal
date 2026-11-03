@@ -2,6 +2,7 @@ const OpenAI = require('openai');
 const { query } = require('./db');
 const { TOOLS, executeTool } = require('./tools');
 const { ts } = require('./erp-sync/common');
+const promptSections = require('./prompt');
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -563,6 +564,8 @@ CONTEXT:
 - User's default currency: ${user.default_currency}
 - User's country: ${user.country}
 - Default tax rate: ${user.default_tax_rate ?? 'none'}
+
+${promptSections.render({ user, draft, today })}
 
 CURRENT DRAFT (in progress):
 ${draftJson}`;

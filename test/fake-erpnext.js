@@ -76,6 +76,11 @@ class FakeErpNext {
     this.docs = new Map();
     this.counters = {};
     this.calls = [];
+    // Extension points for feature tests: extra /api/method handlers and extra doctypes.
+    //   erp.methods['frappe.utils.print_format.download_pdf'] = (url, body) => ({...})
+    //   erp.createHandlers['Sales Taxes and Charges Template'] = (d) => doc
+    this.methods = {};
+    this.createHandlers = {};
     for (const a of seedAccounts()) this._put('Account', a);
   }
 
@@ -290,7 +295,9 @@ class FakeErpNext {
       case 'Purchase Invoice': return this.createInvoice(doctype, d);
       case 'Journal Entry': return this.createJournalEntry(d);
       case 'Payment Entry': return this.createPaymentEntry(d);
-      default: throw new ErpError(417, `fake-erpnext: create ${doctype} not supported`);
+      default:
+        if (this.createHandlers[doctype]) return this._put(doctype, this.createHandlers[doctype](d));
+        throw new ErpError(417, `fake-erpnext: create ${doctype} not supported`);
     }
   }
 
@@ -305,6 +312,7 @@ class FakeErpNext {
     const u = new URL(url);
     const parts = u.pathname.split('/').filter(Boolean).map(decodeURIComponent);
     if (parts[0] === 'api' && parts[1] === 'method') {
+      if (this.methods[parts[2]]) return this.methods[parts[2]](u, body);
       if (parts[2] === 'erpnext.accounts.utils.get_balance_on') {
         return { message: this.balanceOn(u.searchParams.get('account'), u.searchParams.get('date')) };
       }

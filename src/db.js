@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const { Pool } = require('pg');
 
 let _pool = null;
@@ -192,8 +194,18 @@ CREATE TABLE IF NOT EXISTS otp_attempts (
 CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_attempts(phone);
 `;
 
+/**
+ * Feature migrations live in src/migrations/*.sql, applied in filename order after the core
+ * schema. Each file must be idempotent (CREATE TABLE IF NOT EXISTS, ADD COLUMN IF NOT EXISTS …)
+ * because this runs on every boot.
+ */
 async function migrate() {
   await query(SCHEMA);
+  const dir = path.join(__dirname, 'migrations');
+  if (!fs.existsSync(dir)) return;
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) {
+    await query(fs.readFileSync(path.join(dir, f), 'utf8'));
+  }
 }
 
 /**
