@@ -10,7 +10,7 @@
  *   parent_code 2100 → Credit Card  (liability leaf; ERPNext has no card type, so it's tracked here)
  */
 const { query } = require('./db');
-const { ts, friendlyAccountName, resolveErpAccount } = require('./erp-sync/common');
+const { ts, resolveErpAccount } = require('./erp-sync/common');
 
 const PARENT_CODE_TO_TYPE = { '1000': 'Cash', '1100': 'Bank', '2100': 'Credit Card' };
 const TYPE_TO_PARENT_CODE = { Cash: '1000', Bank: '1100', 'Credit Card': '2100' };
@@ -61,7 +61,9 @@ async function syncFromErp(user, erp) {
   const live = r.data || [];
   for (const a of live) {
     await upsert(user, {
-      name: friendlyAccountName(a.account_name),
+      // account_name has no company suffix, so don't run friendlyAccountName over it:
+      // it would strip a trailing currency such as the "-USD" in "DBS-USD".
+      name: String(a.account_name).trim(),
       accountType: a.account_type,
       currency: a.account_currency,
       erpName: a.name,

@@ -9,6 +9,9 @@ node_modules/
 npm-debug.log*
 *.log
 
+# ERPNext smoke-test report (scripts/smoke-erpnext.js)
+smoke-report.json
+
 # OS / editor cruft
 .DS_Store
 .vscode/

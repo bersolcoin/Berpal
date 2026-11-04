@@ -110,6 +110,15 @@ test('wallets: ERPNext cash account is listed; create is idempotent', async () =
   assert.deepEqual(result.accounts.map((w) => w.name).sort(), ['BBL Savings', 'Cash']);
 });
 
+test('a wallet whose name ends in a currency keeps its full name and is listed once', async () => {
+  let { result } = await tool('create_user_account', { name: 'DBS-USD', parent_code: '1100', currency: 'USD' });
+  assert.equal(result.existed, false);
+  ({ result } = await tool('list_user_accounts', { currency: 'USD' }));
+  assert.deepEqual(result.accounts.map((w) => w.name).sort(), ['DBS USD', 'DBS-USD']);
+  ({ result } = await tool('create_user_account', { name: 'DBS-USD', parent_code: '1100', currency: 'USD' }));
+  assert.equal(result.existed, true, 'second create must find the existing wallet');
+});
+
 test('opening balance → JE against Opening Balance Equity', async () => {
   const r = await confirmAndSave({
     transaction_type: 'cash', direction: 'income', amount: 50000, currency: 'THB',
@@ -316,7 +325,7 @@ test('transaction summary by category and month', async () => {
 test('cash/bank balance lists every wallet with live balances', async () => {
   const { result } = await tool('query_cash_bank_balance');
   const bal = Object.fromEntries(result.accounts.map((a) => [a.name, a.balance]));
-  assert.deepEqual(bal, { AmEx: -1200, 'BBL Savings': 46200, Cash: 4150, 'DBS USD': 55000 });
+  assert.deepEqual(bal, { AmEx: -1200, 'BBL Savings': 46200, Cash: 4150, 'DBS USD': 55000, 'DBS-USD': 0 });
   assert.deepEqual(result.totals_by_currency, { THB: 49150, USD: 55000 });
 });
 

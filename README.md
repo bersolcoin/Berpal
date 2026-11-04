@@ -159,6 +159,8 @@ scripts/
   reset-conversations.js    clear all drafts + chat history (npm run reset)
   ping-db.js                standalone Postgres connectivity test
   show-inv.js <name>        pretty-print an ERPNext Sales Invoice
+  smoke-erpnext.js          end-to-end smoke test against a real ERPNext Company (npm run smoke:erpnext)
+  lib/smoke-helpers.js      its pure helpers (arg parsing, checks, report), unit-tested
 
 test/
   fake-erpnext.js           in-memory ERPNext that enforces the validations the bot relies on
@@ -191,6 +193,22 @@ on first bill/advance-received. Invoices are referenced by their ERPNext name
 
 - `npm test` — all unit/flow tests (node:test). No network: ERPNext is `test/fake-erpnext.js`, Postgres is pg-mem, OpenAI and Twilio are stubbed.
 - `npm run test:llm` — `test/llm-harness.js` drives scripted WhatsApp conversations through `conversation.handle()` with the **real** OpenAI model (needs `OPENAI_API_KEY` in `.env`; a few cents; 2–4 minutes). ERPNext, Postgres, FX and Twilio stay in memory. Synthetic `[receipt scanned]` / `[voice note]` lines are injected directly (the harness bypasses `whatsapp.js`). `VERBOSE=1` also prints the bot's tool logs. Model output isn't deterministic: treat a failure as "read the transcript", not a red build.
+
+### Verifying against a real ERPNext
+
+`npm run smoke:erpnext` (`scripts/smoke-erpnext.js`) runs the bot's own code paths — `wallets.create`, `saveDraft` from `src/erp-sync`, the `src/erp-query` modules, `erp.getPdf` / `uploadFile` — against a **real** ERPNext Company, then fetches every posted document and its GL Entries and checks them (the same figures `test/flows.test.js` and `test/tax-items.test.js` assert against the fake). It reads `ERPNEXT_URL`, `ERPNEXT_API_KEY`, `ERPNEXT_API_SECRET` and `ERPNEXT_COMPANY_DEFAULT` from `.env` (`--company "Name"` overrides); Postgres isn't needed (the cache tables live in pg-mem for the run).
+
+**Use a dedicated test Company** (e.g. "Smoke Test Co", THB, "Standard with Numbers" chart). The flows refuse to run against a Company that has GL Entries the smoke test didn't create unless you pass `--allow-live`. Everything the run creates is named `SMOKE-…` (stock items become `SMOKEPA2293-<abbr>`, following the bot's item-code rule).
+
+```bash
+npm run smoke:erpnext -- --preflight          # setup checks only: PASS/WARN/FAIL + a fix hint per line
+npm run smoke:erpnext -- --preflight --fix    # also create what the bot would create anyway (tax and per-currency accounts, GEN items, Products group, Stores warehouse)
+npm run smoke:erpnext                         # preflight + flows a–l, then asks whether to clean up (TTY)
+npm run smoke:erpnext -- --cleanup            # … and cleans up without asking
+npm run smoke:erpnext -- --cleanup-only       # cancel + delete what the last run's report lists
+```
+
+Each step prints ✔ / ✖ (expected vs actual) or ⚠ for soft checks, and every ERPNext error with its server message — those messages are the point of the run. A JSON report goes to `--report` (default `./smoke-report.json`, git-ignored); the exit code is 1 when any preflight line FAILs or any step/check fails, 2 when refused. `--fix` never changes Company defaults or Settings. Cleanup cancels then deletes payments, invoices, JEs, files, items, parties and wallet accounts in that order; ERPNext keeps cancelled ledger rows, so the SMOKE- masters can only be deleted when Accounts Settings → "Delete Accounting and Stock Ledger Entries on deletion of Transaction" is on (a test-site-only setting; preflight reports it). Otherwise leave them — a re-run reuses them.
 
 ## Known limitations
 

@@ -9,7 +9,8 @@
     "create-template": "node scripts/create-confirmation-template.js",
     "reset": "node scripts/reset-conversations.js",
     "test": "node --test test/",
-    "test:llm": "node test/llm-harness.js"
+    "test:llm": "node test/llm-harness.js",
+    "smoke:erpnext": "node scripts/smoke-erpnext.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
