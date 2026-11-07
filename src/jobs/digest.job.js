@@ -16,6 +16,7 @@ const { getCashBankBalance } = require('../erp-query/cash-balance');
 const { getOpenInvoices } = require('../erp-query/open-invoices');
 const { getTransactionSummary } = require('../erp-query/transaction-summary');
 const { companyCurrency, round2 } = require('../erp-sync/common');
+const review = require('../trust/review');
 const { localClock, addDays } = require('./index');
 
 const MAX_WALLETS = 4;
@@ -33,6 +34,26 @@ function headerDate(isoDate) {
   // Format the local calendar date itself (noon UTC can't roll over to another day).
   return new Intl.DateTimeFormat('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' })
     .format(new Date(`${isoDate}T12:00:00Z`));
+}
+function shortDate(isoDate) {
+  return new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' })
+    .format(new Date(`${isoDate}T12:00:00Z`));
+}
+
+/**
+ * "Awaiting accountant review: 3 (oldest 3 Nov)", or null. A reminder, not news: it only rides
+ * along on a digest that has something else to say (buildDigest). A Postgres hiccup must not
+ * cost the digest, so a failure here is just no line.
+ */
+async function reviewLine(user, now) {
+  try {
+    const { count, oldest } = await review.pendingSummary(user.id, { now });
+    if (!count) return null;
+    return `Awaiting accountant review: ${count}${oldest ? ` (oldest ${shortDate(oldest)})` : ''}`;
+  } catch (err) {
+    console.error(`[digest] review summary failed (user ${user.id}):`, err.message);
+    return null;
+  }
 }
 
 /** "DBS USD 5.00", not "DBS USD USD 5.00", when the name already says the currency. */
@@ -119,7 +140,9 @@ async function buildDigest(user, erp, { now = new Date(), clock = null } = {}) {
 
   const body = sections.filter((s) => s.length);
   if (body.length === 0) return null;
-  return [`Your books, ${headerDate(date)}:`, ...body.flat()].join('\n');
+  // Trailing, and only once there is a digest to append it to: the queue alone is no reason to send.
+  const pending = await reviewLine(user, now);
+  return [`Your books, ${headerDate(date)}:`, ...body.flat(), ...(pending ? [pending] : [])].join('\n');
 }
 
 /**

@@ -275,14 +275,14 @@ test('markPosted: review Comment on the ERPNext doc (with the card warnings) and
   assert.equal(comment.content, `${review.REVIEW_NOTE}<br>Warnings shown to the user:<br>- ${line}`);
   assert.equal(review.commentText(['<b>x</b> & "y"']), `${review.REVIEW_NOTE}<br>Warnings shown to the user:<br>- &lt;b&gt;x&lt;/b&gt; &amp; &quot;y&quot;`);
 
-  const pending = await review.listPending(user.id);
+  const pending = (await review.listPending(user.id)).rows;
   assert.deepEqual(pending.map((p) => [p.erpnext_name, p.warnings]), [
     [plain.saved.erpnext_name, []],
     [dup.saved.erpnext_name, [line]],
   ]);
   const rows = await db.query("SELECT review_status FROM trust_fingerprints WHERE user_id = $1", [user.id]);
   assert.deepEqual(rows.rows.map((r) => r.review_status), ['pending', 'pending']);
-  assert.deepEqual(await review.listPending((await newUser()).id), [], 'scoped to the user');
+  assert.deepEqual(await review.listPending((await newUser()).id), { total: 0, rows: [] }, 'scoped to the user');
 });
 
 test('save still succeeds when the review Comment fails', async () => {
@@ -300,7 +300,7 @@ test('save still succeeds when the review Comment fails', async () => {
   }
   assert.ok(erp.get('Journal Entry', saved.erpnext_name), 'document posted');
   assert.equal(erp.all('Comment').some((c) => c.reference_name === saved.erpnext_name), false);
-  assert.deepEqual((await review.listPending(user.id)).map((p) => p.erpnext_name), [saved.erpnext_name]);
+  assert.deepEqual((await review.listPending(user.id)).rows.map((p) => p.erpnext_name), [saved.erpnext_name]);
 });
 
 // ── Warnings and the confirmation signature ──────────────────────────

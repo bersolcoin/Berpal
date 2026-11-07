@@ -113,7 +113,7 @@ function check(label, ok, detail = '') {
 
 /**
  * step: { say, expect: { tools?: [names that must be called], noTools?: true,
- *         confirmation?: bool, reply?: RegExp, after?: () => void } }
+ *         confirmation?: bool, reply?: RegExp, after?: (result) => void | Promise<void> } }
  * `say` may be a function of the previous reply, for answering pickers.
  */
 async function scenario(title, steps) {
@@ -141,7 +141,7 @@ async function scenario(title, steps) {
     realLog(`     tools: ${shown.length ? shown.join(' → ') : '(none)'}${result.isConfirmation ? '   [confirmation card]' : ''}`);
     realLog(`     « ${result.text.replace(/\n/g, '\n       ')}`);
     const failed = calls.filter((c) => c.result && c.result.ok === false);
-    for (const f of failed) realLog(`     ⚠ ${f.name} returned error: ${f.result.error}`);
+    for (const f of failed) realLog(`     ⚠ ${f.name} returned error: ${f.result.error || f.result.reason}`);
 
     const e = step.expect || {};
     for (const t of e.tools || []) check(`called ${t}`, toolNames.includes(t), `got ${toolNames.join(', ') || 'none'}`);
@@ -149,8 +149,10 @@ async function scenario(title, steps) {
     if (e.confirmation != null) check(`confirmation card ${e.confirmation ? 'sent' : 'not sent'}`, result.isConfirmation === e.confirmation);
     if (e.reply) check(`reply matches ${e.reply}`, e.reply.test(result.text));
     if (e.after) {
+      // Awaited: an async `after` (one that reads Postgres) must land its checks before the run
+      // is scored, and a throw inside it must count as a failure rather than an unhandled rejection.
       try {
-        e.after(result);
+        await e.after(result);
       } catch (err) {
         check(err.message, false);
       }
@@ -383,6 +385,35 @@ const usdBank = () => erp.all('Account').find((a) => a.account_type === 'Bank' &
   const prefs = (await db.query('SELECT job_prefs, vat_registered FROM users WHERE id = $1', [user.id])).rows[0];
   check('digest time stored as 07:30', /"07:30"/.test(prefs.job_prefs || ''), prefs.job_prefs);
   assertEq('vat_registered', Number(prefs.vat_registered), 1);
+
+  // Every document saved above is awaiting review; the first ACC-JV in the queue is the one we name.
+  const queue = async () => (await db.query(
+    "SELECT erpnext_name FROM trust_fingerprints WHERE user_id = $1 AND review_status = 'pending' ORDER BY transaction_date, id", [user.id]
+  )).rows.map((r) => r.erpnext_name);
+  const firstJv = (await queue()).find((n) => /^ACC-JV-/.test(n)) || '';
+  await scenario('Accountant review queue: list, mark one, mark all (count guard)', [
+    { say: "what's waiting for my accountant?", expect: { tools: ['list_review_queue'], confirmation: false,
+      reply: new RegExp(firstJv.replace(/[-]/g, '\\-') || 'ACC-'),
+      after: (r) => check('no ⚠ on items without warnings, one line per item', !/⚠.*⚠/.test(r.text.split('\n').find((l) => l.includes(firstJv)) || ''), r.text) } },
+    { say: `mark ${firstJv} reviewed`, expect: { tools: ['mark_reviewed'], confirmation: false, reply: new RegExp(firstJv.replace(/[-]/g, '\\-')),
+      after: async () => {
+        const row = (await db.query('SELECT review_status, reviewed_by FROM trust_fingerprints WHERE user_id = $1 AND erpnext_name = $2', [user.id, firstJv])).rows[0];
+        assertEq(`${firstJv} status`, row && row.review_status, 'reviewed');
+        assertEq('reviewer label', row && row.reviewed_by, 'owner via whatsapp');
+      } } },
+    // "all reviewed" right after the list: expected_count must be the total it just saw (the list is stale by one).
+    { say: 'the accountant has checked everything, all reviewed', expect: { tools: ['mark_reviewed'], confirmation: false,
+      after: async (r) => {
+        const mr = calls.filter((c) => c.name === 'mark_reviewed');
+        check('mark_reviewed(all=true, expected_count)', mr.some((c) => c.args.all === true && Number.isFinite(Number(c.args.expected_count))), JSON.stringify(mr.map((c) => c.args)));
+        // Either the count matched and the queue is empty, or the guard tripped and the bot showed the
+        // current queue (count_changed carries it) and asked with the new total.
+        const left = await queue();
+        const asked = new RegExp(`all ${left.length}[^?]*\\?`, 'i').test(r.text);
+        const shown = left.every((name) => r.text.includes(name));
+        check('queue empty, or re-shown and asked with the new total', left.length === 0 || (asked && shown), `left ${left.length}; asked ${asked}; shown ${shown}`);
+      } } },
+  ]);
 
   realLog(`\n${turnCount} turns in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   if (failures.length) {
