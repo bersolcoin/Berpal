@@ -6,7 +6,7 @@ WhatsApp-first bookkeeping bot for small businesses. Users log transactions in p
 
 ## Architecture
 
-WhatsApp → Twilio webhook → Express (`server.js`, signature-checked) → `src/whatsapp.js` (per-sender queue, chitchat short-circuit, media intake: photos/PDFs → vision scan line, voice notes → transcript, vCards → contact line) → conversation engine (`src/conversation.js`: system prompt + `src/prompt/*` sections, GPT-4o-mini tool loop) → tools (`src/tools/*`) → write side: per-doctype handlers in `src/erp-sync/` POST to ERPNext via `src/erpnext.js`; read side: `src/erp-query/` reads live balances, invoices and stock. Outbound messages to customers go through `src/outreach/` behind a preview → yes gate; scheduled sends (digest, reminders) run from `src/jobs/scheduler.js` inside the same process. Postgres holds identity, conversation state, lookup caches, receipt images awaiting attachment, and job/outreach logs only — **no accounting truth lives in Postgres** (that's all in ERPNext). Multi-tenant model: one shared ERPNext instance with N Companies, one Company per user.
+WhatsApp (Twilio) or LINE → that channel's signed webhook (`src/channels/twilio.js` at `/webhook`, `src/channels/line.js` at `/line/webhook`; mounted by `server.js` for every configured channel) → one normalised inbound message → `src/whatsapp.js` (per-sender queue, onboarding for unknown addresses, chitchat short-circuit, media intake: photos/PDFs → vision scan line, voice notes → transcript, shared contacts → contact line) → conversation engine (`src/conversation.js`: system prompt + `src/prompt/*` sections, GPT-4o-mini tool loop) → tools (`src/tools/*`) → write side: per-doctype handlers in `src/erp-sync/` POST to ERPNext via `src/erpnext.js`; read side: `src/erp-query/` reads live balances, invoices and stock. Every reply goes back over the channel the user's address belongs to (`src/channels/address.js`: `+66…` is WhatsApp, `line:U…` is LINE; `src/channels/index.js` holds the contract). Outbound messages to customers go through `src/outreach/` behind a preview → yes gate, always over WhatsApp (customers are reached by phone number, whatever channel the owner uses); scheduled sends (digest, reminders) run from `src/jobs/scheduler.js` inside the same process. Postgres holds identity, conversation state, lookup caches, receipt images awaiting attachment, and job/outreach logs only — **no accounting truth lives in Postgres** (that's all in ERPNext). Multi-tenant model: one shared ERPNext instance with N Companies, one Company per user.
 
 Nothing is posted without a confirmation card. `request_confirmation` builds the card's lines on the server (`src/tools/card.js`; the model copies them verbatim) and signs the draft; when that turn ends, `handle()` stores the signature of the card the user saw in `confirmation_pending`. `save_transaction` on a later turn refuses unless the draft still matches it — re-signing in the save turn doesn't count. The only card-less save is the second half of the missed-sale flow: the back-dated invoice is carded and confirmed like any other draft, and in that same confirm turn the payment that settles it is chained without a second card. If OpenAI fails after something was saved or cancelled in a turn, the draft is reset and the reply says what was saved, so a repeated "yes" can't post twice. Server-only draft keys (`confirmation_*`, `wallet_options`, `outreach_preview`) can't be set by the model. When the bot's last reply listed wallets by number and the user answers with just that number, the server resolves it to the wallet shown on that line (matched by name), and the model can't swap it in that turn; any other bare number is left to the model.
 
@@ -92,7 +92,7 @@ The target Company needs (most standard charts already have these):
 
 ## Onboarding
 
-A WhatsApp number with no `users` row goes through a short signup in chat (`src/onboarding/`). It is a fixed state machine — no LLM call — so an unknown number costs a few queries and the replies are predictable.
+A WhatsApp number or LINE user with no `users` row goes through a short signup in chat (`src/onboarding/`). It is a fixed state machine — no LLM call — so an unknown number costs a few queries and the replies are predictable.
 
 1. business name (2–80 characters, at least one letter or digit, no `<` `>` — ERPNext refuses them in a Company name) → 2. country (TH default; `TH/MY/SG/ID/VN/PH/AU` or the name; sets default + reporting currency and timezone) → 3. VAT-registered yes/no → 4. tax ID (Thai: 13 digits with the official check digit, dashes/spaces allowed; elsewhere 5–20 characters) or `skip` → 5. accountant name and phone (optional, `skip`; the phone is normalised to `+<country code>…`) → 6. privacy notice (PDPA: what is stored, where, why, how to delete; the receipt retention it states is `RETENTION_DAYS` from `src/media/store.js`), answered with `I agree` / `agree` / `ตกลง`. A refusal (`no`, `I don't agree`, `ไม่ตกลง` …) ends the signup and deletes the session; anything else re-asks.
 
@@ -127,6 +127,26 @@ WhatsApp delivers a free-form business message only if the recipient messaged yo
 
 Without a content SID: the digest is sent free-form only if the user wrote in the last 23h (otherwise the run is `skipped`); invoices and reminders go free-form (text + up to 3 PDFs + QR, one attachment per WhatsApp message) and the preview warns about the window. The PromptPay QR always follows as a free-form media message. Variables can't contain newlines or tabs (flattened to spaces). In the sandbox the customer must also have joined the sandbox.
 
+### LINE
+
+LINE is an optional second channel for the bot's own users (`src/channels/line.js`); a LINE user is stored as `line:<userId>` (LINE never shares a phone number). Customer outreach (invoices, reminders) still goes out over WhatsApp, since customers are reached by phone number.
+
+Setup, in the [LINE Developers console](https://developers.line.biz/console/):
+
+1. Create a provider and a **Messaging API** channel (this also creates a LINE Official Account).
+2. **Basic settings → Channel secret** → `LINE_CHANNEL_SECRET`. **Messaging API → Channel access token (long-lived)** → issue → `LINE_CHANNEL_ACCESS_TOKEN`. Set both or neither; one alone stops the boot.
+3. **Messaging API → Webhook URL** = `<PUBLIC_BASE_URL>/line/webhook`, turn on **Use webhook**, then press **Verify** (LINE posts a signed body with no events; the bot answers 200).
+4. In the LINE Official Account Manager (**Response settings**), turn **off** auto-reply messages and the greeting message, so LINE's canned replies don't answer alongside the bot. Adding the bot as a friend counts as a "hi", which starts onboarding; unblocking it does not (the user has talked to the bot before).
+
+Every webhook must carry a valid `X-Line-Signature` (base64 HMAC-SHA256 of the raw body with the channel secret; 403 otherwise; bodies over 1 MB get 413). The bot answers 200 before processing, so LINE's optional webhook redelivery (off by default) rarely triggers. `GET /health` adds a `line` check (`GET https://api.line.me/v2/bot/info` with the access token) when both variables are set.
+
+Limits:
+
+- **Reply vs push.** A reply token is single-use and LINE only guarantees it for one minute; the bot replies with it when it answers within 50 s, else it **pushes** (also when LINE answers "Invalid reply token"). Pushes (and everything the bot starts: digests, "books are ready") count against the Official Account's monthly message quota, which is small on the free plan; past it, pushes fail until the next month or a plan upgrade.
+- No message templates or 24-hour window, and no delivery receipts: a message LINE accepted is assumed delivered.
+- No contact sharing, no captions on photos (send the photo, then type the details), no location. A video gets the "can't read that kind of file" reply. Photos, voice messages and PDF / JPEG / PNG files are read; the bot can't send files, so invoice PDFs it sends over LINE arrive as links. Long replies are split into 5,000-character messages. Stickers are ignored. Only 1:1 chats; groups and rooms are ignored.
+- Confirmation cards use LINE quick-reply buttons (✅ Confirm / ✏️ Edit / ❌ Reject) that send `confirm` / `edit` / `reject`, the words the WhatsApp card's buttons send.
+
 ## Jobs
 
 `src/jobs/scheduler.js` ticks every minute inside the web process and runs each `src/jobs/*.job.js` for every active user with ERPNext credentials, in the user's own timezone (`users.timezone`, default `Asia/Bangkok`):
@@ -143,7 +163,7 @@ Without a content SID: the digest is sent free-form only if the user wrote in th
 - **`DISABLE_JOBS=1|true|yes|on`** skips the scheduler on an instance (second web-only instance, local dev). On SIGTERM/SIGINT the server waits up to 10s for the in-flight tick.
 - **Status callback.** `POST /twilio/status` (signature-checked against `PUBLIC_BASE_URL + '/twilio/status'`; 403 when `PUBLIC_BASE_URL` or `TWILIO_AUTH_TOKEN` is unset) marks the matching `job_runs` / `outreach_log` row failed on `failed`/`undelivered`. Template and media sends request it automatically when `PUBLIC_BASE_URL` is set; plain `sendText` sends only get it if the callback URL is configured on the Twilio sender.
 
-New jobs export `{ name, defaultTime, window?, timeoutMs?, enabled?(user), run(user, { erp, twilio, now, clock, signal }) }`; see the header of `src/jobs/scheduler.js`.
+New jobs export `{ name, defaultTime, window?, timeoutMs?, enabled?(user), run(user, { erp, channel, twilio, now, clock, signal }) }` (`channel` is the user's own channel from `src/channels`; `twilio` is the legacy alias for the same object; the digest checks `channel.supportsTemplates` and pushes plain text on LINE); see the header of `src/jobs/scheduler.js`.
 
 ## Project layout
 
@@ -176,7 +196,13 @@ src/
   wallets.js                cash/bank/credit-card wallets ↔ ERPNext Accounts
   erpnext.js                thin REST client for ERPNext (timeouts, optional AbortSignal, PDFs, uploads)
   exchange.js               frankfurter.app FX rates
-  twilio-client.js          Twilio REST: text, confirmation card, templates, media
+  channels/
+    index.js                channel contract + registry (forAddress, configured)
+    address.js              user addresses: E.164 for WhatsApp, line:<userId> for LINE
+    twilio.js               WhatsApp over Twilio: sender, inbound normalisation, media download, webhook
+    line.js                 LINE Messaging API: reply/push, quick-reply card, content download, webhook
+    line-signature.js       X-Line-Signature HMAC check
+  twilio-client.js          thin re-export of the Twilio sender (tests stub it)
   chitchat.js               regex-based pre-LLM filter
   vcard.js                  minimal vCard parser
   users.js, messages.js, db.js, log.js

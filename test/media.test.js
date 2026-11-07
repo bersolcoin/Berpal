@@ -17,6 +17,7 @@ const conversation = require('../src/conversation');
 const twilioClient = require('../src/twilio-client');
 const { ErpNextClient } = require('../src/erpnext');
 const { processIncomingMessage } = require('../src/whatsapp');
+const { inboundFromTwilio } = require('../src/channels/twilio');
 const { _setClientForTests } = require('../src/media/openai-client');
 const download = require('../src/media/download');
 const store = require('../src/media/store');
@@ -104,8 +105,22 @@ function raw(items, body = '') {
   return r;
 }
 
+/**
+ * One inbound WhatsApp message through processIncomingMessage. Without vCards the normalised
+ * message is built synchronously (same shape inboundFromTwilio produces), so a send() and a
+ * processIncomingMessage() right after it are queued in call order; with a vCard it goes
+ * through the adapter's real conversion (which downloads the card).
+ */
 function send(items, body = '', from = PHONE) {
-  return processIncomingMessage({ from: `whatsapp:${from}`, body, raw: raw(items, body) });
+  const form = { ...raw(items, body), From: `whatsapp:${from}` };
+  if (items.some(([ct]) => /vcard/i.test(ct))) return inboundFromTwilio(form).then(processIncomingMessage);
+  const media = items.map(([contentType, url]) => ({ contentType, ref: url, url }));
+  return processIncomingMessage({ channel: 'whatsapp', from, body, media, contacts: [], raw: form });
+}
+
+/** A text-only message (no media). */
+function text(body, from = PHONE) {
+  return processIncomingMessage({ channel: 'whatsapp', from, body, media: [], contacts: [], raw: null });
 }
 
 /** Parse the JSON payload of a "[receipt scanned] {…}" line. */
@@ -460,8 +475,8 @@ test('voice note: other failures → plain error, no fallback, no LLM call', asy
 // ── Passthrough, ordering ─────────────────────────────────────────────
 
 test('non-media messages pass through unchanged', async () => {
-  await processIncomingMessage({ from: `whatsapp:${PHONE}`, body: 'paid 850 for lunch', raw: { Body: 'paid 850 for lunch', NumMedia: '0' } });
-  await processIncomingMessage({ from: `whatsapp:${PHONE}`, body: 'sold 2 rings', raw: null });
+  await send([], 'paid 850 for lunch');
+  await text('sold 2 rings');
   assert.deepEqual(handled, ['paid 850 for lunch', 'sold 2 rings']);
   assert.equal(openaiCalls.length, 0);
 });
@@ -480,8 +495,8 @@ test('a typed follow-up waits for the slow scan before it reaches the conversati
     return { choices: [{ message: { content: JSON.stringify(SCAN) } }] };
   };
   const first = send([['image/jpeg', `${TW}/slow`]]);
-  const second = processIncomingMessage({ from: `whatsapp:${PHONE}`, body: 'put it on the AmEx', raw: null });
-  const otherUserMsg = processIncomingMessage({ from: `whatsapp:${OTHER_PHONE}`, body: 'sold 1 ring', raw: null });
+  const second = text('put it on the AmEx');
+  const otherUserMsg = text('sold 1 ring', OTHER_PHONE);
   await Promise.all([first, second, otherUserMsg]);
   assert.equal(handled.length, 3);
   assert.equal(handled[0], 'sold 1 ring', 'other users are not blocked behind the scan');
@@ -569,4 +584,40 @@ test('migration does no per-boot FK DDL (no DROP/ALTER outside comments)', () =>
   const code = sql.split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');
   assert.doesNotMatch(code, /\b(ALTER|DROP)\b/i);
   assert.match(code, /REFERENCES users\(id\) ON DELETE CASCADE/);
+});
+
+test('the type the channel serves wins over the declared one when readable the same way (LINE PNG / m4a)', async () => {
+  const channels = require('../src/channels');
+  const realLine = channels.get('line');
+  let served = 'image/png';
+  const fake = {
+    name: 'line', isConfigured: () => true,
+    downloadMedia: async (item) => ({ bytes: /audio/.test(item.contentType) ? AUDIO_BYTES : IMAGE_BYTES, contentType: served }),
+  };
+  channels.register(fake);
+  try {
+    const inbound = (contentType) => ({ channel: 'line', from: 'line:Umedia', body: '', media: [{ contentType, ref: '123' }], contacts: [] });
+    let r = await mediaIntake.intake(user, inbound('image/jpeg'), '');
+    let p = scanPayload(r.lines[0]);
+    assert.equal((await store.getBlob(user.id, p.media_id)).content_type, 'image/png');
+    assert.match(JSON.stringify(openaiCalls.at(-1).req), /data:image\/png;base64/);
+
+    // An unknown / other-family served type keeps the declared one.
+    for (const t of ['application/octet-stream', 'audio/mpeg', '']) {
+      served = t;
+      r = await mediaIntake.intake(user, inbound('image/jpeg'), '');
+      p = scanPayload(r.lines[0]);
+      assert.equal((await store.getBlob(user.id, p.media_id)).content_type, 'image/jpeg', t);
+    }
+
+    // Audio: the served type reaches the transcriber.
+    served = 'audio/x-m4a';
+    let seenType = null;
+    transcribeImpl = async (req) => { seenType = req.file && (req.file.type || req.file.name); return { text: 'paid 20' }; };
+    r = await mediaIntake.intake(user, inbound('audio/mp4'), '');
+    assert.equal(r.transcript, 'paid 20');
+    assert.ok(seenType, 'transcriber called');
+  } finally {
+    channels.register(realLine);
+  }
 });

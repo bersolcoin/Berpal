@@ -12,7 +12,11 @@
  * messages third parties with no per-message approval, so that switch is the consent.
  *
  * Called by src/jobs/scheduler.js at most once per user per day with
- * deps = { erp, twilio, now, clock, signal? } (clock.date = the user's local YYYY-MM-DD).
+ * deps = { erp, now, clock, signal?, whatsapp? } (clock.date = the user's local YYYY-MM-DD).
+ *
+ * Customer outreach is WhatsApp-only for now, whatever channel the OWNER uses: these go to
+ * customers' phone numbers, so deps.channel / deps.twilio (the owner's channel — LINE for a LINE
+ * user) are deliberately NOT used. deps.whatsapp (tests) else channels.get('whatsapp').
  * The scheduler aborts deps.signal after timeoutMs: we stop before the next customer and pass the
  * signal to every ERPNext call. The Twilio SDK takes no AbortSignal, so a send already in flight
  * completes (and is logged) — we just don't start another.
@@ -21,6 +25,7 @@ const {
   planReminders, deliver, listOpenReceivables, customerRemindedWithin, customerAttempts, localToday,
 } = require('../outreach/send-invoice');
 const { addDays } = require('./index');
+const channels = require('../channels');
 const { ts } = require('../erp-sync/common');
 
 const DUE_WITHIN_DAYS = 3;
@@ -38,7 +43,12 @@ function enabled(user) {
 
 async function run(user, deps = {}) {
   if (!enabled(user)) return { skipped: true, note: 'reminders disabled' };
-  const { erp, twilio, signal = null } = deps;
+  const { erp, signal = null } = deps;
+  const whatsapp = deps.whatsapp || channels.get('whatsapp');
+  // Without WhatsApp nothing can reach a customer: skip before any PDF is rendered or made public.
+  if (!whatsapp || (typeof whatsapp.isConfigured === 'function' && !whatsapp.isConfigured())) {
+    return { skipped: true, note: 'WhatsApp channel not configured (customer reminders go over WhatsApp only)' };
+  }
   const today = deps.clock?.date || localToday(user, deps.now || new Date());
 
   const rows = await listOpenReceivables(erp, { dueOnOrBefore: addDays(today, DUE_WITHIN_DAYS) });
@@ -76,14 +86,14 @@ async function run(user, deps = {}) {
     }
     // One customer at a time: a bad invoice, phone or send never stops the others.
     try {
-      const plan = await planReminders(user, erp, { refs, today, twilio });
+      const plan = await planReminders(user, erp, { refs, today, channel: whatsapp });
       if (signal?.aborted) {
         aborted = true;
         break;
       }
       failures.push(...plan.problems); // no phone / not ours / paid since listing — retried tomorrow
       for (const msg of plan.messages) {
-        const r = await deliver(user, erp, msg, { twilio, today, signal });
+        const r = await deliver(user, erp, msg, { channel: whatsapp, today, signal });
         if (!r.ok && signal?.aborted) {
           aborted = true; // cut off mid-render/upload — not the customer's failure, retried tomorrow
           break;

@@ -30,6 +30,7 @@ npm run check:env          # reads .env + the process environment
 | Also required with `NODE_ENV=production` (the image default) | |
 |---|---|
 | `PUBLIC_BASE_URL` (or `TWILIO_WEBHOOK_URL`), https | Signs/validates `/webhook` and `/twilio/status`. Set `PUBLIC_BASE_URL` even if you use `TWILIO_WEBHOOK_URL`, or status callbacks are refused. |
+| LINE instead of / alongside Twilio | `LINE_CHANNEL_SECRET` + `LINE_CHANNEL_ACCESS_TOKEN` (both or neither). With LINE fully set, the Twilio variables become optional and the Twilio-only production rules above don't apply; at least one channel must be complete. LINE's webhook (`/line/webhook`) is verified by HMAC over the body, not by URL, so `PUBLIC_BASE_URL` isn't required for it — still set it, the LINE console needs the https URL and `/health` and Twilio callbacks use it. See README → LINE. |
 | `TWILIO_CONFIRMATION_CONTENT_SID` | |
 | `LOG_MESSAGES` not `true` | Retention policy: no chat logs |
 | `SEED_TEST_USER_PHONE` unset | It seeds a test user on every boot |

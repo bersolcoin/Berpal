@@ -3,17 +3,17 @@
  * monitors.
  *
  *   status  ok        every check passed
- *           degraded  db fine, ERPNext or Twilio failing (messages may fail; still serve 200 so
+ *           degraded  db fine, ERPNext, Twilio or LINE (when configured) failing (messages may fail; still serve 200 so
  *                     the platform doesn't restart a healthy process over someone else's outage)
  *           fail      db failing → 503
  *
- * `?deep=0` skips the external calls (ERPNext, Twilio) and reports them `{ ok: true, skipped: true }`; use it for
+ * `?deep=0` skips the external calls (ERPNext, Twilio, LINE) and reports them `{ ok: true, skipped: true }`; use it for
  * frequent platform probes. Default is deep. The endpoint is public, so deep results are cached
  * for DEEP_CACHE_MS (concurrent callers share one in-flight check): however often /health is hit,
- * it costs at most one Twilio API request and one ERPNext ping per window.
+ * it costs at most one Twilio API request, one ERPNext ping and one LINE bot-info request per window.
  * Responses never include credentials, hostnames or upstream bodies: only ok/latency, and for
- * ERPNext a fixed-vocabulary detail ("HTTP 502", "timeout", "unreachable"). Raw error text goes
- * to the log only.
+ * ERPNext and LINE a fixed-vocabulary detail ("HTTP 502", "timeout", "unreachable"). Raw error
+ * text goes to the log only.
  */
 const { version } = require('../package.json');
 
@@ -78,7 +78,8 @@ function logDetail(err) {
  *   fetchImpl  fetch
  *   scheduler  { running() } — whether this instance ticks the job scheduler
  *   now        ms clock
- *   env        for ERPNEXT_URL / TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN
+ *   env        for ERPNEXT_URL / TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / LINE_CHANNEL_* (the `line`
+ *              check, GET api.line.me/v2/bot/info, is present only when both LINE vars are set)
  */
 function createHealthHandler({
   db = require('./db'),
@@ -113,12 +114,22 @@ function createHealthHandler({
     return { ok: false, ms: r.ms };
   }
 
+  // LINE: only reported when both credentials are set; same disclosure rules as ERPNext.
+  const lineConfigured = () => Boolean(String(env.LINE_CHANNEL_SECRET || '').trim() && String(env.LINE_CHANNEL_ACCESS_TOKEN || '').trim());
+  async function checkLine() {
+    const headers = { Authorization: `Bearer ${String(env.LINE_CHANNEL_ACCESS_TOKEN).trim()}` };
+    const r = await timed(() => fetchOk(fetchImpl, 'https://api.line.me/v2/bot/info', { headers }, timeoutMs), now, timeoutMs);
+    if (r.ok) return r;
+    console.warn(`[health] line check failed: ${logDetail(r.error)}`);
+    return { ok: false, ms: r.ms, detail: publicDetail(r.error) };
+  }
+
   // { at, promise } of the last deep run; reused while fresh, shared while in flight.
   let deepRun = null;
   function externalChecks() {
     const t = now();
     if (deepRun && t - deepRun.at < deepCacheMs) return deepRun.promise;
-    const promise = Promise.all([checkErpnext(), checkTwilio()]);
+    const promise = Promise.all([checkErpnext(), checkTwilio(), lineConfigured() ? checkLine() : null]);
     deepRun = { at: t, promise };
     return promise;
   }
@@ -127,14 +138,14 @@ function createHealthHandler({
     const deep = String((req.query && req.query.deep) ?? '1') !== '0';
     const skipped = { ok: true, ms: 0, skipped: true };
 
-    const [dbCheck, [erpnext, twilio]] = await Promise.all([
+    const [dbCheck, [erpnext, twilio, line]] = await Promise.all([
       timed(() => db.query('SELECT 1'), now, timeoutMs),
-      deep ? externalChecks() : [skipped, skipped],
+      deep ? externalChecks() : [skipped, skipped, lineConfigured() ? skipped : null],
     ]);
     // db error text can name hosts/users: log only.
     if (!dbCheck.ok) console.error(`[health] db check failed: ${logDetail(dbCheck.error)}`);
 
-    const status = !dbCheck.ok ? 'fail' : (erpnext.ok && twilio.ok ? 'ok' : 'degraded');
+    const status = !dbCheck.ok ? 'fail' : (erpnext.ok && twilio.ok && (!line || line.ok) ? 'ok' : 'degraded');
 
     res.status(status === 'fail' ? 503 : 200).json({
       status,
@@ -144,6 +155,7 @@ function createHealthHandler({
         db: { ok: dbCheck.ok, ms: dbCheck.ms },
         erpnext,
         twilio,
+        ...(line ? { line } : {}),
         scheduler: { running: Boolean(scheduler.running()) },
       },
     });

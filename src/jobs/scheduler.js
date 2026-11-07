@@ -68,8 +68,9 @@ function getJobs() {
   return _jobs;
 }
 
-function defaultTwilio() {
-  return require('../twilio-client');
+/** The channel that reaches this user (their address picks it: WhatsApp or LINE). */
+function defaultChannelFor(user) {
+  return require('../channels').forAddress(user.phone);
 }
 
 /**
@@ -199,12 +200,18 @@ async function runWithTimeout(job, user, deps, runId, timeoutMs, ac = new AbortC
 
 /**
  * One scheduler pass. `now` is a Date or a clock function — it's re-read per user/job so a
- * slow tick doesn't judge late users by a stale time. Tests inject `jobs`, `twilio`,
- * `erpFor`, `jobTimeoutMs` (default for jobs without their own timeoutMs) and `isStopping`.
+ * slow tick doesn't judge late users by a stale time. Tests inject `jobs`, `twilio` (one channel
+ * for every user) or `channelFor(user)`, `erpFor`, `jobTimeoutMs` (default for jobs without their
+ * own timeoutMs) and `isStopping`.
+ *
+ * Jobs get deps.channel = the channel for the USER's address (digest goes over LINE to a LINE
+ * user), and deps.twilio as the legacy name for the same object. Customer outreach
+ * (reminders.job.js) does not use either: it always goes over WhatsApp.
  * Returns what was attempted: [{ user_id, job, run_date, status, error? }].
  */
 async function runDue({
-  now = () => new Date(), jobs = getJobs(), twilio = null, erpFor = erpnext.forUser, jobTimeoutMs = JOB_TIMEOUT_MS,
+  now = () => new Date(), jobs = getJobs(), twilio = null, channelFor = defaultChannelFor, erpFor = erpnext.forUser,
+  jobTimeoutMs = JOB_TIMEOUT_MS,
   isStopping = () => false,
 } = {}) {
   if (!jobs.length) return [];
@@ -250,7 +257,8 @@ async function runDue({
         const erp = erpFor(user, { signal: ac.signal });
         // clock.date is the REAL local date (use it for "today"); run_date is the day the run
         // belongs to — the previous date when a window crosses midnight.
-        const deps = { erp, twilio: twilio || defaultTwilio(), now: at, clock: { ...clock, run_date: runDate } };
+        const channel = twilio || channelFor(user);
+        const deps = { erp, channel, twilio: channel, now: at, clock: { ...clock, run_date: runDate } };
         const res = await runWithTimeout(job, user, deps, runId, Number(job.timeoutMs) > 0 ? Number(job.timeoutMs) : jobTimeoutMs, ac);
         if (res === TIMED_OUT) {
           out.status = 'failed';

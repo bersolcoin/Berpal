@@ -16,7 +16,8 @@ const INVITE_ONLY =
   'ขณะนี้ Berpal เปิดให้ใช้เฉพาะผู้ที่ได้รับเชิญ หากมีรหัสเชิญ กรุณาส่งรหัสมาที่นี่';
 
 const WELCOME =
-  "Hi! I'm Berpal — I keep your business books from WhatsApp. Let's set you up; it takes about a minute.\n" +
+  // Channel-neutral: the same welcome goes out over WhatsApp and LINE.
+  "Hi! I'm Berpal — I keep your business books right here in chat. Let's set you up; it takes about a minute.\n" +
   'สวัสดีครับ มาเริ่มตั้งค่าบัญชีกันครับ';
 
 const PROMPTS = {
@@ -29,15 +30,32 @@ const PROMPTS = {
   accountant_phone: (name) => `What is ${name}'s phone number? (e.g. 081 234 5678 or +66 81 234 5678) Reply skip if you'd rather not.`,
 };
 
-const CONSENT_NOTICE = [
+// The notice names what identifies the user on their channel. The WhatsApp text is the one
+// CONSENT_VERSION has always identified; a LINE user agrees to the same notice with "your LINE
+// user ID" in its place, recorded as CONSENT_VERSION + '-line' (consentVersion below) so the
+// stored version still names the exact text agreed to.
+const consentNoticeFor = (identifier) => [
   'Last step — privacy notice (PDPA):',
-  `• What we store: your WhatsApp number, business details (name, country, VAT status, tax ID, accountant), the text of the transactions you send, and receipt images (our copy is deleted within ${RETENTION_DAYS} days; a receipt you confirm is attached to that entry in your ERPNext ledger).`,
+  `• What we store: ${identifier}, business details (name, country, VAT status, tax ID, accountant), the text of the transactions you send, and receipt images (our copy is deleted within ${RETENTION_DAYS} days; a receipt you confirm is attached to that entry in your ERPNext ledger).`,
   '• Where: our database (Postgres) and your ERPNext ledger. Messages, receipts and voice notes are read by OpenAI to understand them.',
   '• Why: only to keep your books and send the reminders and summaries you ask for.',
   '• Deleting: message "delete my account" at any time.',
   '',
   'Reply I agree (or ตกลง) to continue.',
 ].join('\n');
+
+const CONSENT_NOTICE = consentNoticeFor('your WhatsApp number');
+const CONSENT_NOTICE_LINE = consentNoticeFor('your LINE user ID');
+
+/** The notice for an address's channel ('whatsapp' | 'line'). */
+function consentNotice(channel) {
+  return channel === 'line' ? CONSENT_NOTICE_LINE : CONSENT_NOTICE;
+}
+
+/** The users.consent_version recorded for a signup on `channel`. */
+function consentVersion(channel) {
+  return channel === 'line' ? `${CONSENT_VERSION}-line` : CONSENT_VERSION;
+}
 
 const RETRY = {
   name: 'Please send the business name (2–80 characters, with letters or digits; no < or >).',
@@ -68,7 +86,7 @@ const DELETE_DONE =
 const DELETE_KEPT = 'OK — nothing was deleted. Your account stays as it is.';
 
 module.exports = {
-  CONSENT_VERSION, FOOTER, INVITE_ONLY, WELCOME, PROMPTS, CONSENT_NOTICE, RETRY,
+  CONSENT_VERSION, FOOTER, INVITE_ONLY, WELCOME, PROMPTS, CONSENT_NOTICE, CONSENT_NOTICE_LINE, consentNotice, consentVersion, RETRY,
   CANCELLED, CONSENT_REFUSED, COMPLETED, PENDING_PROVISIONING, ACCOUNT_CLOSED, BOOKS_READY,
   DELETE_CONFIRM, DELETE_DONE, DELETE_KEPT,
 };

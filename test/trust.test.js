@@ -20,6 +20,7 @@ const { WARNING_HEADER } = require('../src/tools/card');
 const download = require('../src/media/download');
 const { _setClientForTests } = require('../src/media/openai-client');
 const mediaIntake = require('../src/media');
+const { inboundFromTwilio } = require('../src/channels/twilio');
 const trust = require('../src/trust');
 const duplicates = require('../src/trust/duplicates');
 const { anomalies } = require('../src/trust/anomalies');
@@ -85,9 +86,9 @@ const SCAN = {
 /** Media intake of one photo with the given bytes; returns the stored media id. */
 async function scan(user, bytes) {
   download._setDownloaderForTests(async () => bytes);
-  const r = await mediaIntake.intake(user, {
+  const r = await mediaIntake.intake(user, await inboundFromTwilio({
     NumMedia: '1', MediaContentType0: 'image/jpeg', MediaUrl0: 'https://api.twilio.com/x/Media/1',
-  }, 'coffee');
+  }), 'coffee');
   assert.equal(r.mediaIds.length, 1);
   return r.mediaIds[0];
 }

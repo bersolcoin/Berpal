@@ -3,10 +3,13 @@
  * Plain text (WhatsApp renders markdown literally in this bot's style). Empty sections are
  * dropped, and a digest with nothing in it isn't sent at all — no daily "all zero" spam.
  *
- * Delivery: WhatsApp only allows free-form business messages within 24h of the user's last
- * message. Twilio still ACCEPTS free-form text outside it (returns a SID) and the 63016 failure
- * arrives later, so: with TWILIO_DIGEST_CONTENT_SID set we always send the approved template;
- * without it we only send free-form when the user wrote to us in the last 23h, else skip.
+ * Delivery goes over the user's own channel (deps.channel, picked from their address):
+ *  - channels with templates (WhatsApp): free-form business messages are only allowed within 24h
+ *    of the user's last message. Twilio still ACCEPTS free-form text outside it (returns a SID)
+ *    and the 63016 failure arrives later, so: with TWILIO_DIGEST_CONTENT_SID set we always send
+ *    the approved template; without it we only send free-form when the user wrote to us in the
+ *    last 23h, else skip.
+ *  - channels without templates (LINE): a plain-text push, any time — no 24h window.
  */
 const { query } = require('../db');
 const { getCashBankBalance } = require('../erp-query/cash-balance');
@@ -150,28 +153,35 @@ module.exports = {
   enabled: isEnabled,
   buildDigest,
   templateVariables,
-  async run(user, { erp, twilio, now = new Date(), clock = null }) {
+  async run(user, { erp, channel = null, twilio = null, now = new Date(), clock = null }) {
+    const ch = channel || twilio; // `twilio` is the legacy dep name for the same channel
     if (!isEnabled(user)) return { skipped: true, note: 'digest disabled' };
     const c = clock || localClock(now, user.timezone);
     const text = await buildDigest(user, erp, { now, clock: c });
     if (!text) return { skipped: true, note: 'nothing to report' };
 
-    const to = `whatsapp:${user.phone}`;
+    // The user's address; the channel formats it for its provider.
+    const to = user.phone;
+    // A stub without the flag is a WhatsApp-like channel (the old Twilio client shape).
+    const templates = ch.supportsTemplates !== false;
     const contentSid = process.env.TWILIO_DIGEST_CONTENT_SID;
     let sid;
     let via;
-    if (contentSid) {
+    if (templates && contentSid) {
       via = 'template';
-      sid = await twilio.sendTemplate(to, contentSid, templateVariables(text, c.date));
-    } else {
+      sid = await ch.sendTemplate(to, contentSid, templateVariables(text, c.date));
+    } else if (templates) {
       if (!(await inServiceWindow(user.id, now))) {
         return { skipped: true, note: 'outside 24h window; set TWILIO_DIGEST_CONTENT_SID' };
       }
       via = 'text';
-      sid = await twilio.sendText(to, text);
+      sid = await ch.sendText(to, text);
+    } else {
+      via = 'push';
+      sid = await ch.sendText(to, text);
     }
     // sendTemplate throws with Twilio's code; sendText swallows errors and returns null.
-    if (!sid) throw new Error(`twilio ${via} send returned no message sid`);
+    if (!sid) throw new Error(`${ch.name || 'channel'} ${via} send returned no message sid`);
     return { sent: 1, via, message_sid: sid };
   },
 };

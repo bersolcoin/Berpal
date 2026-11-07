@@ -286,7 +286,8 @@ test('digest: inside the window → free-form text with its SID', async () => {
   const twilio = stubTwilio();
   const res = await digest.run(user, { erp: erpnext.forUser(user), twilio, now });
   assert.deepEqual(res, { sent: 1, via: 'text', message_sid: 'SMtext1' });
-  assert.equal(twilio.sent[0].to, 'whatsapp:+66100');
+  // The user's address; the channel adds its provider prefix (whatsapp:) itself.
+  assert.equal(twilio.sent[0].to, '+66100');
   assert.match(twilio.sent[0].text, /^Your books, /);
 });
 

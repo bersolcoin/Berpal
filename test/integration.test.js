@@ -21,6 +21,7 @@ const counterparties = require('../src/counterparties');
 const twilioClient = require('../src/twilio-client');
 const download = require('../src/media/download');
 const { processIncomingMessage, contactLine } = require('../src/whatsapp');
+const { inboundFromTwilio } = require('../src/channels/twilio');
 const { webhookHandler, webhookUrl } = require('../src/webhook');
 const { cardSignature } = require('../src/tools/request-confirmation');
 const { PROTECTED_DRAFT_KEYS } = require('../src/tools/validate');
@@ -609,7 +610,7 @@ test('whatsapp sends a reply even if handle() returns a bare string', async () =
   conversation.handle = async () => 'plain string reply';
   twilioClient.sendText = async (to, text) => { sent.push(text); };
   try {
-    await processIncomingMessage({ from: `whatsapp:${PHONE}`, body: 'paid 50 for coffee', raw: { NumMedia: '0' } });
+    await processIncomingMessage(await inboundFromTwilio({ From: `whatsapp:${PHONE}`, Body: 'paid 50 for coffee', NumMedia: '0' }));
   } finally {
     conversation.handle = realHandle;
     twilioClient.sendText = realSend;
@@ -641,7 +642,8 @@ test('POST /webhook: valid signature accepted, forged or unsigned rejected with 
     await handler({ headers: { 'x-twilio-signature': good }, body: params }, res);
     assert.equal(res.statusCode, 200);
     assert.match(res.body, /<Response>/);
-    assert.deepEqual(processed, [{ from: params.From, body: 'hi', raw: params }]);
+    // processMessage gets the normalised inbound message (src/channels/index.js), not the form.
+    assert.deepEqual(processed, [{ channel: 'whatsapp', from: PHONE, body: 'hi', media: [], contacts: [], raw: params }]);
 
     for (const headers of [{ 'x-twilio-signature': 'forged' }, {}]) {
       res = fakeRes();
@@ -748,10 +750,10 @@ test('vCard values are sanitised like scan values and never logged', async () =>
   twilioClient.sendText = async () => {};
   console.log = (...a) => logs.push(a.join(' '));
   try {
-    await processIncomingMessage({
-      from: `whatsapp:${PHONE}`, body: '',
-      raw: { NumMedia: '1', MediaContentType0: 'text/vcard', MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/AC1/Messages/MM1/Media/ME1' },
-    });
+    await processIncomingMessage(await inboundFromTwilio({
+      From: `whatsapp:${PHONE}`, Body: '',
+      NumMedia: '1', MediaContentType0: 'text/vcard', MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/AC1/Messages/MM1/Media/ME1',
+    }));
   } finally {
     conversation.handle = realHandle;
     twilioClient.sendText = realSend;

@@ -1,5 +1,8 @@
 /**
- * POST /webhook — Twilio's inbound WhatsApp message callback.
+ * POST /webhook — Twilio's inbound WhatsApp message callback. Mounted by server.js through the
+ * 'whatsapp' channel (src/channels/twilio.js: webhookPath '/webhook', webhookHandler wraps this
+ * one); the form body becomes the normalised inbound message (src/channels/index.js) before
+ * processMessage sees it.
  *
  * X-Twilio-Signature is checked against the exact public URL Twilio calls: TWILIO_WEBHOOK_URL if
  * set, else PUBLIC_BASE_URL + '/webhook' (the same origin the /twilio/status route uses), with
@@ -16,6 +19,7 @@
  */
 const { twilioSignatureOk } = require('./twilio-signature');
 const { ts } = require('./erp-sync/common');
+const { normalizeAddress } = require('./channels/address');
 
 const EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
 
@@ -42,17 +46,38 @@ function webhookUrl(env = process.env) {
 
 /**
  * Express handler. Options are injectable for tests; `processMessage` is
- * whatsapp.processIncomingMessage. `url: null` means unconfigured (see the header for the
+ * whatsapp.processIncomingMessage and receives the normalised inbound message (`toInbound`,
+ * default inboundFromTwilio). `url: null` means unconfigured (see the header for the
  * production vs dev behaviour).
  */
 function webhookHandler({
   processMessage,
+  toInbound = (form) => require('./channels/twilio').inboundFromTwilio(form),
   url = webhookUrl(),
   authToken = process.env.TWILIO_AUTH_TOKEN,
   production = process.env.NODE_ENV === 'production',
   validate,
 } = {}) {
   let warnedUnconfigured = false;
+  // Converting the form can await vCard downloads, so conversion + the processMessage CALL are
+  // chained per sender: a quick follow-up text can't overtake a contact share on its way into
+  // whatsapp.js's per-sender FIFO. Only the call is chained, not the processing it starts.
+  const tails = new Map();
+  const inOrder = (form) => {
+    // Same key as whatsapp.js's queue (the normalised address), so "whatsapp:+66…" and "+66…"
+    // can never land on two chains that overtake each other.
+    const key = normalizeAddress(form && form.From) || 'unknown';
+    const run = (tails.get(key) || Promise.resolve())
+      .then(() => toInbound(form))
+      // toInbound → null: not a message to process (e.g. a From that isn't a WhatsApp address).
+      .then((inbound) => ({ done: inbound ? processMessage(inbound) : undefined }));
+    const tail = run.catch(() => {});
+    tails.set(key, tail);
+    tail.then(() => {
+      if (tails.get(key) === tail) tails.delete(key);
+    });
+    return run.then(({ done }) => done);
+  };
   return (req, res) => {
     if (!url && production) {
       if (!warnedUnconfigured) {
@@ -72,8 +97,7 @@ function webhookHandler({
 
     // Process and send the actual reply via Twilio REST API in the background.
     const body = req.body || {};
-    return Promise.resolve()
-      .then(() => processMessage({ from: body.From || 'unknown', body: body.Body || '', raw: body }))
+    return inOrder(body)
       .catch((err) => {
         console.error('[webhook async] processing error:', err);
       });

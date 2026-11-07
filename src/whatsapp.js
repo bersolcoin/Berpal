@@ -1,43 +1,19 @@
+/**
+ * Inbound message processing for every channel (the filename is historical: WhatsApp came first).
+ * processIncomingMessage takes the normalised inbound message from a channel's webhook
+ * (src/channels/index.js: { channel, from, body, media, contacts, raw }) and replies over the
+ * channel the sender's address belongs to — channels.forAddress(from).
+ */
 const users = require('./users');
 const conversation = require('./conversation');
 const messageLog = require('./messages');
-const twilioClient = require('./twilio-client');
-const vcard = require('./vcard');
+const channels = require('./channels');
+const { normalizeAddress } = require('./channels/address');
 const chitchat = require('./chitchat');
 const log = require('./log');
 const mediaIntake = require('./media');
-const { downloadMedia } = require('./media/download');
 const { cleanText } = require('./media/vision');
 const onboarding = require('./onboarding');
-
-// Goes through the media downloader so vCards get the same Twilio-host allowlist, timeout and
-// size cap as photos — MediaUrl* is attacker-controllable and carries our Twilio credentials.
-async function fetchTwilioMedia(url) {
-  try {
-    return (await downloadMedia(url)).toString('utf8');
-  } catch (err) {
-    console.error('[whatsapp] media fetch error:', err.message);
-    return null;
-  }
-}
-
-async function extractContactShare(raw) {
-  if (!raw) return null;
-  const numMedia = parseInt(raw.NumMedia || '0', 10);
-  if (!numMedia) return null;
-  for (let i = 0; i < numMedia; i++) {
-    const contentType = raw[`MediaContentType${i}`];
-    const mediaUrl = raw[`MediaUrl${i}`];
-    if (contentType && /vcard/i.test(contentType) && mediaUrl) {
-      const text = await fetchTwilioMedia(mediaUrl);
-      if (text) {
-        const parsed = vcard.parseVCard(text);
-        if (parsed.name || parsed.phone) return parsed;
-      }
-    }
-  }
-  return null;
-}
 
 /**
  * The "[contact shared] {json}" line the model reads. vCard fields are sender-controlled, so they
@@ -59,10 +35,10 @@ function contactLine(contact) {
 // different users still run concurrently.
 const queues = new Map();
 
-function processIncomingMessage(args) {
-  const key = users.normalizePhone(args.from) || String(args.from);
+function processIncomingMessage(inbound) {
+  const key = users.normalizePhone(inbound.from) || String(inbound.from);
   const prev = queues.get(key) || Promise.resolve();
-  const run = prev.then(() => processOne(args));
+  const run = prev.then(() => processOne(inbound));
   const tail = run.catch(() => {});
   queues.set(key, tail);
   tail.then(() => {
@@ -71,7 +47,14 @@ function processIncomingMessage(args) {
   return run;
 }
 
-async function processOne({ from, body, raw = null }) {
+async function processOne(inbound) {
+  const from = normalizeAddress(inbound.from) || String(inbound.from);
+  const body = inbound.body || '';
+  const raw = inbound.raw || null;
+  const contacts = inbound.contacts || [];
+  const msg = { ...inbound, from, body, media: inbound.media || [], contacts };
+  // Resolved lazily so an address with no registered channel fails inside the try (logged).
+  const reply = (text) => channels.forAddress(from).sendText(from, text);
   let user = null;
   let mediaIds = [];
   let loggedIn = false;
@@ -82,8 +65,8 @@ async function processOne({ from, body, raw = null }) {
     // Onboarding logs the message and reply itself: tax-ID / accountant answers are masked there.
     if (!user) {
       loggedIn = true;
-      const reply = await onboarding.handleUnknownPhone(from, body);
-      if (reply) await twilioClient.sendText(from, reply);
+      const signupReply = await onboarding.handleUnknownPhone(from, body);
+      if (signupReply) await reply(signupReply);
       return;
     }
 
@@ -95,7 +78,7 @@ async function processOne({ from, body, raw = null }) {
     const accountReply = await onboarding.handleRegistered(user, body);
     if (accountReply) {
       log.msgOut(from, accountReply, 'account');
-      await twilioClient.sendText(from, accountReply);
+      await reply(accountReply);
       return;
     }
 
@@ -103,27 +86,27 @@ async function processOne({ from, body, raw = null }) {
     await messageLog.logIncoming(user.id, conv.id, body, raw);
 
     // Pre-LLM short-circuit: handle obvious chitchat (greetings, thanks, help) without an API call.
-    // Skip if the user shared media (vCard etc.) — that always carries real intent.
-    const hasMedia = raw && parseInt(raw.NumMedia || '0', 10) > 0;
+    // Skip if the user shared media or a contact — that always carries real intent.
+    const hasMedia = msg.media.length > 0 || contacts.length > 0;
     if (!hasMedia) {
       const cannedReply = chitchat.tryMatch(body || '');
       if (cannedReply) {
         await messageLog.logOutgoing(user.id, conv.id, cannedReply);
         log.msgOut(from, cannedReply, 'chitchat');
-        await twilioClient.sendText(from, cannedReply);
+        await reply(cannedReply);
         return;
       }
     }
 
     // Receipt photos / PDFs are scanned and voice notes transcribed before the LLM sees the
     // message, so the model only ever deals with text (same idea as the vCard line below).
-    const media = await mediaIntake.intake(user, raw, body);
+    const media = await mediaIntake.intake(user, msg, body);
     mediaIds = media.mediaIds;
     if (media.silent) return;
     if (media.reply) {
       await messageLog.logOutgoing(user.id, conv.id, media.reply);
       log.msgOut(from, media.reply, 'media');
-      await twilioClient.sendText(from, media.reply);
+      await reply(media.reply);
       return;
     }
 
@@ -137,8 +120,8 @@ async function processOne({ from, body, raw = null }) {
       augmentedBody = augmentedBody ? `${augmentedBody}\n${line}` : line;
     }
 
-    // If the user shared a WhatsApp contact (vCard attachment), parse it and inject into the message.
-    const contact = await extractContactShare(raw);
+    // A shared contact (WhatsApp vCard, parsed by the channel) is injected into the message.
+    const contact = contacts[0] || null;
     const synthetic = contact && contactLine(contact);
     if (synthetic) {
       augmentedBody = augmentedBody ? `${augmentedBody}\n${synthetic}` : synthetic;
@@ -154,7 +137,7 @@ async function processOne({ from, body, raw = null }) {
       console.error('[whatsapp] conversation error:', err);
       // The draft that would have carried these receipts never formed; don't keep the images.
       await mediaIntake.discard(user.id, mediaIds);
-      await twilioClient.sendText(from, 'Sorry, something went wrong. Please try again.');
+      await reply('Sorry, something went wrong. Please try again.');
       return;
     }
 
@@ -165,10 +148,10 @@ async function processOne({ from, body, raw = null }) {
 
     if (isConfirmation && text) {
       log.msgOut(from, text, 'template');
-      await twilioClient.sendConfirmation(from, text);
+      await channels.forAddress(from).sendConfirmation(from, text);
     } else if (text) {
       log.msgOut(from, text);
-      await twilioClient.sendText(from, text);
+      await reply(text);
     }
   } catch (err) {
     // Lookup failed before we knew whether this is a signup answer: don't log the body.
@@ -176,7 +159,7 @@ async function processOne({ from, body, raw = null }) {
     console.error('[whatsapp] processing error:', err);
     if (user && mediaIds.length) await mediaIntake.discard(user.id, mediaIds);
     try {
-      await twilioClient.sendText(from, 'Sorry, something went wrong. Please try again.');
+      await reply('Sorry, something went wrong. Please try again.');
     } catch (sendErr) {
       console.error('[whatsapp] also failed to send error reply:', sendErr.message);
     }

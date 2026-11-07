@@ -10,7 +10,10 @@
  * problem is listed alongside the others).
  */
 
-const ALWAYS_REQUIRED = ['DATABASE_URL', 'OPENAI_API_KEY', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'ERPNEXT_URL'];
+const ALWAYS_REQUIRED = ['DATABASE_URL', 'OPENAI_API_KEY', 'ERPNEXT_URL'];
+// Required unless LINE is the configured channel (see "messaging channels" in validateEnv).
+const TWILIO_REQUIRED = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN'];
+const LINE_VARS = ['LINE_CHANNEL_SECRET', 'LINE_CHANNEL_ACCESS_TOKEN'];
 
 const OPTIONAL_TEMPLATES = [
   ['TWILIO_DIGEST_CONTENT_SID', 'morning digest goes free-form, only inside the 24h window'],
@@ -36,7 +39,7 @@ function parseHttpUrl(name, value) {
 
 /**
  * The WhatsApp sender for TWILIO_ENV, i.e. the variable resolveFromNumber() in
- * src/twilio-client.js will actually send from. That function picks, in live mode,
+ * src/channels/twilio.js (instantiated by src/twilio-client.js) will actually send from. That function picks, in live mode,
  * LIVE || SANDBOX || legacy, so a live config without *_LIVE but with *_SANDBOX set would send
  * from the sandbox number: refused here. Live falls back to the legacy number only when
  * *_SANDBOX is unset. TWILIO_ENV is lowercased but not trimmed, exactly as twilio-client.js
@@ -82,9 +85,29 @@ function validateEnv(env = process.env) {
     else if (r.url !== env.ERPNEXT_URL) normalized.ERPNEXT_URL = r.url;
   }
 
-  const sender = senderFor(env);
+  // ── messaging channels (Twilio WhatsApp / LINE) ─────────────────────────────────────────
+  // Twilio is required unless LINE is fully configured; then it's optional (a warning when
+  // absent) but, once any TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN is set, validated in full.
+  // At least one channel must be complete. LINE here is only "both vars or neither"; anything
+  // further about LINE belongs to the LINE adapter.
+  const lineSet = LINE_VARS.filter((n) => isSet(env[n]));
+  const lineOn = lineSet.length === LINE_VARS.length;
+  if (lineSet.length && !lineOn) {
+    errors.push(`${LINE_VARS.find((n) => !isSet(env[n]))} is not set (LINE needs both ${LINE_VARS.join(' and ')}, or neither)`);
+  }
+  const twilioOn = !lineOn || TWILIO_REQUIRED.some((n) => isSet(env[n]));
+  if (twilioOn) {
+    for (const name of TWILIO_REQUIRED) {
+      if (!isSet(env[name])) errors.push(`${name} is not set`);
+    }
+  } else {
+    warnings.push('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not set: WhatsApp is off (LINE only; customer invoices and reminders need WhatsApp)');
+  }
+  // ── end messaging channels ──────────────────────────────────────────────────────────────
+
+  const sender = twilioOn ? senderFor(env) : {};
   if (sender.error) errors.push(sender.error);
-  else if (!String(env[sender.name]).trim().startsWith('whatsapp:')) {
+  else if (sender.name && !String(env[sender.name]).trim().startsWith('whatsapp:')) {
     warnings.push(`${sender.name} should start with "whatsapp:" (e.g. whatsapp:+14155238886)`);
   }
   if (production && sender.mode === 'sandbox') warnings.push('NODE_ENV=production with TWILIO_ENV=sandbox: only numbers that joined the sandbox can use the bot');
@@ -99,7 +122,7 @@ function validateEnv(env = process.env) {
   }
 
   if (production) {
-    if (!isSet(env.PUBLIC_BASE_URL) && !isSet(env.TWILIO_WEBHOOK_URL)) {
+    if (twilioOn && !isSet(env.PUBLIC_BASE_URL) && !isSet(env.TWILIO_WEBHOOK_URL)) {
       errors.push('NODE_ENV=production needs PUBLIC_BASE_URL or TWILIO_WEBHOOK_URL (otherwise POST /webhook refuses every request)');
     }
     for (const u of callbackUrls) {
@@ -108,13 +131,13 @@ function validateEnv(env = process.env) {
     if (isSet(env.TWILIO_WEBHOOK_URL) && !isSet(env.PUBLIC_BASE_URL)) {
       warnings.push('PUBLIC_BASE_URL is not set: POST /twilio/status refuses callbacks and sends request no status callback');
     }
-    if (!isSet(env.TWILIO_CONFIRMATION_CONTENT_SID)) errors.push('TWILIO_CONFIRMATION_CONTENT_SID is not set (confirmation cards need it; create with `npm run create-template`)');
+    if (twilioOn && !isSet(env.TWILIO_CONFIRMATION_CONTENT_SID)) errors.push('TWILIO_CONFIRMATION_CONTENT_SID is not set (confirmation cards need it; create with `npm run create-template`)');
     // Same test as src/messages.js.
     if (String(env.LOG_MESSAGES || '').toLowerCase() === 'true') errors.push('LOG_MESSAGES must not be true in production (retention policy: no chat logs)');
     if (isSet(env.SEED_TEST_USER_PHONE)) errors.push('SEED_TEST_USER_PHONE must be unset in production (it seeds a test user on every boot)');
   }
 
-  for (const [name, effect] of OPTIONAL_TEMPLATES) {
+  for (const [name, effect] of twilioOn ? OPTIONAL_TEMPLATES : []) {
     if (!isSet(env[name])) warnings.push(`${name} is not set: ${effect}`);
   }
   for (const name of ['ERPNEXT_API_KEY', 'ERPNEXT_API_SECRET']) {

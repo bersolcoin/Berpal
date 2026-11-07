@@ -29,6 +29,12 @@ const remindersJob = require('../src/jobs/reminders.job');
 const cleanupJob = require('../src/jobs/cleanup.job');
 const conversation = require('../src/conversation');
 const twilioClient = require('../src/twilio-client');
+// The 'whatsapp' channel counts as configured from here on (outreach refuses to render or upload
+// anything otherwise). Set AFTER twilio-client built its sender, so that sender still has no real
+// Twilio client: every send below goes through the stubs.
+process.env.TWILIO_ACCOUNT_SID = 'ACtest';
+process.env.TWILIO_AUTH_TOKEN = 'test-token';
+process.env.TWILIO_WHATSAPP_NUMBER_SANDBOX = 'whatsapp:+14155238886';
 
 const erp = new FakeErpNext();
 let user;
@@ -689,8 +695,19 @@ test('template mode: invoice — approved wording in the preview, {{4}} is exact
 test('twilio-client.sendMedia reports { sids, errors } when not configured', async () => {
   const real = require.cache[require.resolve('../src/twilio-client')].exports;
   // Our stub replaced the export; re-load the module fresh to hit the real function.
+  // Without credentials (set at the top of this file for the channel's isConfigured): the fresh
+  // sender must not build a real Twilio client.
+  const saved = { sid: process.env.TWILIO_ACCOUNT_SID, token: process.env.TWILIO_AUTH_TOKEN };
+  delete process.env.TWILIO_ACCOUNT_SID;
+  delete process.env.TWILIO_AUTH_TOKEN;
   delete require.cache[require.resolve('../src/twilio-client')];
-  const fresh = require('../src/twilio-client');
+  let fresh;
+  try {
+    fresh = require('../src/twilio-client');
+  } finally {
+    process.env.TWILIO_ACCOUNT_SID = saved.sid;
+    process.env.TWILIO_AUTH_TOKEN = saved.token;
+  }
   require.cache[require.resolve('../src/twilio-client')].exports = real;
   const r = await fresh.sendMedia('+66812345678', 'hi', ['http://x/y.pdf']);
   assert.deepEqual(r.sids, []);
@@ -700,7 +717,8 @@ test('twilio-client.sendMedia reports { sids, errors } when not configured', asy
 // ── Reminders ──────────────────────────────────────────────────────────
 
 const jobDeps = (date, extra = {}) => ({
-  erp: erpnext.forUser(user), twilio: twilioStub,
+  // Customer reminders always go over WhatsApp (deps.whatsapp), never the owner's deps.channel.
+  erp: erpnext.forUser(user), whatsapp: twilioStub,
   now: new Date(`${date}T09:00:00Z`), clock: { date, time: '09:00', timezone: 'UTC' }, ...extra,
 });
 
@@ -1012,7 +1030,7 @@ test('deliver: re-validates the phone before uploading anything', async () => {
     kind: 'invoice', customer: 'Bad', customerId: 'Bad', to: 'whatsapp:+0123', phone: '+0123',
     refs: ['ACC-SINV-2026-00001'], pdfRefs: ['ACC-SINV-2026-00001'], qrAmount: 100, template: null, body: 'x',
   };
-  const r = await deliver(user, erpnext.forUser(user), msg, { twilio: twilioStub, today: TODAY });
+  const r = await deliver(user, erpnext.forUser(user), msg, { channel: twilioStub, today: TODAY });
   assert.equal(r.ok, false);
   assert.equal(pdfRequests.length + uploads.length + sent.length, 0);
 });
@@ -1042,7 +1060,7 @@ async function makeUser2() {
   return user2;
 }
 const deps2 = (date, extra = {}) => ({
-  erp: erpnext.forUser(user2), twilio: twilioStub,
+  erp: erpnext.forUser(user2), whatsapp: twilioStub,
   now: new Date(`${date}T09:00:00Z`), clock: { date, time: '09:00', timezone: 'UTC' }, ...extra,
 });
 
@@ -1060,7 +1078,7 @@ test('reminders job: timeoutMs export; an aborted signal stops before the next c
   // Abort while the first customer's message is going out: it completes, the second isn't started.
   const mid = new AbortController();
   const twilio = { async sendMedia(...a) { mid.abort(); return twilioStub.sendMedia(...a); } };
-  r = await remindersJob.run(user2, deps2(TODAY, { signal: mid.signal, twilio }));
+  r = await remindersJob.run(user2, deps2(TODAY, { signal: mid.signal, whatsapp: twilio }));
   assert.equal(sent.length, 1);
   assert.equal(r.sent, 1);
   assert.equal(r.failed, 0);

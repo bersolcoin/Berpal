@@ -1,5 +1,6 @@
 /**
- * In-chat onboarding for unknown WhatsApp numbers, plus the account-level replies registered users
+ * In-chat onboarding for unknown addresses (a WhatsApp number or a LINE user, src/channels/address.js;
+ * "phone" below means that address — it is what users.phone holds), plus the account-level replies registered users
  * get before the LLM (pending provisioning, closed account, "delete my account").
  *
  * A deterministic state machine — no LLM call — so an unknown number costs a couple of queries and
@@ -24,6 +25,7 @@
  */
 const { query, withTransaction } = require('../db');
 const { normalizePhone } = require('../users');
+const { maskAddress, channelOf } = require('../channels/address');
 const { cleanText } = require('../media/vision');
 const { ts } = require('../erp-sync/common');
 const { normalizeThaiTaxId } = require('./thai-tax-id');
@@ -41,10 +43,13 @@ const MASKED_STEPS = { tax_id: 4, accountant_name: 5, accountant_phone: 5 };
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-/** Last 4 digits only: operator logs must not carry full phone numbers. */
+/**
+ * Last 4 characters only (address.maskAddress): operator logs must not carry full phone numbers
+ * or LINE user ids. "+66812345678" → "…5678", "line:U…abcd" → "line:…abcd".
+ */
 function maskPhone(phone) {
-  const digits = String(phone || '').replace(/\D/g, '');
-  return digits ? `…${digits.slice(-4)}` : '?';
+  const id = String(phone || '').trim();
+  return id ? maskAddress(id) : '?';
 }
 
 function mode() {
@@ -82,6 +87,8 @@ function keyword(text) {
 const isSkip = (k) => k === 'skip' || k === 'ข้าม';
 const YES = new Set(['yes', 'y', 'yeah', 'yep', 'ใช่', 'จด', 'จดแล้ว']);
 const NO = new Set(['no', 'n', 'nope', 'ไม่', 'ไม่ใช่', 'ไม่ได้จด', 'ยังไม่จด']);
+// A message that is only a greeting is never an answer (no business is called "Hello").
+const GREETINGS = new Set(['hi', 'hello', 'hey', 'hiya', 'hi there', 'hello there', 'สวัสดี', 'สวัสดีครับ', 'สวัสดีค่ะ', 'หวัดดี']);
 const AGREE = new Set(['i agree', 'agree', 'ตกลง']);
 const REFUSE = new Set(['no', 'n', 'nope', 'disagree', 'i disagree', 'i do not agree', "i don't agree", 'i dont agree', 'ไม่', 'ไม่ตกลง', 'ไม่ยินยอม']);
 
@@ -181,16 +188,16 @@ async function deleteSession(phone) {
 }
 
 /** The question for a step (country-dependent for the tax id, name-dependent for the phone). */
-function prompt(step, answers) {
+function prompt(step, answers, channel) {
   switch (step) {
     case 'tax_id': return (answers.country || DEFAULT_COUNTRY) === 'TH' ? M.PROMPTS.tax_id_th : M.PROMPTS.tax_id_other;
     case 'accountant_phone': return M.PROMPTS.accountant_phone(answers.accountant_name || 'your accountant');
-    case 'consent': return M.CONSENT_NOTICE;
+    case 'consent': return M.consentNotice(channel);
     default: return M.PROMPTS[step];
   }
 }
 
-const ask = (step, answers) => `${prompt(step, answers)}${M.FOOTER}`;
+const ask = (step, answers, channel) => `${prompt(step, answers, channel)}${M.FOOTER}`;
 
 function retry(step, answers) {
   if (step === 'tax_id') return (answers.country || DEFAULT_COUNTRY) === 'TH' ? M.RETRY.tax_id_th : M.RETRY.tax_id_other;
@@ -267,7 +274,7 @@ async function createUser(phone, answers, source) {
     [phone, answers.name, country, info.currency, info.timezone,
       answers.vat_registered == null ? null : Number(answers.vat_registered), answers.tax_id || null,
       answers.accountant_name || null, answers.accountant_phone || null,
-      answers.consent_at || now, M.CONSENT_VERSION, source, now]
+      answers.consent_at || now, M.consentVersion(channelOf(phone)), source, now]
   );
   return r.rows[0];
 }
@@ -295,13 +302,15 @@ async function handleUnknownPhone(from, body) {
     log.msgOut(from, logged, 'onboarding');
     return sent;
   };
-  const askLogged = (step, answers) => reply(ask(step, answers), ask(step, { country: answers.country }));
+  const channel = channelOf(phone);
+  const askLogged = (step, answers) => reply(ask(step, answers, channel), ask(step, { country: answers.country }, channel));
 
   if (!session) {
     const code = matchInvite(text, { inSentence: true });
     if (!code && mode() === 'closed') return reply(M.INVITE_ONLY);
     if (k === 'cancel') return reply(M.CANCELLED);
-    await startSession(phone, code ? `invite:${code}` : 'whatsapp');
+    // Self-serve source = the channel they came in on ('whatsapp' | 'line').
+    await startSession(phone, code ? `invite:${code}` : channelOf(phone));
     return reply(`${M.WELCOME}\n\n${ask('name', {})}`);
   }
 
@@ -316,8 +325,9 @@ async function handleUnknownPhone(from, body) {
     await saveSession(phone, prev, answers);
     return askLogged(prev, answers);
   }
-  // Blank (media only) or the invite code sent again: re-ask instead of taking it as the answer.
-  if (!text.trim() || matchInvite(text)) return askLogged(step, answers);
+  // Blank (media only), the invite code sent again, or a bare greeting (LINE's `follow` event
+  // arrives as 'hi', e.g. after unblocking mid-signup): re-ask instead of taking it as the answer.
+  if (!text.trim() || matchInvite(text) || GREETINGS.has(k)) return askLogged(step, answers);
 
   if (step === 'consent' && REFUSE.has(k)) {
     await deleteSession(phone);

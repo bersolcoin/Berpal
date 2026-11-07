@@ -7,7 +7,8 @@ const db = require('./src/db');
 const { processIncomingMessage } = require('./src/whatsapp');
 const scheduler = require('./src/jobs/scheduler');
 const { jobsDisabled } = require('./src/jobs');
-const { webhookHandler, webhookUrl } = require('./src/webhook');
+const { webhookUrl } = require('./src/webhook');
+const channels = require('./src/channels');
 const { createHealthHandler } = require('./src/health');
 
 (async () => {
@@ -50,24 +51,37 @@ const { createHealthHandler } = require('./src/health');
   // like 63016 on job_runs. Signature-checked against PUBLIC_BASE_URL.
   app.post('/twilio/status', scheduler.twilioStatusHandler());
 
-  // Inbound messages. X-Twilio-Signature is checked against TWILIO_WEBHOOK_URL (or
+  // Inbound messages: one webhook route per configured channel (src/channels — each adapter
+  // names its webhookPath and verifies its own signature).
+  // WhatsApp, POST /webhook: X-Twilio-Signature is checked against TWILIO_WEBHOOK_URL (or
   // PUBLIC_BASE_URL + '/webhook'); a malformed URL throws here and stops the boot. With neither
   // set: production refuses every request, dev skips the check (see src/webhook.js).
-  const signedUrl = webhookUrl();
-  if (!signedUrl && process.env.NODE_ENV === 'production') {
-    console.error('[server] ✖ NODE_ENV=production without TWILIO_WEBHOOK_URL / PUBLIC_BASE_URL: POST /webhook will refuse every request (403).');
-  } else if (!signedUrl) {
-    console.warn('');
-    console.warn('[server] ⚠⚠⚠ WARNING: PUBLIC_BASE_URL / TWILIO_WEBHOOK_URL not set — POST /webhook accepts UNSIGNED requests.');
-    console.warn('[server] ⚠⚠⚠ Anyone who knows the URL can post as any registered user. Fine for local ngrok dev; refused when NODE_ENV=production.');
-    console.warn('');
+  const mounted = [];
+  for (const ch of channels.configured()) {
+    const opts = { processMessage: processIncomingMessage };
+    let note = '';
+    if (ch.name === 'whatsapp') {
+      const signedUrl = webhookUrl();
+      if (!signedUrl && process.env.NODE_ENV === 'production') {
+        console.error('[server] ✖ NODE_ENV=production without TWILIO_WEBHOOK_URL / PUBLIC_BASE_URL: POST /webhook will refuse every request (403).');
+      } else if (!signedUrl) {
+        console.warn('');
+        console.warn('[server] ⚠⚠⚠ WARNING: PUBLIC_BASE_URL / TWILIO_WEBHOOK_URL not set — POST /webhook accepts UNSIGNED requests.');
+        console.warn('[server] ⚠⚠⚠ Anyone who knows the URL can post as any registered user. Fine for local ngrok dev; refused when NODE_ENV=production.');
+        console.warn('');
+      }
+      opts.url = signedUrl;
+      note = signedUrl ? ` (signed as ${signedUrl})` : ' (signature check OFF)';
+    }
+    app.post(ch.webhookPath, ch.webhookHandler(opts));
+    mounted.push(`${ch.name}: POST ${ch.webhookPath}${note}`);
   }
-  app.post('/webhook', webhookHandler({ processMessage: processIncomingMessage, url: signedUrl }));
+  if (!mounted.length) console.error('[server] ✖ no messaging channel is configured: no inbound webhook mounted');
 
   const port = process.env.PORT || 3000;
   app.listen(port, () => {
     console.log(`[server] listening on http://localhost:${port}`);
-    console.log(`[server] webhook path: POST /webhook${signedUrl ? ` (signed as ${signedUrl})` : ' (signature check OFF)'}`);
+    for (const m of mounted) console.log(`[server] webhook ${m}`);
   });
 })().catch((err) => {
   console.error('[server] startup failed:', err);

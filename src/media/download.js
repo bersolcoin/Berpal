@@ -87,11 +87,20 @@ async function twilioDownload(url) {
 
 let _impl = twilioDownload;
 
-/** Resolve to a Buffer of the media bytes; throws on failure, bad URL, or over MEDIA_MAX_BYTES. */
+/** Throws MediaTooLargeError over MEDIA_MAX_BYTES; returns `bytes`. Any channel's download. */
+function enforceMaxBytes(bytes) {
+  if (bytes.length > maxBytes) throw new MediaTooLargeError(bytes.length);
+  return bytes;
+}
+
+/**
+ * Twilio media (the 'whatsapp' channel's downloadMedia): resolve to a Buffer of the bytes;
+ * throws on failure, bad URL, or over MEDIA_MAX_BYTES.
+ */
 async function downloadMedia(url) {
   const bytes = await _impl(url);
   // Stubs (tests) bypass readCapped; keep the cap authoritative for every path.
-  if (bytes.length > maxBytes) throw new MediaTooLargeError(bytes.length);
+  enforceMaxBytes(bytes);
   console.log(`• [media] [${ts()}] downloaded ${bytes.length} bytes`);
   return bytes;
 }
@@ -107,6 +116,6 @@ function _setMaxBytesForTests(n) {
 }
 
 module.exports = {
-  downloadMedia, isTwilioMediaUrl, parseMaxBytes, MediaTooLargeError,
+  downloadMedia, enforceMaxBytes, isTwilioMediaUrl, parseMaxBytes, MediaTooLargeError,
   _setDownloaderForTests, _setMaxBytesForTests,
 };

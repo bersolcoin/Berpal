@@ -19,6 +19,7 @@ const db = require('../src/db');
 const conversation = require('../src/conversation');
 const twilioClient = require('../src/twilio-client');
 const { processIncomingMessage } = require('../src/whatsapp');
+const { inboundFromTwilio } = require('../src/channels/twilio');
 const onboarding = require('../src/onboarding');
 const M = require('../src/onboarding/messages');
 const provision = require('../scripts/provision-user');
@@ -79,7 +80,7 @@ beforeEach(() => {
 /** Send one message from `phone`; the reply text, or null when the bot stayed silent. */
 async function say(phone, body, raw = null) {
   const before = sent.length;
-  await processIncomingMessage({ from: `whatsapp:${phone}`, body, raw: raw || { Body: body, NumMedia: '0' } });
+  await processIncomingMessage(await inboundFromTwilio({ NumMedia: '0', ...(raw || {}), From: `whatsapp:${phone}`, Body: body }));
   assert.ok(sent.length - before <= 1, 'at most one reply per message');
   return sent.length > before ? sent[sent.length - 1].text : null;
 }
@@ -345,7 +346,7 @@ test('rate limit: 20 messages per unknown phone per day, then silence', async ()
   // Silence means no Twilio call at all.
   for (let i = 1; i < onboarding.DAILY_LIMIT; i++) await say(P, `again ${i}`);
   const before = sent.length;
-  await processIncomingMessage({ from: `whatsapp:${P}`, body: 'still there?', raw: { Body: 'x', NumMedia: '0' } });
+  await processIncomingMessage(await inboundFromTwilio({ From: `whatsapp:${P}`, Body: 'still there?', NumMedia: '0' }));
   assert.equal(sent.length, before);
   // Pruning on another phone's first message of the day keeps today's rows.
   await say('+66810000056', 'first today');

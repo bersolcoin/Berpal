@@ -9,6 +9,10 @@
  *   deliver() — side effects: render PDFs, upload them (and the QR) as public ERPNext Files,
  *               send via Twilio, log to outreach_log.
  *
+ * Customer outreach is WhatsApp-only for now, whatever channel the owner talks to us on: callers
+ * pass the 'whatsapp' channel (channels.get('whatsapp')) as `channel`; `twilio` is accepted as
+ * the legacy option name for the same object.
+ *
  * Twilio can only attach media it can download from a public URL, and server.js isn't ours to
  * extend, so attachments are public ERPNext Files with a random suffix (the URL is the only
  * secret). src/jobs/reminders.job.js deletes them after FILE_TTL_DAYS.
@@ -26,6 +30,13 @@ const FREEFORM_NOTE =
 const PDF_NOTE = 'The invoice PDF shows the line-item descriptions as entered.';
 const ONE_MEDIA_NOTE = 'WhatsApp allows one attachment per message, so each attachment arrives as its own WhatsApp message (see whatsapp_messages).';
 const MAX_PDFS_PER_MESSAGE = 3;
+
+const NOT_CONFIGURED_ERROR = "WhatsApp isn't set up on this server, and customer messages go over WhatsApp only — nothing was sent.";
+
+/** The customer channel exists and has its credentials (a stub without isConfigured counts as ready). */
+function whatsappReady(channel) {
+  return Boolean(channel) && (typeof channel.isConfigured !== 'function' || channel.isConfigured());
+}
 
 /** The user's local calendar date (users.timezone, default Asia/Bangkok). */
 function localToday(user, now = new Date()) {
@@ -114,9 +125,9 @@ async function resolveCustomerPhone(user, inv) {
 }
 
 /** Template mode (approved WhatsApp template, works outside the 24h window) when configured. */
-function templateSid(kind, twilio) {
+function templateSid(kind, channel) {
   const sid = kind === 'invoice' ? process.env.TWILIO_INVOICE_CONTENT_SID : process.env.TWILIO_REMINDER_CONTENT_SID;
-  return sid && twilio && typeof twilio.sendTemplate === 'function' ? sid : null;
+  return sid && channel && channel.supportsTemplates !== false && typeof channel.sendTemplate === 'function' ? sid : null;
 }
 
 /** "••••5678" — enough for the user to recognise their own account, no more. */
@@ -145,7 +156,7 @@ function templatePreview(kind, contentSid, vars) {
  * one statement template (no PDFs, {{1}} customer {{2}} total {{3}} statement). The QR follows
  * as a free-form media message either way.
  */
-function composeMessage(user, invoices, { kind, today, to, twilio }) {
+function composeMessage(user, invoices, { kind, today, to, channel }) {
   const first = invoices[0];
   const customer = first.customer_name || first.customer;
   const from = first.company || user.display_name || '';
@@ -172,7 +183,7 @@ function composeMessage(user, invoices, { kind, today, to, twilio }) {
   }
   if (qrAmount) lines.push(`Scan the QR to pay ${money('THB', qrAmount)} by PromptPay.`);
 
-  const contentSid = templateSid(kind, twilio);
+  const contentSid = templateSid(kind, channel);
   let body;
   let template = null;
   let pdfRefs;
@@ -206,7 +217,8 @@ function composeMessage(user, invoices, { kind, today, to, twilio }) {
  * Plan for send_invoice: one invoice, one message.
  *   returns { ok: true, message } | { ok: false, error }
  */
-async function planInvoice(user, erp, { ref, today = localToday(user), twilio = null }) {
+async function planInvoice(user, erp, { ref, today = localToday(user), channel = null, twilio = null }) {
+  channel = channel || twilio;
   let inv;
   try {
     inv = await loadInvoice(erp, ref, 'invoice');
@@ -215,7 +227,7 @@ async function planInvoice(user, erp, { ref, today = localToday(user), twilio = 
   }
   const to = await resolveCustomerPhone(user, inv);
   if (!to.ok) return { ok: false, error: to.error, customer: inv.customer_name || inv.customer };
-  return { ok: true, message: composeMessage(user, [inv], { kind: 'invoice', today, to, twilio }) };
+  return { ok: true, message: composeMessage(user, [inv], { kind: 'invoice', today, to, channel }) };
 }
 
 /**
@@ -223,7 +235,8 @@ async function planInvoice(user, erp, { ref, today = localToday(user), twilio = 
  * Problems never abort the rest: each bad ref lands in `problems`.
  *   returns { messages, problems: [{ ref, error }] }
  */
-async function planReminders(user, erp, { refs, today = localToday(user), twilio = null }) {
+async function planReminders(user, erp, { refs, today = localToday(user), channel = null, twilio = null }) {
+  channel = channel || twilio;
   const byCustomer = new Map();
   const problems = [];
   for (const ref of refs) {
@@ -242,7 +255,7 @@ async function planReminders(user, erp, { refs, today = localToday(user), twilio
       for (const inv of invoices) problems.push({ ref: inv.name, error: to.error });
       continue;
     }
-    messages.push(composeMessage(user, invoices, { kind: 'reminder', today, to, twilio }));
+    messages.push(composeMessage(user, invoices, { kind: 'reminder', today, to, channel }));
   }
   return { messages, problems };
 }
@@ -316,11 +329,14 @@ async function logOutreach(user, msg, { status, error, files, sid, today }) {
  * Render + upload attachments, send, log. Never throws for send problems.
  *   returns { ok, status: 'sent'|'partial'|'failed', refs, sent_to, phone, message_sids, error? }
  */
-async function deliver(user, erp, msg, { twilio, today = localToday(user), signal = null }) {
+async function deliver(user, erp, msg, { channel = null, twilio = null, today = localToday(user), signal = null }) {
+  channel = channel || twilio;
   const files = [];
   let sids = [];
   let errors = [];
   try {
+    // WhatsApp off (a LINE-only deploy): refuse before any PDF/QR is rendered or made public.
+    if (!whatsappReady(channel)) throw new Error(NOT_CONFIGURED_ERROR);
     // Re-check the number before anything is uploaded: a bad one would only bounce at Twilio
     // after the PDFs/QR were already public.
     const check = normalizePhone(msg.phone, null);
@@ -350,11 +366,11 @@ async function deliver(user, erp, msg, { twilio, today = localToday(user), signa
     if (msg.template) {
       // {{4}} is exactly one URL (invoice template only).
       const vars = { ...msg.template.variables, ...(pdfUrls.length ? { 4: pdfUrls[0] } : {}) };
-      const sid = await twilio.sendTemplate(msg.to, msg.template.contentSid, vars);
+      const sid = await channel.sendTemplate(msg.to, msg.template.contentSid, vars);
       if (sid) {
         sids.push(sid);
         if (qrUrl) {
-          const r = await twilio.sendMedia(msg.to, null, [qrUrl]);
+          const r = await channel.sendMedia(msg.to, null, [qrUrl]);
           sids.push(...r.sids);
           errors.push(...r.errors);
         }
@@ -362,7 +378,7 @@ async function deliver(user, erp, msg, { twilio, today = localToday(user), signa
         errors.push({ index: 0, code: null, message: 'template send failed (see [twilio] log)' });
       }
     } else {
-      const r = await twilio.sendMedia(msg.to, msg.body, [...pdfUrls, qrUrl].filter(Boolean));
+      const r = await channel.sendMedia(msg.to, msg.body, [...pdfUrls, qrUrl].filter(Boolean));
       sids = r.sids;
       errors = r.errors;
     }
@@ -424,5 +440,5 @@ async function customerAttempts(user, customer, refs) {
 module.exports = {
   planInvoice, planReminders, deliver, previewView, previewEntry, previewNotes, previewText, listOpenReceivables,
   customerRemindedWithin, customerAttempts, localToday, dueLabel, daysBetween, maskPayee,
-  MAX_PDFS_PER_MESSAGE,
+  whatsappReady, MAX_PDFS_PER_MESSAGE, NOT_CONFIGURED_ERROR,
 };

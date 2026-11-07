@@ -1,6 +1,8 @@
 /**
- * Media intake for an inbound WhatsApp message: receipt/bill photos and PDFs are scanned and
- * stored, voice notes are transcribed. vCards are left to whatsapp.js (extractContactShare).
+ * Media intake for an inbound message (any channel): receipt/bill photos and PDFs are scanned and
+ * stored, voice notes are transcribed. Items come from inbound.media and are downloaded through
+ * the channel that produced them (channel.downloadMedia(item)); shared contacts arrive already
+ * parsed in inbound.contacts and are left to whatsapp.js.
  *
  * HEIC/HEIF photos are converted to JPEG first (src/media/heic.js) and then treated exactly like a
  * JPEG; only when conversion fails does the user get the "send it as JPEG" reply.
@@ -15,7 +17,8 @@
  *   reply       when set, send this plain text to the user and stop — nothing usable arrived
  *   silent      when true, do nothing at all (e.g. a lone sticker)
  */
-const { downloadMedia } = require('./download');
+const { enforceMaxBytes } = require('./download');
+const channels = require('../channels');
 const { scanDocument, formatScanLine, cleanText } = require('./vision');
 const { transcribe } = require('./transcribe');
 const { heicToJpeg } = require('./heic');
@@ -50,29 +53,48 @@ function kindOf(contentType) {
   return 'unsupported';
 }
 
-function listMedia(raw) {
-  if (!raw) return [];
-  const n = parseInt(raw.NumMedia || '0', 10) || 0;
-  const out = [];
-  for (let i = 0; i < n; i++) {
-    const contentType = raw[`MediaContentType${i}`];
-    const url = raw[`MediaUrl${i}`];
-    if (contentType && url) out.push({ contentType: String(contentType).split(';')[0].trim().toLowerCase(), url });
-  }
-  return out;
+/** inbound.media with content types normalised (the channel should already have done it). */
+function listMedia(inbound) {
+  if (!inbound || !Array.isArray(inbound.media)) return [];
+  return inbound.media
+    .filter((m) => m && m.contentType && (m.ref != null || m.url))
+    .map((m) => ({ ...m, contentType: String(m.contentType).split(';')[0].trim().toLowerCase() }));
 }
+
+/** The channel that delivered this message (its own media refs only make sense to it). */
+function channelFor(user, inbound) {
+  return (inbound && inbound.channel && channels.get(inbound.channel)) || channels.forAddress(user.phone);
+}
+
+/**
+ * Bytes of one item via its channel; the MEDIA_MAX_BYTES cap is re-checked whatever the channel.
+ * → { bytes, contentType }. The type the download reports wins over the one the webhook declared
+ * when it is one we can read in the same way (`kinds`): LINE declares every image as image/jpeg
+ * and every voice note as audio/mp4, but serves the real type (e.g. a PNG). Anything else — a
+ * missing, unknown or other-family type — keeps the declared one.
+ */
+async function fetchItem(channel, item, kinds) {
+  const got = (await channel.downloadMedia(item)) || {};
+  const bytes = enforceMaxBytes(got.bytes);
+  const served = got.contentType ? String(got.contentType).split(';')[0].trim().toLowerCase() : '';
+  const contentType = served && kinds.includes(kindOf(served)) ? served : item.contentType;
+  return { bytes, contentType };
+}
+
+const SCAN_KINDS = ['document', 'webp', 'heic'];
 
 /** Voice transcripts are user-controlled text going into the prompt: same flattening as scan values. */
 function cleanTranscript(text) {
   return cleanText(text, MAX_TRANSCRIPT_CHARS);
 }
 
-async function scanItem(user, { contentType, url }) {
+async function scanItem(user, channel, item) {
+  let { contentType } = item;
   let bytes;
   let scan;
   try {
     // The MEDIA_MAX_BYTES cap applies to the original download, HEIC included.
-    bytes = await downloadMedia(url);
+    ({ bytes, contentType } = await fetchItem(channel, item, SCAN_KINDS));
     if (kindOf(contentType) === 'heic') {
       try {
         bytes = await heicToJpeg(bytes);
@@ -107,9 +129,9 @@ async function scanItem(user, { contentType, url }) {
   return { ok: true, mediaId, line: formatScanLine(mediaId, scan) };
 }
 
-async function transcribeItem({ contentType, url }) {
+async function transcribeItem(channel, item) {
   try {
-    const bytes = await downloadMedia(url);
+    const { bytes, contentType } = await fetchItem(channel, item, ['audio']);
     const text = cleanTranscript(await transcribe(bytes, contentType));
     if (!text) throw new Error('empty transcript after cleaning');
     return { ok: true, text };
@@ -121,16 +143,18 @@ async function transcribeItem({ contentType, url }) {
 
 /**
  * @param {object} user  users row (id, timezone)
- * @param {object|null} raw  Twilio webhook body
+ * @param {object|null} inbound  the normalised inbound message (src/channels/index.js)
  * @param {string} body  the user's caption / text
  */
-async function intake(user, raw, body = '') {
+async function intake(user, inbound, body = '') {
   const result = { lines: [], transcript: null, mediaIds: [], reply: null, silent: false };
-  const media = listMedia(raw);
+  const media = listMedia(inbound);
   if (!media.length) return result;
+  const channel = channelFor(user, inbound);
 
   const hasCaption = Boolean(String(body || '').trim());
-  let usable = hasCaption; // anything for the model to act on?
+  // Anything for the model to act on? A shared contact counts, as the vCard item used to.
+  let usable = hasCaption || Boolean(inbound.contacts && inbound.contacts.length);
   let scanFailed = false;
   let tooLarge = false;
   let voiceFailed = false;
@@ -156,7 +180,7 @@ async function intake(user, raw, body = '') {
     }
 
     if (kind === 'document' || kind === 'webp' || kind === 'heic') {
-      const r = await scanItem(user, item);
+      const r = await scanItem(user, channel, item);
       if (r.ok) {
         usable = true;
         if (r.mediaId != null) result.mediaIds.push(r.mediaId);
@@ -172,7 +196,7 @@ async function intake(user, raw, body = '') {
     }
 
     // kind === 'audio'
-    const r = await transcribeItem(item);
+    const r = await transcribeItem(channel, item);
     if (r.ok) {
       usable = true;
       transcripts.push(r.text);
@@ -209,7 +233,7 @@ async function discard(userId, mediaIds) {
 }
 
 module.exports = {
-  intake, discard, kindOf,
+  intake, discard, kindOf, listMedia,
   SCAN_FAILED_REPLY, TOO_LARGE_REPLY, VOICE_FAILED_REPLY, HEIC_REPLY, UNSUPPORTED_REPLY,
   SCAN_FAILED_MARKER, VOICE_FAILED_MARKER,
 };

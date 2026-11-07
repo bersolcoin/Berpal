@@ -1,4 +1,4 @@
-const { planInvoice, deliver, previewView, previewEntry, previewNotes, previewText, localToday } = require('../outreach/send-invoice');
+const { planInvoice, deliver, previewView, previewEntry, previewNotes, previewText, localToday, whatsappReady, NOT_CONFIGURED_ERROR } = require('../outreach/send-invoice');
 const gate = require('../outreach/gate');
 const { getErp } = require('./context');
 
@@ -20,9 +20,15 @@ const definition = {
 
 async function execute(args, ctx) {
   const erp = getErp(ctx);
-  const twilio = require('../twilio-client');
+  // Customers are reached over WhatsApp only for now, whatever channel the owner uses.
+  const channel = require('../channels').get('whatsapp');
+  // Not configured (LINE-only deploy): say so up front instead of previewing an unsendable message.
+  if (!whatsappReady(channel)) {
+    gate.clearPreview(ctx, TOOL);
+    return { ok: false, error: NOT_CONFIGURED_ERROR };
+  }
   const today = localToday(ctx.user);
-  const plan = await planInvoice(ctx.user, erp, { ref: args.ref, today, twilio });
+  const plan = await planInvoice(ctx.user, erp, { ref: args.ref, today, channel });
   if (!plan.ok) {
     // Nothing sendable any more (paid, cancelled, phone removed): a stale preview mustn't linger.
     gate.clearPreview(ctx, TOOL);
@@ -45,7 +51,7 @@ async function execute(args, ctx) {
   }
 
   gate.clearPreview(ctx, TOOL);
-  return deliver(ctx.user, erp, plan.message, { twilio, today });
+  return deliver(ctx.user, erp, plan.message, { channel, today });
 }
 
 module.exports = { definition, execute };

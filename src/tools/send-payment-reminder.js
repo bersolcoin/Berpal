@@ -1,6 +1,6 @@
 const counterparties = require('../counterparties');
 const {
-  planReminders, deliver, previewView, previewEntry, previewNotes, previewText, listOpenReceivables, localToday, daysBetween,
+  planReminders, deliver, previewView, previewEntry, previewNotes, previewText, listOpenReceivables, localToday, daysBetween, whatsappReady, NOT_CONFIGURED_ERROR,
 } = require('../outreach/send-invoice');
 const gate = require('../outreach/gate');
 const { getErp } = require('./context');
@@ -51,7 +51,13 @@ async function selectRefs(user, erp, { ref, counterparty_id, scope }, today) {
 
 async function execute(args, ctx) {
   const erp = getErp(ctx);
-  const twilio = require('../twilio-client');
+  // Customers are reached over WhatsApp only for now, whatever channel the owner uses.
+  const channel = require('../channels').get('whatsapp');
+  // Not configured (LINE-only deploy): say so up front instead of previewing an unsendable message.
+  if (!whatsappReady(channel)) {
+    gate.clearPreview(ctx, TOOL);
+    return { ok: false, error: NOT_CONFIGURED_ERROR };
+  }
   const today = localToday(ctx.user);
   const sel = await selectRefs(ctx.user, erp, args, today);
   if (!sel.ok) return sel;
@@ -60,7 +66,7 @@ async function execute(args, ctx) {
     return { ok: true, sent: [], message: 'No unpaid invoices match — nothing to remind.' };
   }
 
-  const { messages, problems } = await planReminders(ctx.user, erp, { refs: sel.refs, today, twilio });
+  const { messages, problems } = await planReminders(ctx.user, erp, { refs: sel.refs, today, channel });
   const cannot = problems.length ? { cannot_send: problems } : {};
   if (!messages.length) {
     gate.clearPreview(ctx, TOOL);
@@ -87,7 +93,7 @@ async function execute(args, ctx) {
   const failed = [];
   for (const m of messages) {
     try {
-      const r = await deliver(ctx.user, erp, m, { twilio, today });
+      const r = await deliver(ctx.user, erp, m, { channel, today });
       if (r.ok) sent.push({ refs: m.refs, to: m.customer, phone: m.phone, status: r.status, ...(r.error ? { warning: r.error } : {}) });
       else failed.push({ refs: m.refs, error: r.error });
     } catch (err) {

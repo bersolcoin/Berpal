@@ -133,7 +133,7 @@ async function listPending(db, out) {
 }
 
 /**
- * The script body. `deps` lets tests inject the db module, an output function and a Twilio client;
+ * The script body. `deps` lets tests inject the db module, an output function and a channel (deps.channel, or the legacy deps.twilio);
  * the CLI wrapper at the bottom uses the real ones.
  */
 async function run(argv, deps = {}) {
@@ -253,14 +253,21 @@ async function run(argv, deps = {}) {
   let notified = 'no (--notify not given)';
   if (opts.notify) {
     try {
-      const twilio = deps.twilio || require('../src/twilio-client');
-      // No approved template exists for this message: free-form, so WhatsApp delivers it only if the
-      // user wrote in the last 24h. Twilio returns a SID either way; a late failure (63016) shows
-      // only in the status callback.
-      const sid = await twilio.sendText(user.phone, M.BOOKS_READY);
-      notified = sid
-        ? `accepted by Twilio (${sid}) — free-form, so delivered only if the user messaged in the last 24h; otherwise tell them another way`
-        : 'FAILED: not sent (Twilio not configured? see the log above)';
+      // The user's own channel, picked from their address (WhatsApp number or LINE user).
+      // deps.channel / deps.twilio (legacy name) are test injections.
+      const channel = deps.channel || deps.twilio || require('../src/channels').forAddress(user.phone);
+      const sid = await channel.sendText(user.phone, M.BOOKS_READY);
+      if (channel.supportsTemplates === false) {
+        // LINE push: no 24h window, delivered as soon as LINE accepts it.
+        notified = sid ? `pushed over ${channel.name} (${sid})` : `FAILED: not sent (${channel.name} not configured? see the log above)`;
+      } else {
+        // No approved template exists for this message: free-form, so WhatsApp delivers it only if the
+        // user wrote in the last 24h. Twilio returns a SID either way; a late failure (63016) shows
+        // only in the status callback.
+        notified = sid
+          ? `accepted by Twilio (${sid}) — free-form, so delivered only if the user messaged in the last 24h; otherwise tell them another way`
+          : 'FAILED: not sent (Twilio not configured? see the log above)';
+      }
     } catch (err) {
       notified = `FAILED: ${err.message}`;
     }
