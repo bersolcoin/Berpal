@@ -1,0 +1,50 @@
+# Local / single-host stack: Postgres + the bot. ERPNext is EXTERNAL — point ERPNEXT_URL in
+# .env at your ERPNext site; it is not part of this stack. Twilio needs a public https URL for
+# the webhook (PUBLIC_BASE_URL), e.g. a tunnel or a reverse proxy in front of port 3000.
+#
+#   cp .env.example .env   # fill in
+#   docker compose up --build -d
+#   curl localhost:3000/health
+#
+# The image defaults to NODE_ENV=production (strict env checks, see src/config.js). A fresh copy
+# of .env.example does NOT pass them (it sets LOG_MESSAGES=true and SEED_TEST_USER_PHONE, and
+# has no PUBLIC_BASE_URL): the app exits at boot and restarts in a loop. For a dev run against
+# the sandbox, set NODE_ENV=development in .env; for production, fix what `docker compose logs app`
+# lists under [config].
+# .env reaches the container through env_file at runtime only; .dockerignore keeps it out of
+# the image. POSTGRES_PASSWORD goes into a URL unescaped: avoid @ : / ? # % in it.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: berpal
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-berpal}
+      POSTGRES_DB: berpal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U berpal -d berpal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Overrides DATABASE_URL from .env. sslmode=disable: the compose Postgres has no TLS and
+      # src/db.js otherwise requests SSL for every non-Railway-internal host.
+      DATABASE_URL: postgresql://berpal:${POSTGRES_PASSWORD:-berpal}@db:5432/berpal?sslmode=disable
+      # Pinned to match the port mapping and the image HEALTHCHECK; a PORT in .env would
+      # otherwise move the listener away from the mapped 3000.
+      PORT: "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:

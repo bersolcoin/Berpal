@@ -1,28 +1,39 @@
 require('dotenv').config();
+// Env validation first: exits with one line per problem, and normalises ERPNEXT_URL before
+// src/erpnext.js reads it at load.
+require('./src/config').assertEnv();
 const express = require('express');
 const db = require('./src/db');
 const { processIncomingMessage } = require('./src/whatsapp');
 const scheduler = require('./src/jobs/scheduler');
 const { jobsDisabled } = require('./src/jobs');
 const { webhookHandler, webhookUrl } = require('./src/webhook');
+const { createHealthHandler } = require('./src/health');
 
 (async () => {
   await db.init();
 
+  let jobsRunning = false;
   // Daily per-user jobs (morning digest, reminders). DISABLE_JOBS=1|true|yes|on for a second
   // web-only instance or local dev — job_runs already prevents double sends, this just skips the work.
   if (!jobsDisabled(process.env.DISABLE_JOBS)) {
     scheduler.start();
-    // A signal listener replaces Node's default exit: let an in-flight tick finish (max 10s)
-    // so its job_runs rows get recorded, then exit.
-    const shutdown = async (signal) => {
+    jobsRunning = true;
+  }
+  // Always installed: in the Docker image node is PID 1, and PID 1 gets no default SIGTERM
+  // action, so without a listener `docker stop` waits out its timeout and SIGKILLs. With the
+  // scheduler running, let an in-flight tick finish (max 10s) so its job_runs rows get recorded.
+  const shutdown = async (signal) => {
+    if (jobsRunning) {
       console.log(`[server] ${signal}: stopping scheduler`);
       await Promise.race([scheduler.stop(), new Promise((resolve) => setTimeout(resolve, 10000))]);
-      process.exit(0);
-    };
-    process.once('SIGTERM', () => shutdown('SIGTERM'));
-    process.once('SIGINT', () => shutdown('SIGINT'));
-  }
+    } else {
+      console.log(`[server] ${signal}: exiting`);
+    }
+    process.exit(0);
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 
   const app = express();
   app.use(express.urlencoded({ extended: false }));
@@ -30,6 +41,10 @@ const { webhookHandler, webhookUrl } = require('./src/webhook');
   app.get('/', (_req, res) => {
     res.send('WhatsApp bot is running. POST /webhook for Twilio.');
   });
+
+  // Liveness + dependency checks (db, ERPNext, Twilio); ?deep=0 skips the external calls.
+  // 503 only when the db is down — see src/health.js.
+  app.get('/health', createHealthHandler({ scheduler: { running: () => jobsRunning } }));
 
   // Twilio delivery callbacks for scheduled sends (digest template) — marks async failures
   // like 63016 on job_runs. Signature-checked against PUBLIC_BASE_URL.
