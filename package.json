@@ -10,11 +10,17 @@
     "reset": "node scripts/reset-conversations.js",
     "test": "node --test test/",
     "test:llm": "node test/llm-harness.js",
-    "smoke:erpnext": "node scripts/smoke-erpnext.js"
+    "smoke:erpnext": "node scripts/smoke-erpnext.js",
+    "check:env": "node src/config.js",
+    "docker:build": "docker build -t berpal .",
+    "docker:up": "docker compose up --build -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f app"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "heic-convert": "^2.1.0",
     "openai": "^4.77.0",
     "pg": "^8.20.0",
     "qrcode": "^1.5.4",

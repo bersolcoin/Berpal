@@ -477,10 +477,23 @@ class FakeErpNext {
       case 'Item Group':
         if (!this.get('Item Group', d.parent_item_group)) throw new ErpError(417, `Could not find Item Group: ${d.parent_item_group}`);
         return this._put('Item Group', { ...d, name: d.item_group_name });
+      case 'Company':
+        // Just the record (scripts/provision-user.js): the fake's chart is seeded for COMPANY only.
+        if (this.get('Company', d.company_name)) throw new ErpError(409, `DuplicateEntryError: Company ${d.company_name} already exists`);
+        if (this.all('Company').some((c) => c.abbr === d.abbr)) throw new ErpError(417, `Abbreviation ${d.abbr} is already used for another company`);
+        return this._put('Company', { ...d, name: d.company_name, default_inventory_account: d.company_name === COMPANY ? STOCK_ACCOUNT : null });
+      case 'Warehouse':
+        return this._put('Warehouse', { ...d, name: `${d.warehouse_name} - ${(this.get('Company', d.company) || {}).abbr || ABBR}`, is_group: d.is_group || 0 });
       case 'Sales Invoice':
       case 'Purchase Invoice': return this.createInvoice(doctype, d);
       case 'Journal Entry': return this.createJournalEntry(d);
       case 'Payment Entry': return this.createPaymentEntry(d);
+      case 'Comment':
+        // Stock Comment doctype: the referenced document must exist (Dynamic Link validation).
+        if (!this.get(d.reference_doctype, d.reference_name)) {
+          throw new ErpError(417, `Could not find ${d.reference_doctype}: ${d.reference_name}`);
+        }
+        return this._put('Comment', { ...d, name: this._seq('CMT') });
       default:
         if (this.createHandlers[doctype]) return this._put(doctype, this.createHandlers[doctype](d));
         throw new ErpError(417, `fake-erpnext: create ${doctype} not supported`);

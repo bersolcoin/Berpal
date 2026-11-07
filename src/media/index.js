@@ -2,6 +2,9 @@
  * Media intake for an inbound WhatsApp message: receipt/bill photos and PDFs are scanned and
  * stored, voice notes are transcribed. vCards are left to whatsapp.js (extractContactShare).
  *
+ * HEIC/HEIF photos are converted to JPEG first (src/media/heic.js) and then treated exactly like a
+ * JPEG; only when conversion fails does the user get the "send it as JPEG" reply.
+ *
  * Each item is handled independently: one unreadable photo doesn't throw away the caption or the
  * other attachments, it just becomes a "[receipt could not be read]" marker for the model.
  *
@@ -15,7 +18,10 @@
 const { downloadMedia } = require('./download');
 const { scanDocument, formatScanLine, cleanText } = require('./vision');
 const { transcribe } = require('./transcribe');
+const { heicToJpeg } = require('./heic');
 const store = require('./store');
+const { query } = require('../db');
+const { contentHash } = require('../trust/duplicates');
 const { ts } = require('../erp-sync/common');
 
 const SCAN_FAILED_REPLY =
@@ -25,9 +31,9 @@ const TOO_LARGE_REPLY =
 const VOICE_FAILED_REPLY =
   "Sorry, I couldn't make out that voice note. Please try again, or type the message instead.";
 const HEIC_REPLY =
-  "Sorry, I can't read HEIC photos yet. Please send it as a regular photo (JPEG/PNG), or type the details.";
+  "Sorry, I couldn't open that HEIC photo. Please send it as a regular photo (JPEG/PNG), or type the details.";
 const UNSUPPORTED_REPLY =
-  "Sorry, I can't read that kind of file yet. I can handle receipt photos, PDF bills, voice notes and shared contacts.";
+  "Sorry, I can't read that kind of file yet. I can handle receipt photos (JPEG, PNG, HEIC), PDF bills, voice notes and shared contacts.";
 
 const SCAN_FAILED_MARKER = '[receipt could not be read]';
 const VOICE_FAILED_MARKER = '[voice note could not be transcribed]';
@@ -65,7 +71,17 @@ async function scanItem(user, { contentType, url }) {
   let bytes;
   let scan;
   try {
+    // The MEDIA_MAX_BYTES cap applies to the original download, HEIC included.
     bytes = await downloadMedia(url);
+    if (kindOf(contentType) === 'heic') {
+      try {
+        bytes = await heicToJpeg(bytes);
+      } catch (err) {
+        console.error(`• [media] [${ts()}] ${err.message}`);
+        return { ok: false, heic: true };
+      }
+      contentType = 'image/jpeg';
+    }
     scan = await scanDocument(bytes, contentType, { timezone: user.timezone });
   } catch (err) {
     console.error(`• [media] [${ts()}] scan failed: ${err.message}`);
@@ -78,6 +94,15 @@ async function scanItem(user, { contentType, url }) {
     mediaId = await store.saveBlob(user.id, { contentType, bytes });
   } catch (err) {
     console.error(`• [media] [${ts()}] blob store failed: ${err.message}`);
+  }
+  // Content hash for the duplicate guard (src/trust): request_confirmation reads it by the
+  // draft's receipt_media_id and puts it on the draft as receipt_hash. Best effort.
+  if (mediaId != null) {
+    try {
+      await query('UPDATE media_blobs SET sha256 = $1 WHERE id = $2 AND user_id = $3', [contentHash(bytes), mediaId, user.id]);
+    } catch (err) {
+      console.error(`• [media] [${ts()}] receipt hash failed: ${err.message}`);
+    }
   }
   return { ok: true, mediaId, line: formatScanLine(mediaId, scan) };
 }
@@ -120,10 +145,6 @@ async function intake(user, raw, body = '') {
       usable = true;
       continue;
     }
-    if (kind === 'heic') {
-      heic = true;
-      continue;
-    }
     if (kind === 'webp' && !hasCaption) {
       sticker = true;
       continue;
@@ -134,12 +155,14 @@ async function intake(user, raw, body = '') {
       continue;
     }
 
-    if (kind === 'document' || kind === 'webp') {
+    if (kind === 'document' || kind === 'webp' || kind === 'heic') {
       const r = await scanItem(user, item);
       if (r.ok) {
         usable = true;
         if (r.mediaId != null) result.mediaIds.push(r.mediaId);
         result.lines.push(r.line);
+      } else if (r.heic) {
+        heic = true; // conversion failed: the HEIC-specific marker / reply below
       } else {
         scanFailed = true;
         tooLarge = tooLarge || r.tooLarge;

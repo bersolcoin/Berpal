@@ -8,9 +8,7 @@ const log = require('./log');
 const mediaIntake = require('./media');
 const { downloadMedia } = require('./media/download');
 const { cleanText } = require('./media/vision');
-
-const REGISTRATION_LINK_REPLY =
-  "Hi! It looks like your number isn't registered yet. Please sign up at https://your-app.com/signup to link your WhatsApp number to your account.";
+const onboarding = require('./onboarding');
 
 // Goes through the media downloader so vCards get the same Twilio-host allowlist, timeout and
 // size cap as photos — MediaUrl* is attacker-controllable and carries our Twilio credentials.
@@ -76,14 +74,28 @@ function processIncomingMessage(args) {
 async function processOne({ from, body, raw = null }) {
   let user = null;
   let mediaIds = [];
+  let loggedIn = false;
   try {
-    log.msgIn(from, body);
-
     user = await users.findByPhone(from);
 
+    // Unknown number: the in-chat signup (src/onboarding) — deterministic, no LLM. null = rate-limited.
+    // Onboarding logs the message and reply itself: tax-ID / accountant answers are masked there.
     if (!user) {
-      log.msgOut(from, REGISTRATION_LINK_REPLY, 'unknown_phone');
-      await twilioClient.sendText(from, REGISTRATION_LINK_REPLY);
+      loggedIn = true;
+      const reply = await onboarding.handleUnknownPhone(from, body);
+      if (reply) await twilioClient.sendText(from, reply);
+      return;
+    }
+
+    log.msgIn(from, body);
+    loggedIn = true;
+
+    // Account-level replies before anything else: books not provisioned yet, closed account,
+    // "delete my account". null for an active user with nothing pending.
+    const accountReply = await onboarding.handleRegistered(user, body);
+    if (accountReply) {
+      log.msgOut(from, accountReply, 'account');
+      await twilioClient.sendText(from, accountReply);
       return;
     }
 
@@ -159,6 +171,8 @@ async function processOne({ from, body, raw = null }) {
       await twilioClient.sendText(from, text);
     }
   } catch (err) {
+    // Lookup failed before we knew whether this is a signup answer: don't log the body.
+    if (!loggedIn) log.msgIn(from, '[message not shown: user lookup failed]');
     console.error('[whatsapp] processing error:', err);
     if (user && mediaIds.length) await mediaIntake.discard(user.id, mediaIds);
     try {
