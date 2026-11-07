@@ -10,6 +10,8 @@ const counterparties = require('../counterparties');
 const { companyCurrency, computeDueDate, friendlyAccountName, round2 } = require('../erp-sync/common');
 const { computeTotals, vatTreatment } = require('../erp-sync/taxes');
 
+const WARNING_HEADER = '⚠ Please check before confirming:';
+
 // Our category codes (the CHART OF ACCOUNTS / CATEGORIZATION RULES in the prompt) → card names.
 const CATEGORY_NAMES = {
   1000: 'Cash', 1100: 'Bank', 1200: 'Accounts Receivable', 1400: 'Other Receivables',
@@ -79,7 +81,7 @@ async function parentDoc(getErp, draft) {
 /**
  * @returns {Promise<{ type_label, account_line, amount_line, due_line, settles_line, net_vat_lines, lines }>}
  *   lines: the whole card in order (Date, Amount, items, Net/VAT, WHT, Type, Account,
- *   Counterparty, Due, Settles, Note); empty fields are left out.
+ *   Counterparty, Due, Settles, Note, then any ⚠ trust warnings); empty fields are left out.
  */
 async function buildCard(user, draft, getErp = null) {
   const tt = draft.transaction_type || 'cash';
@@ -170,8 +172,13 @@ async function buildCard(user, draft, getErp = null) {
     settles_line,
     draft.description ? `Note: ${draft.description}` : null,
   ].filter(Boolean);
+  // Trust warnings (src/trust, set on the draft by request_confirmation), last, under one header.
+  const warning_lines = Array.isArray(draft.trust_warnings) && draft.trust_warnings.length
+    ? [WARNING_HEADER, ...draft.trust_warnings.map((w) => `- ${w}`)]
+    : [];
+  lines.push(...warning_lines);
 
-  return { type_label: typeLabel(draft), account_line: `Account: ${account_line}`, amount_line, due_line, settles_line, net_vat_lines, lines };
+  return { type_label: typeLabel(draft), account_line: `Account: ${account_line}`, amount_line, due_line, settles_line, net_vat_lines, warning_lines, lines };
 }
 
-module.exports = { buildCard, categoryName, fmt, CATEGORY_NAMES };
+module.exports = { buildCard, categoryName, fmt, CATEGORY_NAMES, WARNING_HEADER };

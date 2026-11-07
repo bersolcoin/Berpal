@@ -14,13 +14,15 @@ Nothing is posted without a confirmation card. `request_confirmation` builds the
 
 **Logging transactions.** Type it the way you'd say it: "paid 850 for lunch", "sold ruby 7.68ct to Jameel for 45,000 USD net 30", "got a bill from Acme for 12,000, due in 15 days". The bot fills in what it can, asks only for what's missing (wallet, a new contact's phone, payment terms), shows a card, and posts to ERPNext when you tap Confirm. Questions ("what's outstanding?", "how much does Jameel owe me?", "how much money do I have?") are answered from live ERPNext data.
 
-**Receipts, PDFs and voice notes.** Send a photo or PDF of a receipt or bill and the bot reads the merchant, date, total, VAT and invoice number, then runs the normal flow; when you confirm, the image is attached to the saved ERPNext document (private file). Send a voice note and it's transcribed and handled like a typed message — the reply opens with what it heard. HEIC photos get a "please send as JPEG" reply; stickers are ignored.
+**Receipts, PDFs and voice notes.** Send a photo or PDF of a receipt or bill and the bot reads the merchant, date, total, VAT and invoice number, then runs the normal flow; when you confirm, the image is attached to the saved ERPNext document (private file). Send a voice note and it's transcribed and handled like a typed message — the reply opens with what it heard. Formats: JPEG, PNG, HEIC/HEIF (converted to JPEG on intake; if conversion fails the user is asked to resend as JPEG), WebP with a caption, PDF, voice notes, shared contacts; stickers are ignored.
 
 **Sending invoices and reminders to customers.** "Send it to Jameel" shows exactly what will go out (recipient, number, text, invoice PDF, PromptPay QR for THB amounts) and sends only after your yes on the very next message. "Remind everyone who's overdue" does the same per customer. With automatic reminders switched on (`set_payment_settings`), customers with invoices overdue or due within 3 days get one reminder message every 3 days at most. Customer numbers come only from the contacts you entered (a shared contact, a typed number, `create_contact`); the bot never copies a phone or email from ERPNext into your contacts.
 
 **Morning digest and schedule.** Every morning (08:00 local by default, change with "send my digest at 7:30") the bot sends your cash position, overdue items, what's due in the next 7 days, and yesterday's totals. Timezone and reminder time are adjustable in chat.
 
 **Thai VAT, withholding tax, line items and stock.** Tell the bot once whether you're VAT-registered. VAT 7% (inclusive or on top) is computed by the bot, never by the model, and shown on the card as Net / VAT / Gross; WHT (1/2/3/5%, PND3/PND53) on bills and cash expenses shows what you actually pay the supplier. Invoices can carry several lines. Naming a stone or SKU ("PA2293") makes it a tracked stock item: buying it receives stock, selling it issues stock and books cost of goods sold, and "what's in stock?" lists what's on hand with its value.
+
+**Trust layer.** Before each confirmation card the bot checks its own record of what it posted (`src/trust/`, table `trust_fingerprints`): the same receipt photo/PDF posted before (sha256 of the bytes) → "This receipt was already recorded as …"; same amount, currency, counterparty and direction within ±3 days (never the invoice/bill a payment settles) → "Looks similar to …"; plus flags for an amount (not a transfer between your own wallets) over 10× your 90-day median for that direction and above `TRUST_LARGE_AMOUNT_FLOOR` (default 20,000 in the reporting currency), a future or 90+-day-old date, a round cash expense of 10,000 or more, and a first payment to a new payee at or above the floor. Up to three warnings are added to the card under "⚠ Please check before confirming:"; they never block — confirming the card is the override, and the prompt tells the model to cancel instead when you say it's a duplicate. The warnings are part of the card signature, so if they change, the card is re-sent. Every document the bot posts gets an ERPNext Comment "Berpal: posted from WhatsApp, awaiting accountant review" (plus the warnings), and a local `review_status = 'pending'` row (`src/trust/review.js` `listPending`) for a later accountant queue. A failed Comment is logged and doesn't fail the save.
 
 ## Stack
 
@@ -71,6 +73,10 @@ ngrok http 3000
 
 Point your Twilio WhatsApp webhook at `https://<your-ngrok>.ngrok-free.app/webhook` (HTTP POST). To have the server check Twilio's signature locally too, set `PUBLIC_BASE_URL=https://<your-ngrok>.ngrok-free.app` (see Development). In production `PUBLIC_BASE_URL` (or `TWILIO_WEBHOOK_URL`) is required.
 
+## Deploying
+
+See [DEPLOY.md](DEPLOY.md): Docker / Docker Compose, Fly.io and Railway, Twilio webhook setup, `GET /health`, backups and rollback. `npm run check:env` validates the environment the way the server does at boot.
+
 ## ERPNext setup
 
 The target Company needs (most standard charts already have these):
@@ -83,6 +89,30 @@ The target Company needs (most standard charts already have these):
 - **System Settings → Rounding Method:** keep the default "Banker's Rounding (legacy)" — that's the rounding the bot reproduces for VAT/WHT.
 - **Print format** for invoices sent to customers: set `ERPNEXT_INVOICE_PRINT_FORMAT` (else ERPNext's default). `download_pdf` must work for the API user (wkhtmltopdf installed, print permission), and the format should show the letterhead and line items as typed. A Thai full tax invoice also needs the seller's and buyer's tax IDs and branch: set Company `tax_id` and Customer `tax_id` (the bot stores the user's own tax ID in `users.tax_id` but doesn't push it to ERPNext); item rates print net with VAT as a separate line.
 - **API user permissions:** the usual accounting doctypes, plus read on Company, Warehouse, Bin, Stock Ledger Entry and Stock Settings; create on Item, Item Group, Account and File (uploads), delete on File (the nightly cleanup).
+
+## Onboarding
+
+A WhatsApp number with no `users` row goes through a short signup in chat (`src/onboarding/`). It is a fixed state machine — no LLM call — so an unknown number costs a few queries and the replies are predictable.
+
+1. business name (2–80 characters, at least one letter or digit, no `<` `>` — ERPNext refuses them in a Company name) → 2. country (TH default; `TH/MY/SG/ID/VN/PH/AU` or the name; sets default + reporting currency and timezone) → 3. VAT-registered yes/no → 4. tax ID (Thai: 13 digits with the official check digit, dashes/spaces allowed; elsewhere 5–20 characters) or `skip` → 5. accountant name and phone (optional, `skip`; the phone is normalised to `+<country code>…`) → 6. privacy notice (PDPA: what is stored, where, why, how to delete; the receipt retention it states is `RETENTION_DAYS` from `src/media/store.js`), answered with `I agree` / `agree` / `ตกลง`. A refusal (`no`, `I don't agree`, `ไม่ตกลง` …) ends the signup and deletes the session; anything else re-asks.
+
+Every step accepts `back` and `cancel` (cancel deletes the session; nothing is kept). A blank/media-only message, or the invite code sent again, re-asks the current question. Progress lives in `onboarding_sessions` (`src/migrations/080-onboarding.sql`); a session untouched for 7 days is dropped (its answers were collected before consent). Answers to steps 4–5 (tax ID, accountant) are logged as `[onboarding step N answer]`, never verbatim; logging for registered users is unchanged. On consent the bot inserts the `users` row with `subscription_status = 'pending_provisioning'`, `consent_at`, `consent_version` (`2026-11-pdpa-v2` — bump `CONSENT_VERSION` in `src/onboarding/messages.js` whenever the notice text changes) and `onboarding_source` (`whatsapp` or `invite:<code>`), replies "Thanks — your books are being set up…", and logs `[onboarding] NEW USER pending provisioning: id=… name=…` (phone as the last 4 digits only). Until provisioned, the user gets "Still setting up your books — hang tight." instead of the LLM.
+
+**Who can sign up.** `ONBOARDING_MODE=closed` (the default when `NODE_ENV=production`) answers unknown numbers with an invite-only message unless the message is, or contains as a whole word, one of `ONBOARDING_INVITE_CODES` (comma-separated, trimmed, case-insensitive — `Hi, my code is GEMS` works). `open` (the default elsewhere) lets anyone start. Every unknown number gets at most 20 messages a day (UTC); after that the bot stays silent until the next day.
+
+**Provisioning** (operator, after the log line):
+
+```bash
+node scripts/provision-user.js --list-pending
+node scripts/provision-user.js --user 12 --dry-run          # prints the plan; no ERPNext call, no DB write
+node scripts/provision-user.js --user 12 [--company "Siam Gems Co., Ltd."] [--abbr SG] [--notify]
+```
+
+It creates the ERPNext Company if missing (name = the business name unless `--company`; abbreviation derived from the name unless `--abbr` (`U<id>` when the name has no Latin letters, e.g. Thai), made unique; `default_currency` = the user's reporting currency; the country; chart of accounts **"Standard with Numbers"** — the bot's category mapping in `src/erp-sync/common.js` needs the numbered chart), runs the same setup as `smoke-erpnext --preflight --fix` (`scripts/lib/company-setup.js`: tax group and Output VAT / Input VAT / WHT Payable, a second-currency receivable, Stores warehouse, Products item group, GEN-SALE / GEN-PURCHASE), then sets `erpnext_company`, the API credentials, `subscription_status = 'active'` and `subscription_expires_at` = one year out (a re-run on an active user keeps a still-valid expiry). It refuses a Company name another `users` row already points at (case-insensitive) — two users with the same business name would otherwise share one ledger; pass `--company` with a distinct name. `--notify` WhatsApps the user that the books are ready. There is no approved template for it, so it is free-form: delivered only if the user messaged in the last 24 hours (Twilio returns a SID either way; the script says so). Otherwise tell them another way. Re-running is safe; an existing Company with a different currency is refused.
+
+**Pilot mode:** the user row gets the **admin** `ERPNEXT_API_KEY` / `ERPNEXT_API_SECRET`. Those keys reach every Company on the instance — the bot scopes itself to `erpnext_company`, ERPNext does not. Before onboarding users who must be isolated from each other, give each Company its own ERPNext user (User Permission on the Company) and store that user's keys instead.
+
+**Deleting.** A registered user who sends "delete my account" is asked to reply `DELETE` (within 15 minutes; anything else keeps the account). Confirming sets `subscription_status = 'deleted'`, clears the tax ID, accountant details and stored API keys, deletes stored receipts and logged messages, and leaves the ERPNext ledger alone (the accountant keeps it as the bookkeeping record). Later messages get an "account closed" reply.
 
 ## WhatsApp templates and the 24-hour window
 
@@ -122,6 +152,7 @@ server.js                   Express: POST /webhook, POST /twilio/status, schedul
 src/
   webhook.js                /webhook handler + X-Twilio-Signature check
   whatsapp.js               phone → user routing, per-sender queue, media + vCard lines, chitchat short-circuit
+  onboarding/               in-chat signup state machine, account replies (pending / closed / delete), Thai tax-id checksum, country map
   conversation.js           LLM tool loop, core system prompt, conversation state
   prompt/                   feature prompt sections (media, outreach, digest, tax/items/stock), appended in filename order
   tools/                    LLM tool definitions + dispatch, one file per tool (index.js = registry)
@@ -137,7 +168,7 @@ src/
     items.js                stock Items, warehouses, stock-on-hand checks
     common.js               account resolution, per-currency party accounts, generic items, rounding
   erp-query/                READ side, one file per query (incl. stock.js)
-  media/                    intake (download, vision scan, transcription), blob store, attach-to-ERPNext
+  media/                    intake (download, HEIC → JPEG, vision scan, transcription), blob store, attach-to-ERPNext
   outreach/                 send invoice / reminders: planning, PromptPay QR, phone normalisation, consent gate
   jobs/                     scheduler + *.job.js (digest, reminders, cleanup)
   migrations/               SQL migrations applied by db.migrate()
@@ -161,11 +192,15 @@ scripts/
   show-inv.js <name>        pretty-print an ERPNext Sales Invoice
   smoke-erpnext.js          end-to-end smoke test against a real ERPNext Company (npm run smoke:erpnext)
   lib/smoke-helpers.js      its pure helpers (arg parsing, checks, report), unit-tested
+  provision-user.js         create + set up the ERPNext Company for an onboarded user and activate them
+  lib/company-setup.js      the --fix setup (tax accounts, warehouse, items) shared with provisioning
 
 test/
   fake-erpnext.js           in-memory ERPNext that enforces the validations the bot relies on
   flows.test.js             end-to-end tool flows (Postgres via pg-mem)
   media.test.js, outreach.test.js, jobs.test.js, tax-items.test.js   per-feature tests
+  onboarding.test.js        signup flow, invite gate, rate limit, delete, provision-user, HEIC intake
+  thai-tax-id.test.js       tax-id checksum, phone and country parsing
   integration.test.js       cross-feature wiring (receipt attach, card signature, webhook signature, …)
   llm-harness.js            scripted conversations against the real OpenAI model (npm run test:llm)
 ```
@@ -217,8 +252,14 @@ Each step prints ✔ / ✖ (expected vs actual) or ⚠ for soft checks, and ever
 **Media**
 - Receipt images are kept 7 days; a draft pending longer saves without its attachment. One receipt per draft (several photos produce several scan lines, but the draft holds one `receipt_media_id`). A failed attachment is logged, not retried.
 - No "reading your receipt…" message: the user waits 2–5 s for vision, 1–3 s for transcription, and later messages from the same sender queue behind it. The queue is in-memory, per process: several instances would need a DB advisory lock or sticky routing.
-- HEIC isn't converted (users are asked to resend as JPEG; WhatsApp normally converts photos itself).
+- HEIC decoding (`heic-convert`, pure JS/wasm) runs in a short-lived `worker_threads` Worker (≈1.6 s for a 12 MP / 3.8 MB HEIC on an M-series Mac; ~100 ms worker start-up). The 15 s timeout terminates the worker, so the CPU is reclaimed and other senders are not stalled; the worker's JS heap is capped at 512 MB.
 - Scan values, transcripts and vCard fields are flattened/sanitised so they can't fake synthetic lines or keys, but they still reach the model as data. A user can type a fake `[receipt scanned]` line in a caption; it only affects their own draft (attach is user-scoped) and nothing saves without the card.
+
+**Onboarding**
+- Not verified live with real WhatsApp users or a real ERPNext Company creation (`provision-user.js` ran only against the fake ERPNext, which records the Company but does not build its chart).
+- Unattached receipt blobs are pruned when any user's next receipt is stored (`src/media/store.js`) and by the nightly `cleanup` job per user (`src/jobs/cleanup.job.js`), so the 7 days the privacy notice states holds on a quiet instance too, give or take the job's 03:00 window.
+- "delete my account" keeps `outreach_log` rows (the customers' phone numbers the bot sent invoices/reminders to), alongside the ERPNext ledger they belong to.
+- A closed account keeps its `users` row (phone is unique), so the same number can't sign up again without an operator.
 
 **Outreach**
 - Free-form mode and the 24h window (see above); public Files: the random suffix is the only protection until the nightly cleanup ~2 days later, after which a template's PDF link stops working.
@@ -241,6 +282,13 @@ Each step prints ✔ / ✖ (expected vs actual) or ⚠ for soft checks, and ever
 - No opening-stock flow (use a purchase bill), no serial/batch numbers (one Item per stone id, counted in Nos). Item codes ignore separators, so `A-12` and `A1-2` are the same Item. Cancelling a stock invoice isn't supported.
 - A stock line whose amount doesn't divide by its qty books the leftover satang to a rounding row (on purchases the stone's valuation can be a few satang under).
 - If a site switches Rounding Method to "Banker's Rounding" (half-to-even), its figures can differ from the bot's by a satang.
+
+**Trust layer**
+- Only sees what the bot posted (documents entered in ERPNext directly aren't fingerprinted), and only from the day `070-trust.sql` ran: medians need 3+ postings in the last 90 days. "Similar" needs a counterparty, so two identical cash expenses with no counterparty aren't flagged (a re-sent photo still is, by hash).
+- "New payee" means no earlier posting to that name and the contact is new (no contact row, or one added in the last 24 h), not strictly "created this turn": that would drop the flag on the confirming turn and change the card's signature.
+- The receipt match is an exact sha256 of the stored bytes. WhatsApp re-compresses images, so a photo forwarded again, re-shared from the gallery or re-shot usually has different bytes and is NOT caught by hash (it may still be caught as "similar" when amount, currency and counterparty match). Re-sent PDFs and the same file sent twice are caught. No perceptual hashing yet.
+- `trust_warnings` and `receipt_hash` are protected draft keys (`PROTECTED_DRAFT_KEYS`): the model can't set or clear them through `update_draft`, and dropping the warnings changes the card signature, so save_transaction refuses. The card *text* is still the model's (told to copy `card.lines` verbatim), so at the end of a card turn `handle()` appends any ⚠ line the reply left out (`withTrustWarnings`): the user always sees what the signature covers.
+- Warnings are worked out when the card is built, not again at save. Fingerprints older than 180 days are pruned when a new one is written (no cleanup-job change), except rows still `pending` review. There is no "mark reviewed" flow yet: the accountant clears the Comment in ERPNext, and the local status stays `pending`. Until such a flow exists, the 180-day pruning never removes anything (every row is `pending`); rows are small, but the table grows with every posting.
 
 **Model reliability (gpt-4o-mini).** On the final tree, `npm run test:llm` passed all 99 checks in 2 of the 3 runs that finished. The third failed one check: on the voice-note turn the model called only `list_user_accounts`, skipping `update_draft`, then recovered and saved correctly. One further run stalled for more than 15 minutes on a single OpenAI call and was killed; the OpenAI client now times out after 30 s with one retry (`src/conversation.js`), so a stalled call costs a turn, not the session. The server now covers the misses seen in earlier runs: card lines are built by the server, a wallet number resolves to the wallet as the user saw it in the picker, payment terms imply an invoice or bill, an `item_code` without digits is refused, a payment that skips an open invoice is refused, the "Heard:" echo is added when missing, and the outreach preview is shown verbatim from the tool. What's left is model-side and intermittent: an occasional question before `update_draft`, a wrong category (e.g. 5900 instead of Travel; the card now shows that category, so the user can catch it), or a skipped tool call. The guards (card signature, wallet offers, stock checks, outreach gate) stop these from posting or sending anything wrong, but they can cost the user an extra turn. Treat a harness failure as "read the transcript".
 

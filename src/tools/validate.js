@@ -18,12 +18,15 @@ const REQUIRED_FIELDS = ['amount', 'currency', 'direction', 'transaction_date'];
 /**
  * Draft keys that gate side effects. Only server code may set them: save_transaction needs
  * confirmation_pending/confirmation_sig, wallet pickers need wallet_options, outbound sends need
- * outreach_preview. update_draft strips them from its arguments (so the model can't forge them
- * even if it copies them from a tool result) and from the draft it echoes back; conversation.js
+ * outreach_preview; trust_warnings/receipt_hash are the card's ⚠ lines and the receipt's hash
+ * (request_confirmation recomputes both; the warnings are signed). update_draft strips them from
+ * its arguments (so the model can't forge them even if it copies them from a tool result) and
+ * from the draft it echoes back; conversation.js
  * hides them from the prompt's CURRENT DRAFT. Lives here (not conversation.js) so tools can
  * import it without a require cycle.
  */
-const PROTECTED_DRAFT_KEYS = ['confirmation_pending', 'confirmation_sig', 'wallet_options', 'outreach_preview'];
+const PROTECTED_DRAFT_KEYS = ['confirmation_pending', 'confirmation_sig', 'wallet_options', 'outreach_preview',
+  'trust_warnings', 'receipt_hash'];
 function stripProtected(obj) {
   const out = { ...obj };
   for (const k of PROTECTED_DRAFT_KEYS) delete out[k];

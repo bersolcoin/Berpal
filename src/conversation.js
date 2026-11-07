@@ -7,6 +7,7 @@ const promptSections = require('./prompt');
 const { PROTECTED_DRAFT_KEYS, stripProtected } = require('./tools/validate');
 const mediaIntake = require('./media');
 const wallets = require('./wallets');
+const { WARNING_HEADER } = require('./tools/card');
 
 // 30s/1 retry: a hung completion must not stall a WhatsApp turn (the SDK default is 10 min × 3).
 let openai = process.env.OPENAI_API_KEY
@@ -720,6 +721,20 @@ function scannedMediaIds(userMessage) {
  * that it's added here when missing. `transcript` comes only from whatsapp.js's voice path, so a
  * typed "[voice note] …" never triggers it.
  */
+/**
+ * The card text is the model's, copied from card.lines. The ⚠ warnings (src/trust) are part of
+ * what the user confirms, so a card that went out this turn without them gets them appended:
+ * the signature already includes them, and the user must see what they are agreeing to.
+ */
+function withTrustWarnings(ctx, text) {
+  if (!ctx.confirmationRequested || ctx.saved || ctx.cancelled) return text;
+  const warnings = ctx.draft.trust_warnings;
+  if (!Array.isArray(warnings) || !warnings.length) return text;
+  const missing = warnings.filter((w) => !text.includes(String(w)));
+  if (!missing.length) return text;
+  return `${text}\n\n${WARNING_HEADER}\n${missing.map((w) => `- ${w}`).join('\n')}`;
+}
+
 function withVoiceEcho(transcript, text) {
   if (!transcript || /heard:/i.test(text)) return text;
   const heard = transcript.length > 120 ? `${transcript.slice(0, 120)}…` : transcript;
@@ -854,6 +869,7 @@ async function handle(user, userMessage, { voiceTranscript = null } = {}) {
 
   if (!finalText) finalText = 'Got it. Anything else?';
   finalText = cleanReply(finalText);
+  finalText = withTrustWarnings(ctx, finalText);
   finalText = withVoiceEcho(voiceTranscript, finalText);
 
   if (ctx.saved || ctx.cancelled) {
@@ -900,5 +916,5 @@ async function handle(user, userMessage, { voiceTranscript = null } = {}) {
 }
 
 module.exports = {
-  handle, loadConversation, resetConversation, applyDeterministicReplies, shownWalletOptions, withVoiceEcho, _setOpenAIForTests, PROTECTED_DRAFT_KEYS,
+  handle, loadConversation, resetConversation, applyDeterministicReplies, shownWalletOptions, withVoiceEcho, withTrustWarnings, _setOpenAIForTests, PROTECTED_DRAFT_KEYS,
 };

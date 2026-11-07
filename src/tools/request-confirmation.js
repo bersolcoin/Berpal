@@ -3,6 +3,7 @@ const { validateDraft, readinessError, applyDefaults, stripProtected } = require
 const { computeTotals, vatTreatment } = require('../erp-sync/taxes');
 const { getErp } = require('./context');
 const { buildCard } = require('./card');
+const trust = require('../trust');
 
 const definition = {
   name: 'request_confirmation',
@@ -14,8 +15,10 @@ const definition = {
 // Fields that change what the card says. Flags and bookkeeping keys are left out.
 // receipt_media_id is deliberately IN the signature: swapping the receipt after the card must
 // invalidate it (save_transaction compares). outreach_preview is a separate consent flow.
+// trust_warnings (the card's ⚠ lines) are IN the signature: a changed warning set re-arms the card.
+// receipt_hash is derived from receipt_media_id (already signed), so it is left out.
 const IGNORED = new Set(['wallet_options', 'confirmation_pending', 'confirmation_sig', 'counterparty_contact_skipped',
-  'wallet_skipped', 'wallet_skip_requested_by_model', 'exchange_rate_source', 'outreach_preview']);
+  'wallet_skipped', 'wallet_skip_requested_by_model', 'exchange_rate_source', 'outreach_preview', 'receipt_hash']);
 /** What the user saw on the card, as a comparable string. save_transaction re-checks it. */
 // Ids the model may pass as "9" or 9: the same wallet / contact / receipt either way.
 const NUMERIC_IDS = new Set(['payment_account_id', 'transfer_destination_account_id', 'counterparty_id', 'receipt_media_id']);
@@ -30,6 +33,18 @@ function cardSignature(draft) {
     .filter(([k, v]) => v != null && v !== '' && !(v === false && !FALSE_MEANINGFUL.has(k)))
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return JSON.stringify(entries);
+}
+
+async function applyTrust(ctx) {
+  delete ctx.draft.trust_warnings;
+  delete ctx.draft.receipt_hash;
+  try {
+    const { warnings, receiptHash } = await trust.assess(ctx.user, ctx.draft);
+    if (warnings.length) ctx.draft.trust_warnings = warnings;
+    if (receiptHash) ctx.draft.receipt_hash = receiptHash;
+  } catch (err) {
+    console.error(`[tools] trust checks failed (user ${ctx.user.id}):`, err.message);
+  }
 }
 
 async function execute(args, ctx) {
@@ -48,6 +63,10 @@ async function execute(args, ctx) {
   // signature)? Then they have most likely just confirmed it: save rather than re-issue.
   // confirmation_sig is THIS turn's card; handle() promotes it to confirmation_pending only when
   // the turn ends, so re-signing here never authorises a save in the same turn.
+  // Trust warnings (duplicates, anomalies) go on the draft before the card and the signature, so
+  // they show as card lines and a changed set means a new card. Advisory only: a failure here
+  // just means no warnings, never a blocked save.
+  await applyTrust(ctx);
   // The card first: if building it fails, nothing is armed (no signature, no button card).
   const card = await buildCard(ctx.user, ctx.draft, () => getErp(ctx));
   const sig = cardSignature(ctx.draft);

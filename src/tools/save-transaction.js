@@ -3,6 +3,7 @@ const { validateDraft, readinessError, applyDefaults } = require('./validate');
 const { getErp } = require('./context');
 const { cardSignature } = require('./request-confirmation');
 const { attachToDoc } = require('../media/attach');
+const review = require('../trust/review');
 
 const definition = {
   name: 'save_transaction',
@@ -43,6 +44,7 @@ async function execute(args, ctx) {
 
   // Read before saveDraft: the draft is cleared right after a successful save.
   const mediaId = ctx.draft.receipt_media_id;
+  const confirmed = { ...ctx.draft };
   try {
     const saved = await saveDraft(ctx.user, getErp(ctx), ctx.draft);
     ctx.saved = saved;
@@ -50,6 +52,9 @@ async function execute(args, ctx) {
     // Clear the draft so a chained save in the same turn (missed-sale flow) starts fresh.
     ctx.draft = {};
     ctx.confirmationRequested = false;
+    // Duplicate fingerprint + "awaiting accountant review" Comment. Before the attachment (which
+    // deletes the receipt blob the fingerprint hashes). Never throws: the doc is already posted.
+    await review.markPosted(getErp(ctx), { user: ctx.user, saved, draft: confirmed, mediaId });
     if (mediaId) {
       // The transaction is already posted; a failed attachment must not turn the save into an error.
       try {

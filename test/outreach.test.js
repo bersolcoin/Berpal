@@ -831,6 +831,29 @@ test('cleanup job: deletes old public Files for every user, once each, regardles
   assert.equal((await db.query('SELECT 1 FROM outreach_log WHERE files IS NOT NULL')).rows.length, 0);
 });
 
+test('cleanup job: purges this user\'s receipt blobs past RETENTION_DAYS even when nobody uploads', async () => {
+  const { RETENTION_DAYS } = require('../src/media/store');
+  const now = new Date();
+  const old = new Date(now.getTime() - (RETENTION_DAYS + 1) * 86400000).toISOString();
+  const fresh = new Date(now.getTime() - 3600000).toISOString();
+  const otherUser = (await db.query(
+    `INSERT INTO users (phone, default_currency, reporting_currency, country, created_at, updated_at)
+     VALUES ('+66900009999', 'THB', 'THB', 'TH', $1, $1) RETURNING id`, [now.toISOString()])).rows[0];
+  for (const [uid, at] of [[user.id, old], [user.id, fresh], [otherUser.id, old]]) {
+    await db.query(
+      `INSERT INTO media_blobs (user_id, content_type, filename, bytes, created_at) VALUES ($1, 'image/jpeg', 'r.jpg', $2, $3)`,
+      [uid, Buffer.from('x'), at]
+    );
+  }
+  const r = await cleanupJob.run({ ...user, reminders_enabled: 0 }, { erp: erpnext.forUser(user), now });
+  assert.equal(r.receipts, 1, 'only the stale blob of this user');
+  const left = (await db.query('SELECT user_id, created_at FROM media_blobs ORDER BY user_id')).rows;
+  assert.equal(left.length, 2);
+  assert.ok(left.some((b) => b.user_id === user.id && b.created_at === fresh), 'fresh blob kept');
+  assert.ok(left.some((b) => b.user_id === otherUser.id), 'other tenant untouched');
+  await db.query('DELETE FROM media_blobs');
+});
+
 test('template mode: grouped reminder = one statement template, no PDFs, QR as follow-up; preview says so', async () => {
   process.env.TWILIO_REMINDER_CONTENT_SID = 'HXrem';
   twilioClient.sendTemplate = async (to, sid, vars) => {
