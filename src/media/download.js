@@ -19,8 +19,8 @@ function parseMaxBytes(value) {
 let maxBytes = parseMaxBytes(process.env.MEDIA_MAX_BYTES);
 
 class MediaTooLargeError extends Error {
-  constructor(size) {
-    super(`media too large: over ${maxBytes} bytes (got ${size})`);
+  constructor(size, cap = maxBytes) {
+    super(`media too large: over ${cap} bytes (got ${size})`);
     this.code = 'MEDIA_TOO_LARGE';
   }
 }
@@ -44,13 +44,14 @@ function isTwilioMediaUrl(url) {
 
 /**
  * Read a fetch Response body chunk by chunk, aborting the moment it passes the cap. Content-Length
- * can be missing or lie, so it's only an early-out — this is the real bound on memory.
+ * can be missing or lie, so it's only an early-out — this is the real bound on memory. `cap`
+ * defaults to MEDIA_MAX_BYTES; channels with their own override (src/channels/line.js) pass theirs.
  */
-async function readCapped(res, abort) {
+async function readCapped(res, abort, cap = maxBytes) {
   const declared = Number(res.headers && res.headers.get && res.headers.get('content-length'));
-  if (declared > maxBytes) {
+  if (declared > cap) {
     abort();
-    throw new MediaTooLargeError(declared);
+    throw new MediaTooLargeError(declared, cap);
   }
   if (!res.body) return Buffer.alloc(0);
   const reader = res.body.getReader();
@@ -60,10 +61,10 @@ async function readCapped(res, abort) {
     const { done, value } = await reader.read();
     if (done) break;
     total += value.length;
-    if (total > maxBytes) {
+    if (total > cap) {
       abort();
       await reader.cancel().catch(() => {});
-      throw new MediaTooLargeError(total);
+      throw new MediaTooLargeError(total, cap);
     }
     chunks.push(value);
   }
@@ -116,6 +117,6 @@ function _setMaxBytesForTests(n) {
 }
 
 module.exports = {
-  downloadMedia, enforceMaxBytes, isTwilioMediaUrl, parseMaxBytes, MediaTooLargeError,
+  downloadMedia, enforceMaxBytes, isTwilioMediaUrl, parseMaxBytes, readCapped, MediaTooLargeError,
   _setDownloaderForTests, _setMaxBytesForTests,
 };

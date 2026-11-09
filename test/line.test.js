@@ -96,12 +96,15 @@ async function hook(req, opts = {}) {
 }
 
 const userSource = { type: 'user', userId: USER };
+// A fresh webhookEventId per event: a repeated id is a duplicate (dropped), so tests that want
+// one pass it explicitly.
+let eventSeq = 0;
 const ev = (extra) => ({
   type: 'message',
   mode: 'active',
   timestamp: 1700000000000,
   source: userSource,
-  webhookEventId: '01HXYZ',
+  webhookEventId: `01HXYZ${++eventSeq}`,
   deliveryContext: { isRedelivery: false },
   replyToken: 'rtok-1',
   ...extra,
@@ -182,10 +185,15 @@ test('webhook: signature over the raw bytes, not re-serialised JSON', async () =
 });
 
 test('webhook: accepts req.rawBody and an express.raw Buffer body', async () => {
-  const buf = Buffer.from(JSON.stringify({ events: [ev({ message: { type: 'text', id: '1', text: 'a' } })] }));
-  const sig = lineSignature(buf, SECRET);
-  const viaRaw = { rawBody: buf, headers: { 'x-line-signature': sig } };
-  const viaBody = { body: buf, headers: { 'x-line-signature': sig } };
+  // One event per request: the same event twice would be a duplicate and dropped.
+  const signed = () => {
+    const buf = Buffer.from(JSON.stringify({ events: [ev({ message: { type: 'text', id: '1', text: 'a' } })] }));
+    return { buf, sig: lineSignature(buf, SECRET) };
+  };
+  const raw = signed();
+  const body = signed();
+  const viaRaw = { rawBody: raw.buf, headers: { 'x-line-signature': raw.sig } };
+  const viaBody = { body: body.buf, headers: { 'x-line-signature': body.sig } };
   for (const req of [viaRaw, viaBody]) {
     const { res, inbound } = await hook(req);
     assert.equal(res.code, 200);
@@ -319,12 +327,64 @@ test('mapping: group/room sources and missing userId are ignored', () => {
   assert.doesNotMatch(out.text(), /hi all/);
 });
 
-test('mapping: redelivery is processed and logged', async () => {
+test('mapping: a first-time redelivery is processed and logged', async () => {
   const e = ev({ deliveryContext: { isRedelivery: true }, message: { type: 'text', id: '1', text: 'again' } });
   const { inbound } = await hook(signedReq({ events: [e] }));
   assert.equal(inbound.length, 1);
   assert.equal(inbound[0].body, 'again');
   assert.match(out.text(), /redelivered message event/);
+});
+
+// ── duplicate events ─────────────────────────────────────────────────────────────────────────────
+
+test('dedupe: the same webhookEventId is processed once, flagged as redelivery or not', async () => {
+  const first = ev({ webhookEventId: 'EV-1', message: { type: 'text', id: '1', text: 'once' } });
+  const again = ev({ webhookEventId: 'EV-1', deliveryContext: { isRedelivery: true }, replyToken: 'rtok-2', message: { type: 'text', id: '1', text: 'once' } });
+  const unflagged = ev({ webhookEventId: 'EV-1', replyToken: 'rtok-3', message: { type: 'text', id: '1', text: 'once' } });
+  const { inbound: a } = await hook(signedReq({ events: [first] }));
+  const { inbound: b } = await hook(signedReq({ events: [again, unflagged] }));
+  assert.equal(a.length, 1);
+  assert.equal(b.length, 0);
+  assert.match(out.text(), /duplicate message event from=line:…abcd id=EV-1, skipped/);
+  assert.doesNotMatch(out.text(), new RegExp(USER), 'address is masked');
+  // A dropped duplicate still hands over its reply token: the latest one is the live one.
+  assert.equal(line.takeReplyToken(ADDR), 'rtok-3');
+});
+
+test('dedupe: different ids are all processed; events without an id always are', async () => {
+  const events = [
+    ev({ webhookEventId: 'EV-A', message: { type: 'text', id: '1', text: 'a' } }),
+    ev({ webhookEventId: 'EV-B', message: { type: 'text', id: '2', text: 'b' } }),
+  ];
+  const { inbound } = await hook(signedReq({ events }));
+  assert.deepEqual(inbound.map((m) => m.body), ['a', 'b']);
+  const noId = ev({ message: { type: 'text', id: '3', text: 'c' } });
+  delete noId.webhookEventId;
+  const { inbound: twice } = await hook(signedReq({ events: [noId, noId] }));
+  assert.deepEqual(twice.map((m) => m.body), ['c', 'c']);
+});
+
+test('dedupe: ids are evicted over the cap and after SEEN_EVENT_KEEP_MS', async () => {
+  let t = 1_700_000_000_000;
+  line._setNowForTests(() => t);
+  const batch = (start, n) => Array.from({ length: n }, (_, i) => ev({ webhookEventId: `EV-${start + i}`, message: { type: 'text', id: '1', text: 'x' } }));
+  await hook(signedReq({ events: [batch(0, 1)[0]] }));
+  // Fill the map past the cap in chunks the 1 MB body limit allows: EV-0 is the oldest, so it goes.
+  for (let i = 1; i < line.SEEN_EVENTS_MAX + 1; i += 500) {
+    await hook(signedReq({ events: batch(i, Math.min(500, line.SEEN_EVENTS_MAX + 1 - i)) }));
+  }
+  const { inbound: evicted } = await hook(signedReq({ events: [batch(0, 1)[0]] }));
+  assert.equal(evicted.length, 1, 'EV-0 fell out of the cap and is processed again');
+  const { inbound: kept } = await hook(signedReq({ events: [batch(line.SEEN_EVENTS_MAX, 1)[0]] }));
+  assert.equal(kept.length, 0, 'the newest id is still remembered');
+  // Age: the whole map is older than the keep window.
+  t += line.SEEN_EVENT_KEEP_MS + 1;
+  const { inbound: aged } = await hook(signedReq({ events: [batch(line.SEEN_EVENTS_MAX, 1)[0]] }));
+  assert.equal(aged.length, 1);
+  // _resetForTests forgets everything.
+  line._resetForTests();
+  const { inbound: reset } = await hook(signedReq({ events: [batch(line.SEEN_EVENTS_MAX, 1)[0]] }));
+  assert.equal(reset.length, 1);
 });
 
 // ── reply token vs push ──────────────────────────────────────────────────────────────────────────

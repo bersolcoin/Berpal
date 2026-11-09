@@ -4,6 +4,32 @@ const { getErp } = require('./context');
 const { cardSignature } = require('./request-confirmation');
 const { attachToDoc } = require('../media/attach');
 const review = require('../trust/review');
+const { computeTotals } = require('../erp-sync/taxes');
+
+/**
+ * What a document saved earlier this turn is still owed, from the confirmed draft (no ERPNext
+ * round trip): a fresh invoice is owed its grand total — gross, or gross − WHT for a bill, since
+ * only purchase rows deduct WHT — and an advance (Journal Entry) its amount.
+ */
+function savedDoc(saved, draft) {
+  const invoice = saved.doctype === 'Sales Invoice' || saved.doctype === 'Purchase Invoice';
+  const t = invoice ? computeTotals(draft) : null;
+  const outstanding = !t ? Number(draft.amount) : saved.doctype === 'Purchase Invoice' ? t.due : t.gross;
+  return { doctype: saved.doctype, currency: draft.currency, outstanding };
+}
+
+/** null when the chained payment settles the parent as the user saw it; otherwise the refusal. */
+function chainMismatch(draft, parent) {
+  const amount = Number(draft.amount);
+  if (parent.currency && draft.currency !== parent.currency) {
+    return `the payment is in ${draft.currency} but ${draft.parent_invoice_name} is in ${parent.currency}`;
+  }
+  if (!(amount > 0)) return 'the payment amount must be greater than 0';
+  if (amount > parent.outstanding + 0.005) {
+    return `the payment (${amount} ${draft.currency}) exceeds what ${draft.parent_invoice_name} is owed (${parent.outstanding} ${parent.currency})`;
+  }
+  return null;
+}
 
 const definition = {
   name: 'save_transaction',
@@ -30,6 +56,20 @@ async function execute(args, ctx) {
   if (missing.length) {
     return { ok: false, error: `Cannot save; missing required fields: ${missing.join(', ')}.` };
   }
+  // The card the user confirmed covered the parent only, so the chained payment may not go beyond
+  // it: same currency, and 0 < amount <= what the parent is owed. Anything else needs its own card.
+  // After applyDefaults, so a payment the model left without a currency is compared on the
+  // defaulted one (as request_confirmation would sign it), not on `undefined`.
+  if (chained) {
+    const parent = (ctx.savedDocs || {})[ctx.draft.parent_invoice_name];
+    const mismatch = parent ? chainMismatch(ctx.draft, parent) : `${ctx.draft.parent_invoice_name} was saved without its totals`;
+    if (mismatch) {
+      return {
+        ok: false,
+        error: `Cannot save without a card: ${mismatch}. Call request_confirmation, send the summary, and wait for the user to confirm.`,
+      };
+    }
+  }
   const problem = await readinessError(ctx.user, ctx.draft, () => getErp(ctx));
   if (problem) return { ok: false, error: `Cannot save; ${problem}` };
   // Save exactly what the user saw: any change since that card (amount, wallet, receipt…) means
@@ -49,6 +89,7 @@ async function execute(args, ctx) {
     const saved = await saveDraft(ctx.user, getErp(ctx), ctx.draft);
     ctx.saved = saved;
     ctx.savedIds = [...(ctx.savedIds || []), saved.erpnext_name];
+    ctx.savedDocs = { ...(ctx.savedDocs || {}), [saved.erpnext_name]: savedDoc(saved, confirmed) };
     // Clear the draft so a chained save in the same turn (missed-sale flow) starts fresh.
     ctx.draft = {};
     ctx.confirmationRequested = false;

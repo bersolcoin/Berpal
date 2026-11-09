@@ -338,8 +338,9 @@ test('rate limit: 20 messages per unknown phone per day, then silence', async ()
   assert.equal(await say(P, 'anyone?'), null);
   // Other phones are unaffected.
   assert.equal(await say('+66810000055', 'hi'), M.INVITE_ONLY);
-  // A new day resets the count (rows are keyed by UTC day).
+  // A new day resets the count (rows are keyed by UTC day); the process prunes once per day.
   await db.query(`UPDATE onboarding_rate_limits SET day = '2000-01-01' WHERE phone = $1`, [P]);
+  onboarding._resetPruneForTests();
   assert.equal(await say(P, 'hi again'), M.INVITE_ONLY);
   const days = (await db.query('SELECT day FROM onboarding_rate_limits WHERE phone = $1', [P])).rows.map((r) => r.day);
   assert.equal(days.length, 1, 'the old day was pruned');
@@ -352,6 +353,25 @@ test('rate limit: 20 messages per unknown phone per day, then silence', async ()
   await say('+66810000056', 'first today');
   const n = (await db.query('SELECT msg_count FROM onboarding_rate_limits WHERE phone = $1', [P])).rows[0].msg_count;
   assert.equal(Number(n), onboarding.DAILY_LIMIT + 1);
+});
+
+test('pruning runs once per process per day, not on every new number\'s first message', async () => {
+  process.env.ONBOARDING_MODE = 'closed';
+  const old = '+66810000057';
+  await db.query(`INSERT INTO onboarding_rate_limits (phone, day, msg_count) VALUES ($1, '2000-01-01', 3)`, [old]);
+  await db.query(`INSERT INTO onboarding_sessions (phone, step, answers, source, created_at, updated_at)
+    VALUES ($1, 'name', '{}', 'whatsapp', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z')`, [old]);
+  const rows = async (table) => Number((await db.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE phone = $1`, [old])).rows[0].n);
+  // Earlier tests already pruned today: two fresh numbers' first messages leave the stale rows alone.
+  assert.equal(await say('+66810000058', 'hi'), M.INVITE_ONLY);
+  assert.equal(await say('+66810000059', 'hi'), M.INVITE_ONLY);
+  assert.equal(await rows('onboarding_rate_limits'), 1);
+  assert.equal(await rows('onboarding_sessions'), 1);
+  // The day's first message in a process prunes both tables.
+  onboarding._resetPruneForTests();
+  assert.equal(await say('+66810000060', 'hi'), M.INVITE_ONLY);
+  assert.equal(await rows('onboarding_rate_limits'), 0);
+  assert.equal(await rows('onboarding_sessions'), 0);
 });
 
 test('media from an unknown phone re-asks the current question', async () => {
@@ -385,7 +405,20 @@ test('active users are unaffected; "delete my account" → DELETE closes the acc
   await addMsg(other.id);
   await db.query(`INSERT INTO media_blobs (user_id, content_type, bytes, created_at) VALUES ($1, 'image/jpeg', $2, $3)`,
     [other.id, Buffer.from('y'), new Date().toISOString()]);
-  const count = async (table, id) => Number((await db.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE user_id = $1`, [id])).rows[0].n);
+  // Customer phones and counterparty names are third-party personal data: gone with the account.
+  const addOutreach = (id) => db.query(`INSERT INTO outreach_log (user_id, counterparty_phone, kind, reference, sent_at, status)
+    VALUES ($1, '+66899999999', 'invoice', 'ACC-SINV-1', $2, 'sent')`, [id, new Date().toISOString()]);
+  const addFingerprint = (id) => db.query(`INSERT INTO trust_fingerprints (user_id, doctype, erpnext_name, counterparty_name, created_at)
+    VALUES ($1, 'Sales Invoice', 'ACC-SINV-1', 'jameel crest gems', $2)`, [id, new Date().toISOString()]);
+  await addOutreach(u.id);
+  await addOutreach(other.id);
+  await addFingerprint(u.id);
+  await addFingerprint(other.id);
+  const addContact = (id) => db.query(`INSERT INTO counterparty_cache (owner_user_id, name, phone, created_at, updated_at)
+    VALUES ($1, 'Jameel Crest Gems', '+66899999999', $2, $2)`, [id, new Date().toISOString()]);
+  await addContact(u.id);
+  await addContact(other.id);
+  const count = async (table, id, col = 'user_id') => Number((await db.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE ${col} = $1`, [id])).rows[0].n);
   const otherMsgs = await count('messages', other.id);
   assert.ok(otherMsgs > 0);
   assert.ok((await count('messages', u.id)) > 0);
@@ -394,14 +427,23 @@ test('active users are unaffected; "delete my account" → DELETE closes the acc
   assert.match(M.DELETE_DONE, /accountant retains/);
   const row = await userByPhone(P);
   assert.equal(row.subscription_status, 'deleted');
+  assert.equal(row.phone, P, 'the number is kept so the closed account still answers');
+  assert.equal(row.display_name, null);
   assert.equal(row.tax_id, null);
   assert.equal(row.accountant_name, null);
   assert.equal(row.accountant_phone, null);
   assert.equal(row.erpnext_company, COMPANY, 'the ERPNext link is kept for the record');
   assert.equal(await count('media_blobs', u.id), 0);
   assert.equal(await count('messages', u.id), 0);
+  assert.equal(await count('outreach_log', u.id), 0);
+  assert.equal(await count('trust_fingerprints', u.id), 0);
+  assert.equal(await count('counterparty_cache', u.id, 'owner_user_id'), 0, 'customer phones/emails go with the account');
+  assert.equal(await count('counterparty_cache', other.id, 'owner_user_id'), 1);
   assert.equal(await count('media_blobs', other.id), 1);
   assert.equal(await count('messages', other.id), otherMsgs);
+  assert.equal(await count('outreach_log', other.id), 1);
+  assert.equal(await count('trust_fingerprints', other.id), 1);
+  assert.match(M.DELETE_DONE, /customer contact log/);
 
   assert.equal(await say(P, 'hello?'), M.ACCOUNT_CLOSED);
   assert.equal(await say(P, 'delete my account'), M.ACCOUNT_CLOSED);

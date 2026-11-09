@@ -114,7 +114,7 @@ It creates the ERPNext Company if missing (name = the business name unless `--co
 
 **Pilot mode:** the user row gets the **admin** `ERPNEXT_API_KEY` / `ERPNEXT_API_SECRET`. Those keys reach every Company on the instance — the bot scopes itself to `erpnext_company`, ERPNext does not. Before onboarding users who must be isolated from each other, give each Company its own ERPNext user (User Permission on the Company) and store that user's keys instead.
 
-**Deleting.** A registered user who sends "delete my account" is asked to reply `DELETE` (within 15 minutes; anything else keeps the account). Confirming sets `subscription_status = 'deleted'`, clears the tax ID, accountant details and stored API keys, deletes stored receipts and logged messages, and leaves the ERPNext ledger alone (the accountant keeps it as the bookkeeping record). Later messages get an "account closed" reply.
+**Deleting.** A registered user who sends "delete my account" is asked to reply `DELETE` (within 15 minutes; anything else keeps the account). Confirming sets `subscription_status = 'deleted'`, clears the display name, tax ID, accountant details and stored API keys, deletes stored receipts, logged messages, the customer contact log (`outreach_log` and the contact cache) and the trust fingerprints, and leaves the ERPNext ledger alone (the accountant keeps it as the bookkeeping record). The address itself (`users.phone`) is kept so later messages get an "account closed" reply instead of a fresh signup.
 
 ## WhatsApp templates and the 24-hour window
 
@@ -140,7 +140,7 @@ Setup, in the [LINE Developers console](https://developers.line.biz/console/):
 3. **Messaging API → Webhook URL** = `<PUBLIC_BASE_URL>/line/webhook`, turn on **Use webhook**, then press **Verify** (LINE posts a signed body with no events; the bot answers 200).
 4. In the LINE Official Account Manager (**Response settings**), turn **off** auto-reply messages and the greeting message, so LINE's canned replies don't answer alongside the bot. Adding the bot as a friend counts as a "hi", which starts onboarding; unblocking it does not (the user has talked to the bot before).
 
-Every webhook must carry a valid `X-Line-Signature` (base64 HMAC-SHA256 of the raw body with the channel secret; 403 otherwise; bodies over 1 MB get 413). The bot answers 200 before processing, so LINE's optional webhook redelivery (off by default) rarely triggers. `GET /health` adds a `line` check (`GET https://api.line.me/v2/bot/info` with the access token) when both variables are set.
+Every webhook must carry a valid `X-Line-Signature` (base64 HMAC-SHA256 of the raw body with the channel secret; 403 otherwise; bodies over 1 MB get 413). The bot answers 200 before processing, so LINE's optional webhook redelivery (off by default) rarely triggers; when it does, an event whose `webhookEventId` was seen in the last 10 minutes is skipped, so a redelivered message never runs a second turn. `GET /health` adds a `line` check (`GET https://api.line.me/v2/bot/info` with the access token) when both variables are set.
 
 Limits:
 
@@ -286,7 +286,7 @@ Each step prints ✔ / ✖ (expected vs actual) or ⚠ for soft checks, and ever
 **Onboarding**
 - Not verified live with real WhatsApp users or a real ERPNext Company creation (`provision-user.js` ran only against the fake ERPNext, which records the Company but does not build its chart).
 - Unattached receipt blobs are pruned when any user's next receipt is stored (`src/media/store.js`) and by the nightly `cleanup` job per user (`src/jobs/cleanup.job.js`), so the 7 days the privacy notice states holds on a quiet instance too, give or take the job's 03:00 window.
-- "delete my account" keeps `outreach_log` rows (the customers' phone numbers the bot sent invoices/reminders to), alongside the ERPNext ledger they belong to.
+- "delete my account" keeps `users.phone` (so the closed account answers "account closed") and the ERPNext ledger; everything else personal is removed.
 - A closed account keeps its `users` row (phone is unique), so the same number can't sign up again without an operator.
 
 **Outreach**

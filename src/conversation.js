@@ -672,11 +672,10 @@ async function shownWalletOptions(user, draft, lastReply) {
   const offered = Array.isArray(draft.wallet_options) ? draft.wallet_options : [];
   const lines = [...String(lastReply || '').matchAll(/^[\s>*_•-]*(?:\*\*)?(\d{1,2})(?:\*\*)?\s*(?:[.)]|[-–—:])(?:\*\*)?\s+(.+?)\s*$/gm)];
   if (!offered.length || !lines.length) return null;
-  const named = [];
-  for (const id of offered) {
-    const w = await wallets.getById(user, id);
-    if (w && w.name) named.push({ id: Number(w.id), name: w.name.toLowerCase() });
-  }
+  // One query for the whole picker, not one per wallet.
+  const named = (await wallets.getByIds(user, offered))
+    .filter((w) => w.name)
+    .map((w) => ({ id: Number(w.id), name: w.name.toLowerCase() }));
   const out = {};
   for (const [, k, raw] of lines) {
     const label = raw.replace(/^[\p{Extended_Pictographic}\uFE0F\u200D*_`\s]+/u, '').replace(/[*_`]+/g, '').trim().toLowerCase();
@@ -701,18 +700,28 @@ function cleanReply(text) {
     .join('\n');
 }
 
-/** media_id values of the "[receipt scanned] {json}" lines in a message (whatsapp.js stored those blobs). */
-function scannedMediaIds(userMessage) {
-  const ids = [];
+/**
+ * The "[receipt scanned] {json}" lines of a message (media/index.js scanItem → vision.js
+ * formatScanLine), parsed. `mediaIds` are the blobs whatsapp.js stored for them; `unstored` is
+ * true when a scan line has no media_id, i.e. a real scan whose blob store failed. A typed line
+ * that isn't JSON ("[receipt scanned] hello") is an imitation and counts as neither.
+ */
+function scannedReceipts(userMessage) {
+  const mediaIds = [];
+  let unstored = false;
   for (const m of String(userMessage || '').matchAll(/^\[receipt scanned\] (\{.*\})$/gm)) {
+    let scan;
     try {
-      const id = Number(JSON.parse(m[1]).media_id);
-      if (Number.isInteger(id) && id > 0) ids.push(id);
+      scan = JSON.parse(m[1]);
     } catch {
-      // not JSON — a typed imitation; nothing stored for it
+      continue; // not JSON — nothing stored for it
     }
+    if (!scan || typeof scan !== 'object') continue;
+    const id = Number(scan.media_id);
+    if (Number.isInteger(id) && id > 0) mediaIds.push(id);
+    else if (scan.media_id == null) unstored = true;
   }
-  return ids;
+  return { mediaIds, unstored };
 }
 
 /**
@@ -727,7 +736,7 @@ function scannedMediaIds(userMessage) {
  * the signature already includes them, and the user must see what they are agreeing to.
  */
 function withTrustWarnings(ctx, text) {
-  if (!ctx.confirmationRequested || ctx.saved || ctx.cancelled) return text;
+  if (!ctx.confirmationRequested) return text;
   const warnings = ctx.draft.trust_warnings;
   if (!Array.isArray(warnings) || !warnings.length) return text;
   const missing = warnings.filter((w) => !text.includes(String(w)));
@@ -763,9 +772,11 @@ async function handle(user, userMessage, { voiceTranscript = null } = {}) {
   // A new scan replaces any receipt previously attached to the draft: hide the old id so the
   // model re-sets receipt_media_id from the new line. The old blob is only deleted once the turn
   // has ended with a different id (below) — an OpenAI failure keeps the old draft as it was.
+  // A scan whose blob store failed (no media_id) is still a new receipt; a typed
+  // "[receipt scanned] …" that isn't a scan line is not, and leaves the receipt alone.
   const previousMediaId = draft.receipt_media_id || null;
-  const newMediaIds = scannedMediaIds(userMessage);
-  if (newMediaIds.length || /^\[receipt scanned\] /m.test(userMessage || '')) delete draft.receipt_media_id;
+  const { mediaIds: newMediaIds, unstored: unstoredScan } = scannedReceipts(userMessage);
+  if (newMediaIds.length || unstoredScan) delete draft.receipt_media_id;
   // A preview armed at the START of this turn was for exactly this user message. If the turn
   // ends with that same preview still pending, the user didn't confirm it — drop it.
   // Identified by preview_id (random), never by timestamp: a re-preview issued in the same
@@ -872,7 +883,11 @@ async function handle(user, userMessage, { voiceTranscript = null } = {}) {
   finalText = withTrustWarnings(ctx, finalText);
   finalText = withVoiceEcho(voiceTranscript, finalText);
 
-  if (ctx.saved || ctx.cancelled) {
+  // ctx.confirmationRequested means a card went out AFTER the last save/cancel (both clear it):
+  // that card is live, so its draft is kept even though something was saved this turn — the
+  // missed-sale chain whose payment was refused and re-carded. A card followed by the save (or
+  // cancel) of its own draft is spent, and the conversation resets.
+  if ((ctx.saved || ctx.cancelled) && !ctx.confirmationRequested) {
     await resetConversation(user.id);
   } else {
     // The draft's receipt was replaced (or dropped) this turn: the previous image is unreferenced.
@@ -911,7 +926,7 @@ async function handle(user, userMessage, { voiceTranscript = null } = {}) {
 
   return {
     text: finalText,
-    isConfirmation: ctx.confirmationRequested && !ctx.saved && !ctx.cancelled,
+    isConfirmation: ctx.confirmationRequested,
   };
 }
 

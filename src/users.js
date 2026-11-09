@@ -1,13 +1,9 @@
 const { query } = require('./db');
 const { normalizeAddress } = require('./channels/address');
 
-/**
- * users.phone holds the user's ADDRESS (src/channels/address.js): "+66…" for WhatsApp,
- * "line:U…" for LINE. Name kept for the existing callers.
- */
-function normalizePhone(raw) {
-  return normalizeAddress(raw);
-}
+// users.phone holds the user's ADDRESS (src/channels/address.js): "+66…" for WhatsApp, "line:U…"
+// for LINE. normalizePhone IS normalizeAddress, under the name the existing callers use.
+const normalizePhone = normalizeAddress;
 
 async function findByPhone(phone) {
   const normalized = normalizePhone(phone);

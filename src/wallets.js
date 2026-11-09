@@ -103,6 +103,22 @@ async function getById(user, id) {
   return r.rows[0] ? { ...rowToWallet(r.rows[0]), is_active: r.rows[0].is_active === 1 } : null;
 }
 
+/**
+ * getById for several ids in one query, same scoping and row shape. Non-integer ids are ignored;
+ * unknown / other users' ids are simply absent. Order is not the input's.
+ */
+async function getByIds(user, ids) {
+  const wanted = [...new Set((Array.isArray(ids) ? ids : []).map(Number).filter((n) => Number.isInteger(n)))];
+  if (!wanted.length) return [];
+  // One placeholder per id, not `= ANY($n::int[])`: pg-mem (the tests' DB) doesn't match array params.
+  const marks = wanted.map((_, i) => `$${i + 2}`).join(', ');
+  const r = await query(
+    `SELECT * FROM account_cache WHERE user_id = $1 AND account_type IS NOT NULL AND id IN (${marks})`,
+    [user.id, ...wanted]
+  );
+  return r.rows.map((row) => ({ ...rowToWallet(row), is_active: row.is_active === 1 }));
+}
+
 /** Group account a new wallet of this type should sit under. */
 async function findParentGroup(erp, accountType) {
   if (accountType === 'Cash' || accountType === 'Bank') {
@@ -185,4 +201,4 @@ async function accountForDraft(user, erp, draft, { field = 'payment_account_id' 
   return acc;
 }
 
-module.exports = { list, getById, create, accountForDraft, PARENT_CODE_TO_TYPE };
+module.exports = { list, getById, getByIds, create, accountForDraft, PARENT_CODE_TO_TYPE };

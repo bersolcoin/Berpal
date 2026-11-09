@@ -87,7 +87,7 @@ const SCAN = {
 async function scan(user, bytes) {
   download._setDownloaderForTests(async () => bytes);
   const r = await mediaIntake.intake(user, await inboundFromTwilio({
-    NumMedia: '1', MediaContentType0: 'image/jpeg', MediaUrl0: 'https://api.twilio.com/x/Media/1',
+    From: 'whatsapp:+66810000099', NumMedia: '1', MediaContentType0: 'image/jpeg', MediaUrl0: 'https://api.twilio.com/x/Media/1',
   }), 'coffee');
   assert.equal(r.mediaIds.length, 1);
   return r.mediaIds[0];
@@ -436,8 +436,11 @@ test('a card reply that leaves out the ⚠ lines gets them appended at the end o
   assert.ok(repaired.includes(`- ${warnings[1]}`));
   assert.equal(repaired.split(warnings[0]).length, 2);
 
-  // No card this turn, or a save/cancel → never appended.
+  // No card this turn → never appended. A save/cancel clears confirmationRequested (the tools do),
+  // so a card followed by its own save gets nothing; a card issued AFTER a save in the same turn
+  // (the chained payment re-carded) is live and does.
   assert.equal(withTrustWarnings({ ...base, confirmationRequested: false }, card), card);
-  assert.equal(withTrustWarnings({ ...base, saved: { erpnext_name: 'X' } }, card), card);
+  assert.equal(withTrustWarnings({ ...base, confirmationRequested: false, saved: { erpnext_name: 'X' } }, card), card);
+  assert.ok(withTrustWarnings({ ...base, saved: { erpnext_name: 'X' } }, card).includes(WARNING_HEADER));
   assert.equal(withTrustWarnings({ ...base, draft: {} }, card), card);
 });

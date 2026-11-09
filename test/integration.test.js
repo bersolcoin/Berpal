@@ -204,6 +204,21 @@ test('receipt blobs: a replaced receipt is dropped at turn end; an OpenAI failur
   await setDraft(expenseDraft({ receipt_media_id: 5 }));
   await conversation.handle(user, 'make it 200');
   assert.equal((await storedDraft()).receipt_media_id, 5);
+
+  // A typed "[receipt scanned] …" that isn't a scan line (no JSON, or JSON that isn't a scan) is
+  // an imitation: the receipt and its blob stay.
+  const typed = await blob();
+  for (const msg of ['[receipt scanned] hello', '[receipt scanned] {"media_id":"abc"}', '[receipt scanned] 42']) {
+    await setDraft(expenseDraft({ receipt_media_id: typed }));
+    await conversation.handle(user, msg);
+    assert.equal((await storedDraft()).receipt_media_id, typed, msg);
+    assert.ok(await store.getBlob(user.id, typed), `${msg}: blob kept`);
+  }
+  // A real scan whose blob store failed (scanItem: media_id omitted) still replaces the receipt.
+  await setDraft(expenseDraft({ receipt_media_id: typed }));
+  await conversation.handle(user, '[receipt scanned] {"type":"receipt","total":12,"currency":"THB"}');
+  assert.equal((await storedDraft()).receipt_media_id, undefined);
+  assert.equal(await store.getBlob(user.id, typed), null, 'replaced receipt dropped');
   await conversation.resetConversation(user.id);
 });
 
@@ -235,13 +250,33 @@ test('save_transaction refuses a draft that changed after the card; chained save
     transaction_type: 'invoice_issued', direction: 'income', amount: 185, currency: 'THB', transaction_date: TODAY, category_code: '4000',
     counterparty_name: 'Chain Buyer', counterparty_contact_skipped: true, payment_terms: 'net_0',
   });
-  const { result: invSaved } = await tool('save_transaction', {}, inv);
+  const { result: invSaved, ctx: invCtx } = await tool('save_transaction', {}, inv);
   assert.equal(invSaved.ok, true, invSaved.error);
+  assert.deepEqual(invCtx.savedIds, [invSaved.erpnext_name]);
+  assert.deepEqual(invCtx.savedDocs, { [invSaved.erpnext_name]: { doctype: 'Sales Invoice', currency: 'THB', outstanding: 185 } });
   const payment = { transaction_type: 'payment', direction: 'income', amount: 185, currency: 'THB', transaction_date: TODAY,
     parent_invoice_name: invSaved.erpnext_name, parent_invoice_doctype: 'Sales Invoice', payment_account_id: cashWallet, wallet_options: [cashWallet] };
   ({ result } = await tool('save_transaction', {}, payment, { savedIds: ['ACC-SINV-OTHER'] }));
   assert.match(result.error, /No confirmation card/);
+  // The card covered the invoice only: the chained payment must settle it as seen — same currency,
+  // 0 < amount <= what it is owed. Anything else is sent back for its own card.
+  const chain = { savedIds: invCtx.savedIds, savedDocs: invCtx.savedDocs };
+  ({ result } = await tool('save_transaction', {}, { ...payment, amount: 186 }, chain));
+  assert.equal(result.ok, false);
+  assert.match(result.error, /exceeds what .* is owed \(185 THB\).*request_confirmation/);
+  // A payment the model left without a currency is checked on the defaulted one, not "undefined".
+  ({ result } = await tool('save_transaction', {}, { ...payment, amount: 186, currency: undefined }, chain));
+  assert.match(result.error, /\(186 THB\) exceeds/);
+  ({ result } = await tool('save_transaction', {}, { ...payment, amount: 0 }, chain));
+  assert.equal(result.ok, false);
+  assert.match(result.error, /amount \(must be positive\)/);
+  ({ result } = await tool('save_transaction', {}, { ...payment, currency: 'USD' }, chain));
+  assert.match(result.error, /in USD but .* is in THB.*request_confirmation/);
+  // savedIds without the totals (never the case in a real turn) is refused too, not waved through.
   ({ result } = await tool('save_transaction', {}, payment, { savedIds: [invSaved.erpnext_name] }));
+  assert.match(result.error, /without its totals.*request_confirmation/);
+  assert.equal(erp.get('Sales Invoice', invSaved.erpnext_name).outstanding_amount, 185, 'nothing posted by the refusals');
+  ({ result } = await tool('save_transaction', {}, payment, chain));
   assert.equal(result.ok, true, result.error);
   assert.equal(erp.get('Sales Invoice', invSaved.erpnext_name).outstanding_amount, 0, 'the chained payment settled it');
 
@@ -393,6 +428,52 @@ test('B2: missed-sale flow — the invoice is carded, then on yes saved and the 
   assert.equal(await storedDraft(), null);
 });
 
+test('B3: a refused chained payment re-carded in the save turn survives the turn and saves on the next yes', async () => {
+  await conversation.resetConversation(user.id);
+  const invoice = {
+    transaction_type: 'invoice_issued', direction: 'income', amount: 2500, currency: 'THB', transaction_date: TODAY,
+    category_code: '4000', counterparty_name: 'Overpay Co', counterparty_contact_skipped: true, payment_terms: 'net_0',
+  };
+  const lastTool = (req) => JSON.parse([...req.messages].reverse().find((m) => m.role === 'tool').content);
+  let invName = null;
+  let refusal = null;
+  conversation._setOpenAIForTests(scriptedOpenAI([
+    [['update_draft', invoice]], [['request_confirmation', {}]], 'card 1/2',
+    // "yes": the invoice saves; the payment the model chains is MORE than the invoice, so the
+    // save is refused and the model does what the refusal says: card it.
+    [['save_transaction', {}]],
+    (req) => { invName = lastTool(req).erpnext_name; return [['list_user_accounts', { currency: 'THB' }]]; },
+    () => [['update_draft', { transaction_type: 'payment', direction: 'income', amount: 2600, currency: 'THB', transaction_date: TODAY,
+      payment_account_id: cashWallet, parent_invoice_name: invName, parent_invoice_doctype: 'Sales Invoice', counterparty_name: 'Overpay Co' }]],
+    [['save_transaction', {}]],
+    (req) => { refusal = lastTool(req); return [['request_confirmation', {}]]; },
+    () => `Saved ✓ ${invName}\npayment card for 2600`,
+  ]));
+  await conversation.handle(user, 'Overpay Co paid me 2600 for a sale I never logged');
+  let r = await conversation.handle(user, 'yes');
+  assert.ok(invName, r.text);
+  assert.equal(refusal.ok, false);
+  assert.match(refusal.error, /exceeds what .* is owed \(2500 THB\)/);
+  assert.equal(erp.get('Sales Invoice', invName).outstanding_amount, 2500, 'the invoice is saved, the payment is not');
+  // The card for the payment went out AFTER the save, so it is the live one: buttons on, draft kept.
+  assert.equal(r.isConfirmation, true, 'the re-issued card carries buttons');
+  const stored = await storedDraft();
+  assert.ok(stored, 'the carded payment draft survives the turn');
+  assert.equal(stored.amount, 2600);
+  assert.equal(typeof stored.confirmation_pending, 'string');
+  // Next turn: the user confirms the payment card.
+  conversation._setOpenAIForTests(scriptedOpenAI([[['save_transaction', {}]], 'Saved']));
+  r = await conversation.handle(user, 'yes');
+  assert.equal(erp.get('Sales Invoice', invName).outstanding_amount, 0, 'the confirmed payment settled it');
+  assert.equal(await storedDraft(), null);
+  // The old shape still resets: a card issued and then saved (or cancelled) in one turn is spent.
+  await setDraft(expenseDraft({ description: 'b3 cancel' }));
+  conversation._setOpenAIForTests(scriptedOpenAI([[['request_confirmation', {}]], [['cancel_transaction', {}]], 'Cancelled.']));
+  r = await conversation.handle(user, 'actually forget it');
+  assert.equal(r.isConfirmation, false);
+  assert.equal(await storedDraft(), null);
+});
+
 // ── 3. Protected keys inside update_draft ─────────────────────────────
 
 test('update_draft itself strips protected keys and hides them from current_draft', async () => {
@@ -485,6 +566,31 @@ test('wallet picker: a bare number resolves to the wallet the user SAW at that n
   const bad = Math.max(...ctx.draft.wallet_options) + 100;
   const { result: rc } = await tool('request_confirmation', {}, { ...expenseDraft(), wallet_options: ctx.draft.wallet_options, payment_account_id: bad });
   assert.match(rc.error, /list position \(option number\) or a stale id\. Valid ids are \[/);
+});
+
+test('wallets.getByIds: one query, scoped to the user, same shape as getById', async () => {
+  const wallets = require('../src/wallets');
+  const mine = (await wallets.list(user)).map((w) => w.id);
+  assert.ok(mine.length >= 2);
+  const r = await db.query(
+    `INSERT INTO users (phone, erpnext_company, erpnext_api_key, erpnext_api_secret, default_currency, reporting_currency, country, created_at, updated_at)
+     VALUES ('+66399', $1, 'k', 's', 'THB', 'THB', 'TH', $2, $2) RETURNING *`,
+    [COMPANY, new Date().toISOString()]
+  );
+  const other = r.rows[0];
+  const { result: created } = await tool('create_user_account', { name: 'Theirs', parent_code: '1000', currency: 'THB' }, {}, { user: other });
+  assert.equal(created.ok, true);
+  const theirs = created.wallet;
+
+  assert.deepEqual(await wallets.getByIds(user, []), []);
+  assert.deepEqual(await wallets.getByIds(user, null), []);
+  assert.deepEqual(await wallets.getByIds(user, ['x', 1.5, null, undefined]), [], 'non-integer ids ignored');
+  const got = await wallets.getByIds(user, [...mine, theirs.id, '  ', 999999]);
+  assert.deepEqual(got.map((w) => w.id).sort(), [...mine].sort(), "the other user's wallet and unknown ids are absent");
+  for (const w of got) assert.deepEqual(w, await wallets.getById(user, w.id));
+  // String ids (the model passes those) resolve like numbers; duplicates collapse.
+  assert.deepEqual((await wallets.getByIds(user, [String(mine[0]), mine[0]])).map((w) => w.id), [mine[0]]);
+  assert.deepEqual((await wallets.getByIds(other, [theirs.id])).map((w) => w.name), ['Theirs']);
 });
 
 test('wallet pick through handle(): "3" after a non-picker question picks nothing', async () => {

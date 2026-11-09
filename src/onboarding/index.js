@@ -125,6 +125,12 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// The UTC day the pruning DELETEs last ran in this process. Every unknown number still costs the
+// one UPSERT (the cap must hold for INVITE_ONLY replies too), but the two table scans run once per
+// process per day rather than on each distinct number's first message — a scripted sweep of fresh
+// numbers in closed mode used to trigger them per number.
+let lastPruneDay = null;
+
 /** Count this message; true when the phone is still under today's cap. */
 async function allowMessage(phone) {
   const day = today();
@@ -135,9 +141,10 @@ async function allowMessage(phone) {
     [phone, day]
   );
   const n = Number(r.rows[0].msg_count);
-  if (n === 1) {
-    // First message of the day for this phone: drop older days (keeps the table small), and
-    // abandoned signups — their answers were collected before consent.
+  if (lastPruneDay !== day) {
+    // First time today: drop older days (keeps the table small), and abandoned signups — their
+    // answers were collected before consent.
+    lastPruneDay = day;
     await query('DELETE FROM onboarding_rate_limits WHERE day < $1', [day]);
     await query('DELETE FROM onboarding_sessions WHERE updated_at < $1', [sessionCutoff()]);
   }
@@ -378,9 +385,18 @@ async function closeAccount(user) {
     await c.query('DELETE FROM messages WHERE user_id = $1', [user.id]);
     await c.query(`UPDATE conversations SET draft_transaction = NULL, recent_messages = '[]', state = 'idle', updated_at = $1 WHERE user_id = $2`,
       [now, user.id]);
+    // Customer phones (outreach log) and counterparty names (duplicate fingerprints) are personal
+    // data about third parties; the ERPNext ledger keeps the truth either way.
+    await c.query('DELETE FROM outreach_log WHERE user_id = $1', [user.id]);
+    await c.query('DELETE FROM trust_fingerprints WHERE user_id = $1', [user.id]);
+    // The contact cache holds customers' phones and emails: the "customer contact log" the user is
+    // told is removed. ERPNext keeps its own Customer/Supplier records with the ledger.
+    await c.query('DELETE FROM counterparty_cache WHERE owner_user_id = $1', [user.id]);
+    // users.phone stays: it is how the bot recognises this number afterwards and answers
+    // "account closed" instead of starting a fresh signup.
     await c.query(
-      `UPDATE users SET subscription_status = 'deleted', tax_id = NULL, accountant_name = NULL, accountant_phone = NULL,
-         erpnext_api_key = NULL, erpnext_api_secret = NULL, delete_requested_at = NULL, updated_at = $1
+      `UPDATE users SET subscription_status = 'deleted', display_name = NULL, tax_id = NULL, accountant_name = NULL,
+         accountant_phone = NULL, erpnext_api_key = NULL, erpnext_api_secret = NULL, delete_requested_at = NULL, updated_at = $1
        WHERE id = $2`,
       [now, user.id]
     );
@@ -426,4 +442,5 @@ async function handleRegistered(user, body) {
 module.exports = {
   handleUnknownPhone, handleRegistered, normalizeContactPhone, maskPhone, mode, matchInvite,
   parseName, DAILY_LIMIT, STEPS, SESSION_TTL_DAYS, NAME_MAX,
+  _resetPruneForTests: () => { lastPruneDay = null; },
 };

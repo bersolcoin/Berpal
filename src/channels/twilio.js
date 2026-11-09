@@ -235,15 +235,21 @@ async function fetchVCard(url) {
 /**
  * Twilio's webhook form body → the normalised inbound message. Async because shared contacts
  * (vCard attachments) are downloaded and parsed here: they leave `media` and land in `contacts`
- * (only those with a name or phone; an unreadable vCard is dropped). null when From is not a
- * WhatsApp address (the webhook then drops the message). Exported for tests.
+ * (only those with a name or phone; an unreadable vCard is dropped). null when From is missing or
+ * not a WhatsApp address (the webhook then drops the message). Exported for tests.
  */
 async function inboundFromTwilio(form) {
   const raw = form || {};
+  // No sender, no message: an 'unknown' address would otherwise start an onboarding session
+  // (and be answered) under that literal name.
+  if (!normalizeAddress(raw.From)) {
+    console.error('[whatsapp] dropping inbound: no From address');
+    return null;
+  }
   // Twilio only ever posts WhatsApp senders. A From that normalises to another channel's address
   // ("whatsapp:line:U…", only possible on an unsigned dev webhook) would otherwise act — and be
   // answered — as that LINE user: dropped before anything (vCards included) is fetched.
-  if (raw.From != null && String(raw.From).trim() && channelOf(raw.From) !== 'whatsapp') {
+  if (channelOf(raw.From) !== 'whatsapp') {
     console.error('[whatsapp] dropping inbound: From is not a WhatsApp address');
     return null;
   }
@@ -265,7 +271,7 @@ async function inboundFromTwilio(form) {
   }
   return {
     channel: 'whatsapp',
-    from: normalizeAddress(raw.From) || 'unknown',
+    from: normalizeAddress(raw.From),
     body: raw.Body || '',
     media,
     contacts,

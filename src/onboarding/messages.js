@@ -81,7 +81,7 @@ const DELETE_CONFIRM =
   'Your ledger in ERPNext is NOT deleted — your accountant keeps it as your bookkeeping record.\n\n' +
   'Reply DELETE to confirm, or anything else to keep your account.';
 const DELETE_DONE =
-  'Done — your Berpal account is closed and your tax ID, accountant details, stored receipts and message history have been removed. ' +
+  'Done — your Berpal account is closed and your name, tax ID, accountant details, stored receipts, message history and customer contact log have been removed. ' +
   'Your ERPNext ledger is kept: your accountant retains it as the bookkeeping record.';
 const DELETE_KEPT = 'OK — nothing was deleted. Your account stays as it is.';
 

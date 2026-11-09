@@ -27,7 +27,7 @@
 const crypto = require('node:crypto');
 const { lineAddress, channelIdOf, channelOf, maskAddress, normalizeAddress } = require('./address');
 const { lineSignatureOk } = require('./line-signature');
-const { parseMaxBytes } = require('../media/download');
+const { parseMaxBytes, readCapped } = require('../media/download');
 const { ts } = require('../erp-sync/common');
 
 const API_BASE = 'https://api.line.me/v2/bot';
@@ -42,6 +42,9 @@ const WEBHOOK_MAX_BYTES = 1024 * 1024;
 const REPLY_TOKEN_TTL_MS = 50 * 1000; // use a token only while younger than this
 const REPLY_TOKEN_KEEP_MS = 60 * 1000; // evict entries older than this
 const REPLY_TOKENS_MAX = 1000;
+
+const SEEN_EVENT_KEEP_MS = 10 * 60 * 1000; // forget a webhookEventId after this
+const SEEN_EVENTS_MAX = 5000;
 
 /** Reply tokens the LINE console's "Verify" button sends; there is no user behind them. */
 const VERIFY_REPLY_TOKENS = new Set(['00000000000000000000000000000000', 'ffffffffffffffffffffffffffffffff']);
@@ -123,6 +126,33 @@ function restoreReplyToken(address, token, at) {
   const key = normalizeAddress(address);
   if (!key || replyTokens.has(key)) return;
   rememberReplyToken(address, token, at);
+}
+
+// ── seen event ids ───────────────────────────────────────────────────────────────────────────────
+
+// webhookEventId → seen-at. LINE redelivers events (a slow 200, its own retries), not always with
+// deliveryContext.isRedelivery set, so every id is remembered and a repeat is dropped before it
+// reaches processMessage. Same age-ordered map and eviction as replyTokens.
+const seenEvents = new Map();
+
+function pruneSeenEvents() {
+  const t = now();
+  for (const [key, at] of seenEvents) {
+    if (t - at <= SEEN_EVENT_KEEP_MS) break;
+    seenEvents.delete(key);
+  }
+  while (seenEvents.size > SEEN_EVENTS_MAX) seenEvents.delete(seenEvents.keys().next().value);
+}
+
+/** True when `ev` carries a webhookEventId already seen; otherwise remembers it (if any). */
+function isDuplicateEvent(ev) {
+  const id = ev && ev.webhookEventId != null ? String(ev.webhookEventId) : '';
+  if (!id) return false;
+  pruneSeenEvents(); // an id past SEEN_EVENT_KEEP_MS is forgotten, so it's new again
+  if (seenEvents.has(id)) return true;
+  seenEvents.set(id, now());
+  pruneSeenEvents(); // keep the cap after the insert, like rememberReplyToken
+  return false;
 }
 
 /** The held reply token for `address` if younger than REPLY_TOKEN_TTL_MS; removed either way. */
@@ -309,36 +339,6 @@ async function sendTemplate() {
 
 // ── Channel interface: media ─────────────────────────────────────────────────────────────────────
 
-function tooLarge(size) {
-  return Object.assign(new Error(`media too large: over ${maxBytes()} bytes (got ${size})`), { code: 'MEDIA_TOO_LARGE' });
-}
-
-/** Mirrors readCapped() in src/media/download.js (not exported there). */
-async function readCapped(res, abort) {
-  const cap = maxBytes();
-  const declared = Number(res.headers && res.headers.get && res.headers.get('content-length'));
-  if (declared > cap) {
-    abort();
-    throw tooLarge(declared);
-  }
-  if (!res.body) return Buffer.alloc(0);
-  const reader = res.body.getReader();
-  const chunks = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.length;
-    if (total > cap) {
-      abort();
-      await reader.cancel().catch(() => {});
-      throw tooLarge(total);
-    }
-    chunks.push(value);
-  }
-  return Buffer.concat(chunks, total);
-}
-
 /**
  * The type media/index.js should treat the bytes as. Items from file events carry the type
  * derived from the file name (application/pdf or application/octet-stream) and keep it; images
@@ -373,7 +373,8 @@ async function downloadMedia(item) {
     try { await res.body?.cancel(); } catch { /* nothing to drain */ }
     throw new Error(`LINE media download failed: HTTP ${res.status}`);
   }
-  const bytes = await readCapped(res, () => controller.abort());
+  // This module's cap (maxBytes(), test-overridable) rather than download.js's own.
+  const bytes = await readCapped(res, () => controller.abort(), maxBytes());
   const contentType = resolveContentType(item, res.headers && res.headers.get && res.headers.get('content-type'));
   console.log(`• [line] [${ts()}] downloaded ${bytes.length} bytes (${contentType})`);
   return { bytes, contentType };
@@ -423,8 +424,8 @@ function skip(ev, what, who) {
  *
  * Only 1:1 chats: group/room sources (or no userId) are skipped. Standby-mode events (another
  * module channel owns the chat) are skipped. Redeliveries (deliveryContext.isRedelivery) are
- * processed and logged; de-duplication is the per-sender queue's concern. LINE messages have no
- * captions, so a photo's body is always ''.
+ * logged here; processEvents drops any event whose webhookEventId was already seen, flagged or
+ * not. LINE messages have no captions, so a photo's body is always ''.
  */
 function mapEvent(ev) {
   if (!ev || typeof ev !== 'object') return null;
@@ -465,7 +466,8 @@ function isVerifyPing(ev) {
 /**
  * Maps and dispatches every event. processMessage is called in event order without waiting for
  * the previous one (the per-sender queue serialises a user's messages); one failure doesn't stop
- * the rest. Resolves when all settle.
+ * the rest. An event whose webhookEventId was processed already is dropped (events without an id
+ * are always processed). Resolves when all settle.
  */
 function processEvents(payload, processMessage) {
   const events = payload && Array.isArray(payload.events) ? payload.events : [];
@@ -478,6 +480,7 @@ function processEvents(payload, processMessage) {
     let inbound;
     try {
       inbound = mapEvent(ev);
+      // The redelivery's token is the live one (the first may be spent or expired): keep it.
       if (inbound && ev.replyToken) rememberReplyToken(inbound.from, ev.replyToken);
     } catch (err) {
       // A malformed event must not escape after the 200 (unhandled rejection) or stop the rest.
@@ -485,6 +488,10 @@ function processEvents(payload, processMessage) {
       continue;
     }
     if (!inbound) continue;
+    if (isDuplicateEvent(ev)) {
+      console.log(`• [line] [${ts()}] duplicate ${ev.type} event from=${maskAddress(inbound.from)} id=${ev.webhookEventId}, skipped`);
+      continue;
+    }
     pending.push(Promise.resolve()
       .then(() => processMessage(inbound))
       .catch((err) => console.error(`[line webhook async] processing error from=${maskAddress(inbound.from)}:`, err)));
@@ -628,6 +635,7 @@ function _setMaxBytesForTests(n) {
 }
 function _resetForTests() {
   replyTokens.clear();
+  seenEvents.clear();
   fetchImpl = null;
   nowImpl = () => Date.now();
   maxBytesOverride = null;
@@ -657,6 +665,8 @@ module.exports = {
   WEBHOOK_MAX_BYTES,
   MAX_TEXT_CHARS,
   REPLY_TOKEN_TTL_MS,
+  SEEN_EVENTS_MAX,
+  SEEN_EVENT_KEEP_MS,
   _setFetchForTests,
   _setNowForTests,
   _setMaxBytesForTests,

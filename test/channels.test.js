@@ -138,9 +138,21 @@ test('twilio inbound: text only → normalised message, whatsapp: prefix strippe
   assert.deepEqual(await twilioAdapter.inboundFromTwilio(form), {
     channel: 'whatsapp', from: '+66812345678', body: 'paid 50 for coffee', media: [], contacts: [], raw: form,
   });
-  const empty = await twilioAdapter.inboundFromTwilio({});
-  assert.equal(empty.from, 'unknown');
-  assert.equal(empty.body, '');
+});
+
+test('twilio inbound: a missing or blank From is dropped (null), never the address "unknown"', async () => {
+  const errors = [];
+  const realError = console.error;
+  console.error = (...a) => errors.push(a.join(' '));
+  try {
+    for (const form of [{}, { Body: 'hi', NumMedia: '0' }, { From: '', Body: 'hi' }, { From: '   ', Body: 'hi' }, { From: 'whatsapp:', Body: 'hi' }]) {
+      assert.equal(await twilioAdapter.inboundFromTwilio(form), null, JSON.stringify(form));
+    }
+  } finally {
+    console.error = realError;
+  }
+  assert.equal(errors.length, 5, 'one line per dropped message');
+  assert.ok(errors.every((e) => /no From address/.test(e)), errors.join('\n'));
 });
 
 test('twilio inbound: two media items keep order; content types normalised; ref = MediaUrl', async () => {

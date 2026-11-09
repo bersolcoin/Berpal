@@ -32,11 +32,12 @@ function contactLine(contact) {
 
 // Per-user FIFO: a receipt scan or transcription takes seconds, and a typed follow-up ("put it on
 // the AmEx") must not reach the conversation before the scan it refers to. Messages from
-// different users still run concurrently.
+// different users still run concurrently. Keyed exactly as processOne resolves `from`, so one
+// sender never lands on two queues.
 const queues = new Map();
 
 function processIncomingMessage(inbound) {
-  const key = users.normalizePhone(inbound.from) || String(inbound.from);
+  const key = normalizeAddress(inbound.from) || String(inbound.from);
   const prev = queues.get(key) || Promise.resolve();
   const run = prev.then(() => processOne(inbound));
   const tail = run.catch(() => {});
