@@ -1,0 +1,25 @@
+# Keep secrets, dev deps and test fixtures out of the build context.
+node_modules
+npm-debug.log*
+*.log
+.env
+.env.*
+.git
+.gitignore
+.github
+.claude
+.vscode
+.idea
+.DS_Store
+test
+scripts/smoke-report.json
+smoke-report.json
+*.md
+!README.md
+*.bat
+data
+*.db
+*.db-*
+Dockerfile
+docker-compose.yml
+.dockerignore

@@ -1,12 +1,40 @@
 require('dotenv').config();
+// Env validation first: exits with one line per problem, and normalises ERPNEXT_URL before
+// src/erpnext.js reads it at load.
+require('./src/config').assertEnv();
 const express = require('express');
 const db = require('./src/db');
 const { processIncomingMessage } = require('./src/whatsapp');
-
-const EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+const scheduler = require('./src/jobs/scheduler');
+const { jobsDisabled } = require('./src/jobs');
+const { webhookUrl } = require('./src/webhook');
+const channels = require('./src/channels');
+const { createHealthHandler } = require('./src/health');
 
 (async () => {
   await db.init();
+
+  let jobsRunning = false;
+  // Daily per-user jobs (morning digest, reminders). DISABLE_JOBS=1|true|yes|on for a second
+  // web-only instance or local dev — job_runs already prevents double sends, this just skips the work.
+  if (!jobsDisabled(process.env.DISABLE_JOBS)) {
+    scheduler.start();
+    jobsRunning = true;
+  }
+  // Always installed: in the Docker image node is PID 1, and PID 1 gets no default SIGTERM
+  // action, so without a listener `docker stop` waits out its timeout and SIGKILLs. With the
+  // scheduler running, let an in-flight tick finish (max 10s) so its job_runs rows get recorded.
+  const shutdown = async (signal) => {
+    if (jobsRunning) {
+      console.log(`[server] ${signal}: stopping scheduler`);
+      await Promise.race([scheduler.stop(), new Promise((resolve) => setTimeout(resolve, 10000))]);
+    } else {
+      console.log(`[server] ${signal}: exiting`);
+    }
+    process.exit(0);
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 
   const app = express();
   app.use(express.urlencoded({ extended: false }));
@@ -15,25 +43,45 @@ const EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>
     res.send('WhatsApp bot is running. POST /webhook for Twilio.');
   });
 
-  app.post('/webhook', (req, res) => {
-    // Ack Twilio immediately so the 15s webhook timeout never kicks in.
-    res.set('Content-Type', 'text/xml');
-    res.send(EMPTY_TWIML);
+  // Liveness + dependency checks (db, ERPNext, Twilio); ?deep=0 skips the external calls.
+  // 503 only when the db is down — see src/health.js.
+  app.get('/health', createHealthHandler({ scheduler: { running: () => jobsRunning } }));
 
-    // Process and send the actual reply via Twilio REST API in the background.
-    processIncomingMessage({
-      from: req.body.From || 'unknown',
-      body: req.body.Body || '',
-      raw: req.body,
-    }).catch((err) => {
-      console.error('[webhook async] processing error:', err);
-    });
-  });
+  // Twilio delivery callbacks for scheduled sends (digest template) — marks async failures
+  // like 63016 on job_runs. Signature-checked against PUBLIC_BASE_URL.
+  app.post('/twilio/status', scheduler.twilioStatusHandler());
+
+  // Inbound messages: one webhook route per configured channel (src/channels — each adapter
+  // names its webhookPath and verifies its own signature).
+  // WhatsApp, POST /webhook: X-Twilio-Signature is checked against TWILIO_WEBHOOK_URL (or
+  // PUBLIC_BASE_URL + '/webhook'); a malformed URL throws here and stops the boot. With neither
+  // set: production refuses every request, dev skips the check (see src/webhook.js).
+  const mounted = [];
+  for (const ch of channels.configured()) {
+    const opts = { processMessage: processIncomingMessage };
+    let note = '';
+    if (ch.name === 'whatsapp') {
+      const signedUrl = webhookUrl();
+      if (!signedUrl && process.env.NODE_ENV === 'production') {
+        console.error('[server] ✖ NODE_ENV=production without TWILIO_WEBHOOK_URL / PUBLIC_BASE_URL: POST /webhook will refuse every request (403).');
+      } else if (!signedUrl) {
+        console.warn('');
+        console.warn('[server] ⚠⚠⚠ WARNING: PUBLIC_BASE_URL / TWILIO_WEBHOOK_URL not set — POST /webhook accepts UNSIGNED requests.');
+        console.warn('[server] ⚠⚠⚠ Anyone who knows the URL can post as any registered user. Fine for local ngrok dev; refused when NODE_ENV=production.');
+        console.warn('');
+      }
+      opts.url = signedUrl;
+      note = signedUrl ? ` (signed as ${signedUrl})` : ' (signature check OFF)';
+    }
+    app.post(ch.webhookPath, ch.webhookHandler(opts));
+    mounted.push(`${ch.name}: POST ${ch.webhookPath}${note}`);
+  }
+  if (!mounted.length) console.error('[server] ✖ no messaging channel is configured: no inbound webhook mounted');
 
   const port = process.env.PORT || 3000;
   app.listen(port, () => {
     console.log(`[server] listening on http://localhost:${port}`);
-    console.log(`[server] webhook path: POST /webhook`);
+    for (const m of mounted) console.log(`[server] webhook ${m}`);
   });
 })().catch((err) => {
   console.error('[server] startup failed:', err);

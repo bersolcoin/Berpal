@@ -1,19 +1,32 @@
 {
   "name": "ber-accounting-whatsapp-bot",
   "version": "0.1.0",
-  "description": "WhatsApp bot via Twilio Sandbox — phase 1: echo reply over TwiML",
+  "description": "WhatsApp bookkeeping bot: plain-language transactions, receipts and voice notes posted to ERPNext, with customer outreach, Thai VAT/WHT, stock and a daily digest",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
     "create-template": "node scripts/create-confirmation-template.js",
-    "reset": "node scripts/reset-conversations.js"
+    "reset": "node scripts/reset-conversations.js",
+    "test": "node --test test/",
+    "test:llm": "node test/llm-harness.js",
+    "smoke:erpnext": "node scripts/smoke-erpnext.js",
+    "check:env": "node src/config.js",
+    "docker:build": "docker build -t berpal .",
+    "docker:up": "docker compose up --build -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f app"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "heic-convert": "^2.1.0",
     "openai": "^4.77.0",
     "pg": "^8.20.0",
+    "qrcode": "^1.5.4",
     "twilio": "^6.0.0"
+  },
+  "devDependencies": {
+    "pg-mem": "^3.0.14"
   }
 }

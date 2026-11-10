@@ -33,9 +33,28 @@ function resolveBaseUrl(user) {
   );
 }
 
+// A hung ERPNext (or wkhtmltopdf) must not hang a WhatsApp turn or a scheduler pass with it.
+const REQUEST_TIMEOUT_MS = 30000;
+
+/** Our timeout, plus the caller's signal (e.g. the scheduler's deps.signal) when given. */
+function withTimeout(signal, timeoutMs) {
+  const t = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, t]) : t;
+}
+
+function stripHtml(text) {
+  return String(text)
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 class ErpNextClient {
-  constructor(user) {
+  /** `signal` (optional) is a default AbortSignal for every request, e.g. a scheduler job's timeout. */
+  constructor(user, { signal = null } = {}) {
     this.user = user;
+    this.signal = signal;
     this.baseUrl = resolveBaseUrl(user);
     if (!this.baseUrl) {
       throw new Error('[erpnext] no base URL — set ERPNEXT_URL in .env or users.erpnext_url');
@@ -44,7 +63,7 @@ class ErpNextClient {
     this.company = user.erpnext_company || null;
   }
 
-  async _fetch(method, path, body = null) {
+  async _fetch(method, path, body = null, { signal = null, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
     const url = `${this.baseUrl}${path.startsWith('/') ? path : '/' + path}`;
     const opts = {
       method,
@@ -54,6 +73,7 @@ class ErpNextClient {
         ...(body ? { 'Content-Type': 'application/json' } : {}),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: withTimeout(signal || this.signal, timeoutMs),
     };
     const res = await fetch(url, opts);
     const text = await res.text();
@@ -63,17 +83,66 @@ class ErpNextClient {
     } catch {
       json = { raw: text };
     }
+    if (!res.ok) throw this._httpError(method, path, res.status, json);
+    return json;
+  }
+
+  _httpError(method, path, status, json) {
+    // ERPNext error responses include either `exception` or `_server_messages`.
+    // HTML error pages (proxies, wkhtmltopdf crashes) are mostly markup — strip it so the
+    // 200 chars we keep are the readable part.
+    const msg =
+      json.exception ||
+      json._server_messages ||
+      (json.raw ? stripHtml(json.raw).slice(0, 200) || `HTTP ${status}` : `HTTP ${status}`);
+    const err = new Error(`[erpnext ${method} ${path}] ${msg}`);
+    err.status = status;
+    err.response = json;
+    return err;
+  }
+
+  /**
+   * GET a binary payload (PDFs). Kept separate from _fetch so JSON callers never see a Buffer,
+   * and so the body is read as bytes — res.text() would mangle anything non-UTF-8.
+   */
+  async _fetchBinary(path, { signal = null, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+    const url = `${this.baseUrl}${path.startsWith('/') ? path : '/' + path}`;
+    // PDF rendering (wkhtmltopdf) can hang on a bad print format; don't let a tool call hang with it.
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: this.authHeader, Accept: '*/*' },
+      signal: withTimeout(signal || this.signal, timeoutMs),
+    });
     if (!res.ok) {
-      // ERPNext error responses include either `exception` or `_server_messages`.
-      const msg =
-        json.exception ||
-        json._server_messages ||
-        (json.raw ? json.raw.slice(0, 200) : `HTTP ${res.status}`);
-      const err = new Error(`[erpnext ${method} ${path}] ${msg}`);
-      err.status = res.status;
-      err.response = json;
-      throw err;
+      const text = await res.text();
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = { raw: text };
+      }
+      throw this._httpError('GET', path, res.status, json);
     }
+    return Buffer.from(await res.arrayBuffer());
+  }
+
+  /** POST multipart/form-data (file uploads). fetch sets the boundary header itself from FormData. */
+  async _fetchMultipart(path, form, { signal = null, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+    const url = `${this.baseUrl}${path.startsWith('/') ? path : '/' + path}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: this.authHeader, Accept: 'application/json' },
+      body: form,
+      signal: withTimeout(signal || this.signal, timeoutMs),
+    });
+    const text = await res.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = { raw: text };
+    }
+    if (!res.ok) throw this._httpError('POST', path, res.status, json);
     return json;
   }
 
@@ -121,6 +190,45 @@ class ErpNextClient {
   }
 
   // ── Convenience wrappers (most-used doctypes) ──────────────────────
+
+  // ── Files / print ─────────────────────────────────────────────────
+
+  /**
+   * Render a document through an ERPNext Print Format and return the PDF bytes.
+   * `format` is the Print Format name; omitted → ERPNext's default for the doctype ("Standard").
+   */
+  async getPdf(doctype, name, { format, signal = null } = {}) {
+    const params = new URLSearchParams({ doctype, name });
+    if (format) params.set('format', format);
+    params.set('no_letterhead', '0');
+    const buf = await this._fetchBinary(`/api/method/frappe.utils.print_format.download_pdf?${params}`, { signal });
+    // A misconfigured print setup can answer 200 with an HTML error page; never ship that as a "PDF".
+    if (buf.subarray(0, 5).toString('latin1') !== '%PDF-') {
+      const snippet = stripHtml(buf.subarray(0, 2000).toString('utf8')).slice(0, 200);
+      throw new Error(`[erpnext] print of ${doctype} ${name} did not return a PDF${snippet ? `: ${snippet}` : ''}`);
+    }
+    return buf;
+  }
+
+  /**
+   * Upload a file to ERPNext's File doctype, optionally attached to a document.
+   * isPrivate=false makes it reachable without auth at `${baseUrl}${file_url}` — that's what
+   * lets Twilio fetch it as WhatsApp media, so pick unguessable filenames for anything sensitive.
+   *   returns { file_url, name }
+   */
+  async uploadFile({ buffer, filename, contentType = 'application/octet-stream', isPrivate = true, doctype = null, docname = null, signal = null }) {
+    const form = new FormData();
+    form.append('file', new Blob([buffer], { type: contentType }), filename);
+    form.append('file_name', filename);
+    form.append('is_private', isPrivate ? '1' : '0');
+    if (doctype && docname) {
+      form.append('doctype', doctype);
+      form.append('docname', docname);
+    }
+    const r = await this._fetchMultipart('/api/method/upload_file', form, { signal });
+    const file = r.message || {};
+    return { file_url: file.file_url, name: file.name };
+  }
 
   getMe() {
     return this.callMethod('frappe.auth.get_logged_user').then((r) => r.message);
@@ -199,9 +307,12 @@ class ErpNextClient {
   }
 }
 
-/** Build a per-user client. user must have erpnext_api_key + erpnext_api_secret + erpnext_company. */
-function forUser(user) {
-  return new ErpNextClient(user);
+/**
+ * Build a per-user client. user must have erpnext_api_key + erpnext_api_secret + erpnext_company.
+ * `signal` (optional) aborts every request the client makes (the scheduler passes deps.signal).
+ */
+function forUser(user, { signal = null } = {}) {
+  return new ErpNextClient(user, { signal });
 }
 
 module.exports = { forUser, ErpNextClient };

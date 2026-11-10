@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const { Pool } = require('pg');
 
 let _pool = null;
@@ -151,6 +153,15 @@ CREATE TABLE IF NOT EXISTS counterparty_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_cp_cache_owner ON counterparty_cache(owner_user_id);
 
+-- One contact can be both a Customer (we sell to them / they owe us) and a Supplier
+-- (we buy from them / we owe them). Track both ERPNext records on the same row.
+ALTER TABLE counterparty_cache ADD COLUMN IF NOT EXISTS erpnext_customer TEXT;
+ALTER TABLE counterparty_cache ADD COLUMN IF NOT EXISTS erpnext_supplier TEXT;
+UPDATE counterparty_cache SET erpnext_customer = erpnext_name
+  WHERE erpnext_doctype = 'Customer' AND erpnext_customer IS NULL;
+UPDATE counterparty_cache SET erpnext_supplier = erpnext_name
+  WHERE erpnext_doctype = 'Supplier' AND erpnext_supplier IS NULL;
+
 -- Lookup cache for wallets (Account in ERPNext).
 CREATE TABLE IF NOT EXISTS account_cache (
   id SERIAL PRIMARY KEY,
@@ -183,8 +194,18 @@ CREATE TABLE IF NOT EXISTS otp_attempts (
 CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_attempts(phone);
 `;
 
+/**
+ * Feature migrations live in src/migrations/*.sql, applied in filename order after the core
+ * schema. Each file must be idempotent (CREATE TABLE IF NOT EXISTS, ADD COLUMN IF NOT EXISTS …)
+ * because this runs on every boot.
+ */
 async function migrate() {
   await query(SCHEMA);
+  const dir = path.join(__dirname, 'migrations');
+  if (!fs.existsSync(dir)) return;
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) {
+    await query(fs.readFileSync(path.join(dir, f), 'utf8'));
+  }
 }
 
 /**
@@ -232,4 +253,9 @@ async function init() {
   console.log('[db] ready');
 }
 
-module.exports = { query, withTransaction, init };
+/** Tests only: swap in an in-memory pool (e.g. pg-mem). */
+function _setPoolForTests(pool) {
+  _pool = pool;
+}
+
+module.exports = { query, withTransaction, init, migrate, _setPoolForTests };

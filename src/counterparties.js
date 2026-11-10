@@ -1,86 +1,181 @@
+/**
+ * Counterparties (contacts) — people/businesses the user trades with.
+ *
+ * The `counterparty_cache` row is the bot's stable handle (its `id` is what the LLM passes
+ * around as counterparty_id). It links to the ERPNext Customer and/or Supplier record, which
+ * are created lazily: a contact becomes a Customer the first time we invoice them, a Supplier
+ * the first time we get a bill from them.
+ */
 const { query } = require('./db');
+const { ts } = require('./erp-sync/common');
 
-async function findOrCreate(ownerUserId, { name, nickname, phone, email, taxId } = {}) {
-  if (!name && !phone && !nickname) return null;
+const ROLE_COLUMN = { Customer: 'erpnext_customer', Supplier: 'erpnext_supplier' };
 
-  let existing = null;
-
-  // Phone is the most reliable key
-  if (phone) {
-    const r = await query(
-      'SELECT * FROM counterparties WHERE owner_user_id = $1 AND phone = $2',
-      [ownerUserId, phone]
-    );
-    existing = r.rows[0] || null;
-  }
-
-  // Then exact name (case-insensitive)
-  if (!existing && name) {
-    const r = await query(
-      'SELECT * FROM counterparties WHERE owner_user_id = $1 AND LOWER(name) = LOWER($2)',
-      [ownerUserId, name]
-    );
-    existing = r.rows[0] || null;
-  }
-
-  // Then nickname (case-insensitive) — supports "tall mike" lookup
-  if (!existing && nickname) {
-    const r = await query(
-      'SELECT * FROM counterparties WHERE owner_user_id = $1 AND LOWER(nickname) = LOWER($2)',
-      [ownerUserId, nickname]
-    );
-    existing = r.rows[0] || null;
-  }
-
-  // Also try matching nickname against the name field (user might have stored "tall mike" as name first)
-  if (!existing && nickname) {
-    const r = await query(
-      'SELECT * FROM counterparties WHERE owner_user_id = $1 AND LOWER(name) = LOWER($2)',
-      [ownerUserId, nickname]
-    );
-    existing = r.rows[0] || null;
-  }
-
-  const now = new Date().toISOString();
-
-  if (existing) {
-    const updates = {};
-    if (!existing.phone && phone) updates.phone = phone;
-    if (!existing.email && email) updates.email = email;
-    if (!existing.tax_id && taxId) updates.tax_id = taxId;
-    if (!existing.nickname && nickname && nickname.toLowerCase() !== existing.name.toLowerCase()) {
-      updates.nickname = nickname;
-    }
-
-    if (Object.keys(updates).length > 0) {
-      const keys = Object.keys(updates);
-      const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
-      const params = [...keys.map((k) => updates[k]), now, existing.id];
-      await query(
-        `UPDATE counterparties SET ${setClause}, updated_at = $${keys.length + 1} WHERE id = $${keys.length + 2}`,
-        params
-      );
-    }
-    return existing.id;
-  }
-
-  const result = await query(
-    `INSERT INTO counterparties (owner_user_id, name, nickname, phone, email, tax_id, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     RETURNING id`,
-    [
-      ownerUserId,
-      name || nickname || 'Unknown',
-      nickname || null,
-      phone || null,
-      email || null,
-      taxId || null,
-      now,
-      now,
-    ]
-  );
-
-  return result.rows[0].id;
+function rowToContact(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    nickname: row.nickname || null,
+    phone: row.phone || null,
+    email: row.email || null,
+    is_customer: !!row.erpnext_customer,
+    is_supplier: !!row.erpnext_supplier,
+  };
 }
 
-module.exports = { findOrCreate };
+/**
+ * Insert or update a cache row by (owner, name).
+ *   source 'user' (default) — the user just stated these values (create_contact, a draft): a new
+ *     value replaces the stored one, a null keeps it.
+ *   source 'erp' — pulled from ERPNext (syncFromErp): every column keeps what the row already has
+ *     and only fills a blank. Customers/Suppliers are shared across tenants, so an ERPNext record
+ *     must never replace this user's own data or re-link an existing contact.
+ */
+async function upsert(user, { name, nickname = null, phone = null, email = null, customer = null, supplier = null }, { source = 'user' } = {}) {
+  const now = new Date().toISOString();
+  const keep = (col) => (source === 'erp'
+    ? `COALESCE(counterparty_cache.${col}, EXCLUDED.${col})`
+    : `COALESCE(EXCLUDED.${col}, counterparty_cache.${col})`);
+  const r = await query(
+    `INSERT INTO counterparty_cache
+       (owner_user_id, name, nickname, phone, email, erpnext_customer, erpnext_supplier, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+     ON CONFLICT (owner_user_id, name) DO UPDATE SET
+       nickname = ${keep('nickname')},
+       phone = ${keep('phone')},
+       email = ${keep('email')},
+       erpnext_customer = ${keep('erpnext_customer')},
+       erpnext_supplier = ${keep('erpnext_supplier')},
+       updated_at = EXCLUDED.updated_at
+     RETURNING *`,
+    [user.id, name, nickname, phone, email, customer, supplier, now]
+  );
+  return r.rows[0];
+}
+
+async function getById(user, id) {
+  const r = await query('SELECT * FROM counterparty_cache WHERE id = $1 AND owner_user_id = $2', [id, user.id]);
+  return r.rows[0] || null;
+}
+
+async function findByName(user, name) {
+  if (!name) return null;
+  const r = await query(
+    `SELECT * FROM counterparty_cache
+     WHERE owner_user_id = $1 AND (LOWER(name) = LOWER($2) OR LOWER(nickname) = LOWER($2))
+     ORDER BY id LIMIT 1`,
+    [user.id, name]
+  );
+  return r.rows[0] || null;
+}
+
+/**
+ * Pull Customers/Suppliers matching `term` from ERPNext into the cache so records created
+ * outside the bot (ERPNext UI, imports) are findable too.
+ */
+async function syncFromErp(user, erp, term) {
+  const like = `%${term}%`;
+  const [customers, suppliers] = await Promise.all([
+    erp.listCustomers({ filters: [['customer_name', 'like', like]], limit: 20 }),
+    erp.listSuppliers({ filters: [['supplier_name', 'like', like]], limit: 20 }),
+  ]);
+  for (const c of customers.data || []) {
+    // No phone/email from ERPNext: Customers are shared across tenants, and outreach sends to
+    // the cache phone — it must only ever hold what this user entered.
+    await upsert(user, { name: c.customer_name, customer: c.name }, { source: 'erp' });
+  }
+  for (const s of suppliers.data || []) {
+    await upsert(user, { name: s.supplier_name, supplier: s.name }, { source: 'erp' });
+  }
+}
+
+/**
+ * Fuzzy search by name or nickname. Returns contacts with an `exact` flag so the LLM
+ * knows whether it can proceed or must show a picker.
+ */
+async function search(user, erp, term) {
+  const t = String(term || '').trim();
+  if (!t) return [];
+  if (erp) {
+    try {
+      await syncFromErp(user, erp, t);
+    } catch (err) {
+      console.error(`[counterparties] ERPNext sync failed (using cache only): ${err.message}`);
+    }
+  }
+  const r = await query(
+    `SELECT * FROM counterparty_cache
+     WHERE owner_user_id = $1 AND (name ILIKE $2 OR nickname ILIKE $2)
+     ORDER BY name LIMIT 20`,
+    [user.id, `%${t}%`]
+  );
+  const lower = t.toLowerCase();
+  return r.rows.map((row) => ({
+    ...rowToContact(row),
+    exact: row.name.toLowerCase() === lower || (row.nickname || '').toLowerCase() === lower,
+  }));
+}
+
+/** Add a contact without creating anything in ERPNext yet (role isn't known until they trade). */
+async function createContact(user, { name, nickname = null, phone = null, email = null }) {
+  if (!name) return { ok: false, error: 'name is required' };
+  const existing = await findByName(user, name);
+  const row = await upsert(user, { name: existing ? existing.name : name, nickname, phone, email });
+  return { ok: true, existed: !!existing, contact: rowToContact(row) };
+}
+
+/**
+ * The cache row a draft refers to: counterparty_id wins, else name/nickname match. null if new.
+ */
+async function forDraft(user, draft) {
+  if (draft.counterparty_id) return getById(user, draft.counterparty_id);
+  return findByName(user, draft.counterparty_name);
+}
+
+/**
+ * Resolve the draft's counterparty to an ERPNext party of the given role, creating the
+ * Customer/Supplier in ERPNext if this contact hasn't had that role before.
+ *
+ *   role: 'Customer' | 'Supplier'
+ *   returns: ERPNext party name
+ */
+async function resolveParty(user, erp, draft, role) {
+  const column = ROLE_COLUMN[role];
+  let row = await forDraft(user, draft);
+  if (draft.counterparty_id && !row) {
+    throw new Error(`counterparty_id ${draft.counterparty_id} not found`);
+  }
+  const name = row ? row.name : draft.counterparty_name;
+  if (!name) throw new Error(`${role.toLowerCase()} name required`);
+  if (row && row[column]) return row[column];
+
+  const nameField = role === 'Customer' ? 'customer_name' : 'supplier_name';
+  const found = await erp.listResource(role, { filters: [[nameField, '=', name]], fields: ['name'], limit: 1 });
+
+  let erpName;
+  if (found.data?.length > 0) {
+    erpName = found.data[0].name;
+    console.log(`• [counterparties] [${ts()}] ${role} match in ERPNext: ${erpName}`);
+  } else {
+    const data = { [nameField]: name };
+    if (draft.currency) data.default_currency = draft.currency;
+    const phone = draft.counterparty_phone || row?.phone;
+    const email = draft.counterparty_email || row?.email;
+    if (phone) data.mobile_no = phone;
+    if (email) data.email_id = email;
+    const result = role === 'Customer' ? await erp.createCustomer(data) : await erp.createSupplier(data);
+    erpName = result.data.name;
+    console.log(`• [counterparties] [${ts()}] created ${role} in ERPNext: ${erpName}`);
+  }
+
+  await upsert(user, {
+    name,
+    nickname: draft.counterparty_nickname || null,
+    phone: draft.counterparty_phone || null,
+    email: draft.counterparty_email || null,
+    [role === 'Customer' ? 'customer' : 'supplier']: erpName,
+  });
+  return erpName;
+}
+
+module.exports = { search, createContact, getById, findByName, forDraft, resolveParty, rowToContact, upsert, syncFromErp };
