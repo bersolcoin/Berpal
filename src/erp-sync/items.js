@@ -272,5 +272,5 @@ function clearCaches(company) {
 
 module.exports = {
   ITEM_GROUP, normalizeItemCode, displayItemCode, itemCodeProblem, companyAbbr, displayCode, resolveWarehouse, stockSettings,
-  findItem, resolveItem, binFor, minQtyFrom, stockShortfall, clearCaches,
+  findItem, resolveItem, binFor, minQtyFrom, stockShortfall, clearCaches, ensureItemGroup,
 };

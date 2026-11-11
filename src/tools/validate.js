@@ -12,6 +12,7 @@ const { splitLine } = require('../erp-sync/invoice-lines');
 const { stockShortfall, itemCodeProblem, normalizeItemCode } = require('../erp-sync/items');
 const { getOpenInvoices } = require('../erp-query/open-invoices');
 const { whtOverpaymentError } = require('../erp-sync/payment-entry');
+const lots = require('../lots');
 
 const REQUIRED_FIELDS = ['amount', 'currency', 'direction', 'transaction_date'];
 
@@ -108,7 +109,7 @@ async function applyDefaults(user, draft) {
     draft.tax_amount = computeTotals(draft).vat;
   }
   if (!draft.transaction_date && draft.amount != null) {
-    draft.transaction_date = new Date().toISOString().slice(0, 10);
+    draft.transaction_date = lots.today(user); // a gem account's own day; the UTC date for everyone else
   }
   if (!draft.currency && draft.amount != null && user.default_currency) {
     draft.currency = user.default_currency;
@@ -135,10 +136,21 @@ function hasMoreThan2dp(n) {
   return Math.abs(Number(n) * 100 - Math.round(Number(n) * 100)) > 1e-6;
 }
 
-/** Shape problems with draft.items, or null. Pure. */
-function itemsProblem(items) {
+/**
+ * Shape problems with draft.items, or null. Pure.
+ * lotsOn: the user keeps lots. Only then is a `lot` that is not an object an error; for everyone
+ * else a stray `lot` string on a line is ignored, as it always was.
+ */
+function itemsProblem(items, lotsOn = false) {
   if (!Array.isArray(items)) return 'items must be a list of { description, qty, rate, item_code? }';
   for (const [i, it] of items.entries()) {
+    // A gem lot line: { description, qty: 1, rate: <line total>, lot }. lots/draft.js works the
+    // total out from lot.price × lot.pricing_basis, so a missing rate means that is still to come.
+    if (it && it.lot != null && (lotsOn || (typeof it.lot === 'object' && !Array.isArray(it.lot)))) {
+      if (typeof it.lot !== 'object' || Array.isArray(it.lot)) return `items[${i}].lot must be an object ({ code?, carats, price, pricing_basis, … }); a lot code alone is not a lot line`;
+      if (it.item_code) return `items[${i}] has both lot and item_code; a lot line carries only the lot block, so remove item_code`;
+      if (!(Number(it.rate) > 0)) return `items[${i}] is a lot line with no total yet: set lot.price and lot.pricing_basis (per_ct, per_g, per_kg, per_piece or total) as the trader said them`;
+    }
     if (!it || !(Number(it.rate) > 0)) return `items[${i}] needs a positive rate`;
     // ERPNext rounds the rate to 2 dp before multiplying (3 × 33.333 posts 99.99), so a finer
     // rate would make the invoice disagree with the card.
@@ -170,11 +182,16 @@ function taxAndItemsError(user, draft) {
   const tt = draft.transaction_type || 'cash';
   const hasItems = Array.isArray(draft.items) && draft.items.length > 0;
   if (hasMoreThan2dp(draft.amount || 0)) return `amount ${draft.amount} has more than 2 decimals.`;
+  // 5010 puts a cutter's / heater's fee into the cost of the stones. Only the lot gate sets it,
+  // and only for a transform: anywhere else the money would sit in a holding account for good.
+  if (String(draft.category_code) === lots.FEE_CATEGORY_CODE && !(lots.hasStockOp(draft) && draft.stock_op.kind === 'transform')) {
+    return `category_code ${lots.FEE_CATEGORY_CODE} is set by the system for the fee of a cutting / heating operation only. Use an ordinary category here (e.g. 5700 Professional Services, 5000 Cost of Goods Sold).`;
+  }
   if (hasItems) {
     if (!['invoice_issued', 'bill_received', 'cash'].includes(tt) || draft.direction === 'transfer') {
       return `items only apply to invoice_issued, bill_received or a cash sale/expense, not ${tt}. Remove items.`;
     }
-    const p = itemsProblem(draft.items);
+    const p = itemsProblem(draft.items, lots.isGems(user));
     if (p) return p;
     const sum = itemsSum(draft.items);
     if (Math.abs(sum - Number(draft.amount)) > 0.005) {
@@ -183,6 +200,9 @@ function taxAndItemsError(user, draft) {
     // A cash JE has no item rows, so a stock line there would silently skip the inventory move.
     if (tt === 'cash' && draft.items.some((it) => it.item_code)) {
       return 'Stock items (item_code) move inventory only through an invoice/bill. Use transaction_type=invoice_issued (sale) or bill_received (purchase) with payment_terms=net_0, then log the payment.';
+    }
+    if (tt === 'cash' && lots.hasLotLines(draft)) {
+      return 'Lots are bought on a bill and sold on an invoice. Use transaction_type=invoice_issued (sale) or bill_received (purchase) with payment_terms=net_0, then log the payment.';
     }
   }
 
@@ -217,6 +237,11 @@ function taxAndItemsError(user, draft) {
       if (!(amount > 0) || !(split.rate > 0)) {
         return `line ${i + 1} (${l.description || l.item_code}) is too small to post: after VAT it comes to ${amount} for ${l.qty} unit(s), which rounds to a zero rate. Merge it into another line or drop it.`;
       }
+      // A lot line posts by the carat, so its price per carat must not round to zero either.
+      const lot = hasItems && draft.items[i] ? draft.items[i].lot : null;
+      if (lot && typeof lot === 'object' && Number(lot.carats) > 0 && !(round2(amount / Number(lot.carats)) > 0)) {
+        return `line ${i + 1} (${l.description}) is too small to post: ${amount} for ${lot.carats} ct rounds to a zero price per carat. Check the price and the weight with the user.`;
+      }
     }
   }
 
@@ -237,6 +262,12 @@ function taxAndItemsError(user, draft) {
 async function readinessError(user, draft, getErp = null) {
   const tt = draft.transaction_type || 'cash';
   const isTransfer = draft.direction === 'transfer';
+
+  // Lot lines and stock operations are for accounts with lot tracking on (the lot gate says the
+  // same before it gets here; this keeps a direct caller from posting one as a plain document).
+  if (lots.applies(draft) && !lots.isGems(user)) {
+    return 'Lot tracking is not switched on for this account. Record this without lots (remove the lot block from the items).';
+  }
 
   const taxProblem = taxAndItemsError(user, draft);
   if (taxProblem) return taxProblem;

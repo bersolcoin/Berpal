@@ -6,14 +6,14 @@ const {
 const { buildTaxRows, computeTotals } = require('./taxes');
 const { buildInvoiceLines } = require('./invoice-lines');
 
-async function saveSalesInvoice(user, erp, draft) {
+async function saveSalesInvoice(user, erp, draft, opts = {}) {
   const customer = await counterparties.resolveParty(user, erp, draft, 'Customer');
 
   // Resolve income account from category_code (4000 → 4110 - Sales - TTC)
   const incomeAccount = await resolveErpAccount(user, erp, draft.category_code, companyCurrency(user));
   const dueDate = computeDueDate(draft);
   const totals = computeTotals(draft, `${customer} invoice`);
-  const lines = await buildInvoiceLines(user, erp, draft, 'sales', { lineAccount: incomeAccount, totals });
+  const lines = await buildInvoiceLines(user, erp, draft, 'sales', { lineAccount: incomeAccount, totals, lots: opts.lots });
   const taxes = await buildTaxRows(user, erp, draft, 'sales', totals);
 
   const payload = {
@@ -23,11 +23,14 @@ async function saveSalesInvoice(user, erp, draft) {
     due_date: dueDate,
     currency: draft.currency,
     ...(draft.invoice_number ? { po_no: draft.invoice_number } : {}),
-    ...(draft.delivery_date ? { remarks: `Delivery: ${draft.delivery_date}` } : {}),
+    ...(draft.delivery_date || opts.remark
+      ? { remarks: [opts.remark, draft.delivery_date ? `Delivery: ${draft.delivery_date}` : null].filter(Boolean).join(' | ') }
+      : {}),
     items: lines.rows,
     // Stock lines deliver from the warehouse on submit (no separate Delivery Note) so the Bin
     // and COGS move with the invoice.
-    ...(lines.updateStock ? { update_stock: 1, set_warehouse: lines.warehouse } : {}),
+    ...(lines.updateStock ? { update_stock: 1 } : {}),
+    ...(lines.warehouse ? { set_warehouse: lines.warehouse } : {}),
     ...(taxes.length ? { taxes } : {}),
     // Always: VAT/WHT produce satang amounts, and ERPNext's default rounded total would round the
     // outstanding to whole baht (diff to Round Off) so it no longer matches the card.

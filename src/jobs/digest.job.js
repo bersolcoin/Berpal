@@ -1,5 +1,6 @@
 /**
- * Morning digest: cash per wallet, what's overdue / due this week, yesterday's in & out.
+ * Morning digest: cash per wallet, what's overdue / due this week, yesterday's in & out, and for
+ * a gem trader up to three lines about the stones (src/lots/digest.js).
  * Plain text (WhatsApp renders markdown literally in this bot's style). Empty sections are
  * dropped, and a digest with nothing in it isn't sent at all — no daily "all zero" spam.
  *
@@ -17,6 +18,7 @@ const { getOpenInvoices } = require('../erp-query/open-invoices');
 const { getTransactionSummary } = require('../erp-query/transaction-summary');
 const { companyCurrency, round2 } = require('../erp-sync/common');
 const review = require('../trust/review');
+const lotsDigest = require('../lots/digest');
 const { localClock, addDays } = require('./index');
 
 const MAX_WALLETS = 4;
@@ -53,6 +55,21 @@ async function reviewLine(user, now) {
   } catch (err) {
     console.error(`[digest] review summary failed (user ${user.id}):`, err.message);
     return null;
+  }
+}
+
+/**
+ * A gem trader's stock lines (stones out too long, a stock operation that is not finished,
+ * differences between the lots and the books): [] for everyone else and when there is nothing to
+ * act on. Unlike the review line these are news, so they make a digest on their own. A failure
+ * here is just no lines.
+ */
+async function gemLines(user, date) {
+  try {
+    return await lotsDigest.lines(user, { today: date });
+  } catch (err) {
+    console.error(`[digest] gem lines failed (user ${user.id}):`, err.message);
+    return [];
   }
 }
 
@@ -137,6 +154,7 @@ async function buildDigest(user, erp, { now = new Date(), clock = null } = {}) {
   if (nonZero(inc) || nonZero(exp)) {
     sections.push([`Yesterday: in ${money(base, inc)} · out ${money(base, exp)}`]);
   }
+  sections.push(await gemLines(user, date));
 
   const body = sections.filter((s) => s.length);
   if (body.length === 0) return null;

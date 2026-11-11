@@ -69,7 +69,7 @@ async function buildRows(erp, lines, { currency, rate, baseCurrency }) {
   return { rows, multiCurrency };
 }
 
-async function postJournal(user, erp, draft, { lines, fromAccount, toAccount, remark }) {
+async function postJournal(user, erp, draft, { lines, fromAccount, toAccount, remark, opRemark = null }) {
   const baseCurrency = companyCurrency(user);
   const { rows, multiCurrency } = await buildRows(erp, lines, {
     currency: draft.currency,
@@ -80,7 +80,8 @@ async function postJournal(user, erp, draft, { lines, fromAccount, toAccount, re
     voucher_type: 'Journal Entry',
     posting_date: draft.transaction_date,
     title: buildJournalTitle({ currency: draft.currency, fromAccount, toAccount }),
-    user_remark: draft.description || remark,
+    // opRemark: a gem lot operation's step marker (lots.remarkFor), searched for on a retry.
+    user_remark: opRemark ? `${opRemark} | ${draft.description || remark}` : draft.description || remark,
     ...(draft.invoice_number ? { cheque_no: draft.invoice_number, cheque_date: draft.transaction_date } : {}),
     multi_currency: multiCurrency ? 1 : 0,
     accounts: rows,
@@ -90,7 +91,7 @@ async function postJournal(user, erp, draft, { lines, fromAccount, toAccount, re
 }
 
 /** Cash income / expense against a P&L (or equity, for opening balances) category. */
-async function saveCash(user, erp, draft) {
+async function saveCash(user, erp, draft, opts = {}) {
   const walletAccount = await wallets.accountForDraft(user, erp, draft);
   const categoryAccount = await resolveErpAccount(user, erp, draft.category_code, companyCurrency(user));
   if (!categoryAccount) {
@@ -121,13 +122,14 @@ async function saveCash(user, erp, draft) {
     fromAccount: expense ? walletAccount : categoryAccount,
     toAccount: expense ? categoryAccount : walletAccount,
     remark: 'Bot entry',
+    opRemark: opts.remark,
   });
   console.log(`• [erp-sync] [${ts()}] saved JE ${name} (${draft.direction} ${t.gross} ${draft.currency}${t.vat ? `, VAT ${t.vat}` : ''}${t.wht ? `, WHT ${t.wht}` : ''})`);
   return { erpnext_name: name, doctype: 'Journal Entry' };
 }
 
 /** Wallet → wallet. Not a P&L event. */
-async function saveTransfer(user, erp, draft) {
+async function saveTransfer(user, erp, draft, opts = {}) {
   if (!draft.payment_account_id || !draft.transfer_destination_account_id) {
     throw new Error('transfer needs both payment_account_id (source) and transfer_destination_account_id');
   }
@@ -142,6 +144,7 @@ async function saveTransfer(user, erp, draft) {
     fromAccount: source,
     toAccount: dest,
     remark: 'Transfer',
+    opRemark: opts.remark,
   });
   console.log(`• [erp-sync] [${ts()}] saved transfer JE ${name} (${draft.amount} ${draft.currency})`);
   return { erpnext_name: name, doctype: 'Journal Entry' };
@@ -152,7 +155,7 @@ async function saveTransfer(user, erp, draft) {
  * advance_received: Dr wallet / Cr Payable (party = Supplier)       — you now owe them
  * Settled later with a Payment Entry against the same party (see payment-entry.js).
  */
-async function saveAdvance(user, erp, draft) {
+async function saveAdvance(user, erp, draft, opts = {}) {
   const given = draft.transaction_type === 'advance_given';
   const role = given ? 'Customer' : 'Supplier';
   const party = await counterparties.resolveParty(user, erp, draft, role);
@@ -169,6 +172,7 @@ async function saveAdvance(user, erp, draft) {
     fromAccount: given ? walletAccount : party,
     toAccount: given ? party : walletAccount,
     remark: given ? `Advance to ${party}` : `Advance from ${party}`,
+    opRemark: opts.remark,
   });
   console.log(`• [erp-sync] [${ts()}] saved advance JE ${name} (${draft.transaction_type} ${draft.amount} ${draft.currency} ${party})`);
   return { erpnext_name: name, doctype: 'Journal Entry' };

@@ -4,6 +4,7 @@ const { computeTotals, vatTreatment } = require('../erp-sync/taxes');
 const { getErp } = require('./context');
 const { buildCard } = require('./card');
 const trust = require('../trust');
+const lots = require('../lots');
 
 const definition = {
   name: 'request_confirmation',
@@ -48,6 +49,8 @@ async function applyTrust(ctx) {
 }
 
 async function execute(args, ctx) {
+  // Lots bought / sold or a stock operation: the lot gate builds and signs that card.
+  if (lots.applies(ctx.draft)) return require('../lots/gate').requestConfirmation(ctx);
   await applyDefaults(ctx.user, ctx.draft);
   const missing = validateDraft(ctx.draft);
   if (missing.length) {
@@ -100,4 +103,4 @@ async function execute(args, ctx) {
   };
 }
 
-module.exports = { definition, execute, cardSignature };
+module.exports = { definition, execute, cardSignature, applyTrust };

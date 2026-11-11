@@ -3,6 +3,10 @@
  *   markPosted     → after save_transaction: store the fingerprint (review_status 'pending') and add
  *                    a Comment on the ERPNext document — stock v14 supports Comments on any doctype,
  *                    so no custom field is needed.
+ *   markStockPosted → the same for a Stock Entry of a gem lot operation (src/lots), with a Comment
+ *                    that says in plain words what the operation did, or that it was taken back.
+ *   markCancelled  → a money document (a fee bill, a fee entry) that an undo of a lot operation
+ *                    cancelled: out of the queue and out of the duplicate guard, with a Comment.
  *   listPending    → the local queue of documents still awaiting review (Postgres only).
  *   pendingSummary → count / oldest / stale, for the morning digest.
  *   markReviewed   → the owner (from chat) closes queue rows; a second Comment records who and when.
@@ -10,7 +14,8 @@
  * posted, and a review is a local status first.
  */
 const { query } = require('../db');
-const { ts } = require('../erp-sync/common');
+const { ts, round2, companyCurrency } = require('../erp-sync/common');
+const lots = require('../lots');
 const duplicates = require('./duplicates');
 const { fingerprintFields } = require('./index');
 
@@ -75,6 +80,224 @@ async function markPosted(erp, { user, saved, draft, mediaId = null }) {
     } catch (err) {
       console.error(`[trust] review comment failed (${saved.doctype} ${saved.erpnext_name}):`, err.message);
     }
+  }
+  return { fingerprint, comment };
+}
+
+const UNDO_NOTE = 'Berpal: taken back from WhatsApp (undo)';
+const STOCK_DIRECTION = 'stock'; // trust_fingerprints.direction of a Stock Entry: never 'income' / 'expense'
+
+const ct = (n) => Number(lots.round3(n)).toLocaleString('en-US', { maximumFractionDigits: 3 });
+const amt = (n) => Number(round2(n)).toLocaleString('en-US', { maximumFractionDigits: 2 });
+const PLACE_WORDS = { work: 'out for work', memo: 'out on memo' };
+const sum = (list) => round2((list || []).reduce((a, x) => a + (Number(x.cost) || 0), 0));
+
+/** What the trader would call the operation ("cutting", "split"). Required late: lots/undo.js pulls in the card helpers. */
+function opWords(o) {
+  try {
+    return require('../lots/undo').kindWords(o); // eslint-disable-line global-require
+  } catch (err) {
+    return String((o && (o.job || o.kind)) || 'stock operation');
+  }
+}
+
+/** What a lot operation did, as the lines of the Comment on its stock entry. */
+function stockCommentLines(op, { reference, currency, warnings }) {
+  const lines = [REVIEW_NOTE, `Stock operation: ${opWords(op)}, ${op.date || ''} (Berpal ref ${reference})`];
+  const inputs = op.inputs || [];
+  const outputs = op.outputs || [];
+  if (inputs.length) {
+    lines.push('Lots in:', ...inputs.map((i) => {
+      const part = i.whole ? `${ct(i.carats)} ct (the whole lot)` : `${ct(i.carats)} ct${i.before && i.before.carats != null ? ` of ${ct(i.before.carats)} ct` : ''}`;
+      return `- ${i.code}: ${part}${i.pieces != null ? `, ${i.pieces} pcs` : ''}, cost ${amt(i.cost)} ${currency}`;
+    }));
+  }
+  if (outputs.length) {
+    lines.push('Lots out:', ...outputs.map((o) => {
+      const where = PLACE_WORDS[o.to] ? `, ${PLACE_WORDS[o.to]}` : '';
+      return `- ${o.code}: ${ct(o.carats)} ct${o.pieces != null ? `, ${o.pieces} pcs` : ''}, cost ${amt(o.cost)} ${currency}${o.new ? ' (new lot)' : ''}${where}`;
+    }));
+  }
+  if (op.fee && Number(op.fee.amount) > 0) {
+    const all = Math.abs(Number(op.fee.capitalised) - Number(op.fee.amount)) < 0.005;
+    lines.push(all
+      ? `Fee: ${amt(op.fee.amount)} ${currency}, included in the cost of the stones`
+      : `Fee: ${amt(op.fee.amount)} ${currency}, of which ${amt(op.fee.capitalised || 0)} ${currency} went into the cost of the stones`);
+  }
+  const loss = Number(op.loss_carats) || 0;
+  if (op.yield_pct != null) lines.push(`Yield: ${op.yield_pct}%${loss > 0 ? ` (${ct(loss)} ct lost)` : ''}`);
+  else if (loss > 0) lines.push(`Weight lost: ${ct(loss)} ct`);
+  if (op.holder) {
+    lines.push(`With: ${op.holder}${op.due_date ? `, due ${op.due_date}` : ''}${op.memo_price_per_ct != null ? `, memo price ${amt(op.memo_price_per_ct)} per ct` : ''}`);
+  }
+  if (op.reason) lines.push(`Reason: ${op.reason}`);
+  if (op.note) lines.push(`Note: ${op.note}`);
+  if (warnings.length) lines.push('Warnings shown to the user:', ...warnings.map((w) => `- ${w}`));
+  return lines;
+}
+
+/** The Comment on a stock entry whose operation was taken back (`op` is the undo plan of lots/undo.js). */
+function undoCommentLines(op, { reference, currency, isoNow }) {
+  const t = op.target || {};
+  const lines = [
+    UNDO_NOTE,
+    `Taken back on ${String(isoNow).slice(0, 10)}: ${opWords(t)}${t.date ? ` of ${t.date}` : ''} (Berpal ref ${reference}). This stock entry is cancelled.`,
+  ];
+  const after = op.lots || [];
+  const removed = op.removed || [];
+  if (after.length || removed.length) {
+    lines.push('The lots afterwards:', ...after.map((l) => `- ${l.code}: ${ct(l.carats)} ct, cost ${amt(l.cost)} ${currency}`));
+    if (removed.length) lines.push(`- ${removed.join(', ')}: removed`);
+  }
+  return lines;
+}
+
+async function fingerprintOf(userId, doc) {
+  const r = await query(
+    'SELECT * FROM trust_fingerprints WHERE user_id = $1 AND doctype = $2 AND erpnext_name = $3 ORDER BY id DESC LIMIT 1',
+    [userId, doc.doctype, doc.erpnext_name]
+  );
+  return r.rows[0] || null;
+}
+
+/**
+ * A stock entry of a gem lot operation (src/lots/gate.js calls this once per Stock Entry, after
+ * the operation is saved or taken back): into the accountant's queue like a money document,
+ * since a sort by value or a cutting fee re-prices stock. Never throws.
+ *   saved      → a 'pending' fingerprint (direction 'stock', the cost of the stones moved, no
+ *                counterparty and no base amount: it stays out of the duplicate and anomaly
+ *                checks) and a Comment saying what the operation did.
+ *   taken back → a Comment on the (now cancelled) stock entry; its queue row, if still pending,
+ *                stays in the queue with a line saying so. A cancelled entry is still the
+ *                accountant's to see.
+ * @param {object} erp  per-user ErpNextClient (null → local row only)
+ * @param {{ user, doc: { doctype, erpnext_name }, op: object, undoing: boolean, reference: string, warnings: string[] }} args
+ *   op is the ResolvedOp (src/lots/index.js), or the undo plan when undoing.
+ * @returns {Promise<{ fingerprint: object|null, comment: object|null }>}
+ */
+async function markStockPosted(erp, { user, doc, op, undoing = false, reference, warnings = [] }) {
+  // A money document that an undo cancelled is not a stock entry: it leaves the queue instead.
+  if (undoing && doc && doc.doctype !== 'Stock Entry') return markCancelled(erp, { user, doc, op, reference });
+  let fingerprint = null;
+  let comment = null;
+  let lines = null;
+  try {
+    const plan = op || {};
+    const currency = companyCurrency(user);
+    const shown = [...new Set([...(Array.isArray(plan.warnings) ? plan.warnings : []), ...(Array.isArray(warnings) ? warnings : [])].filter(Boolean).map(String))];
+    const isoNow = new Date().toISOString();
+    lines = undoing
+      ? undoCommentLines(plan, { reference, currency, isoNow })
+      : stockCommentLines(plan, { reference, currency, warnings: shown });
+    try {
+      const had = await fingerprintOf(user.id, doc);
+      if (undoing) {
+        fingerprint = had;
+        if (had && had.review_status === 'pending') {
+          const note = `Taken back on ${isoNow.slice(0, 10)} (undo): the stock entry is cancelled`;
+          const list = had.warnings ? JSON.parse(had.warnings) : [];
+          if (!list.some((w) => /^Taken back on /.test(w))) {
+            const r = await query('UPDATE trust_fingerprints SET warnings = $2 WHERE id = $1 RETURNING *', [had.id, JSON.stringify([...list, note])]);
+            fingerprint = r.rows[0] || had;
+          } else {
+            lines = null; // said once: a retry that finishes the undo does not comment again
+          }
+        }
+      } else {
+        // A second call for the same entry (a retry that finishes an operation) adds no second row.
+        fingerprint = had || await duplicates.recordFingerprint({
+          userId: user.id, doctype: doc.doctype, erpnextName: doc.erpnext_name, direction: STOCK_DIRECTION,
+          amount: (plan.outputs || []).length ? sum(plan.outputs) : sum(plan.inputs), currency, baseAmount: null,
+          transactionDate: plan.date || null, counterpartyName: null, receiptHash: null, warnings: shown,
+        });
+        if (had) lines = null; // commented on the first time
+      }
+    } catch (err) {
+      console.error(`[trust] fingerprint failed (${doc.doctype} ${doc.erpnext_name}):`, err.message);
+    }
+
+    if (erp && lines) {
+      try {
+        const r = await erp.createResource('Comment', {
+          comment_type: 'Comment',
+          reference_doctype: doc.doctype,
+          reference_name: doc.erpnext_name,
+          content: htmlLines(lines),
+        });
+        comment = (r && r.data) || r || null;
+        console.log(`• [trust] [${ts()}] ${undoing ? 'undo' : 'review'} comment on ${doc.doctype} ${doc.erpnext_name}`);
+      } catch (err) {
+        console.error(`[trust] ${undoing ? 'undo' : 'review'} comment failed (${doc.doctype} ${doc.erpnext_name}):`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error(`[trust] stock review mark failed (${doc && doc.doctype} ${doc && doc.erpnext_name}):`, err.message);
+  }
+  return { fingerprint, comment };
+}
+
+const CANCELLED_STATUS = 'cancelled'; // trust_fingerprints.review_status of a document an undo cancelled
+
+/**
+ * A money document of a lot operation that an undo cancelled (src/lots/gate.js calls this for each
+ * one in undo.run's `cancelled` list). It is no longer in the books, so there is nothing to review
+ * and nothing to be a duplicate of:
+ *   its queue row   → review_status 'cancelled' (listPending and the digest count only 'pending'),
+ *                     with the receipt hash, the counterparty and the base amount cleared so the
+ *                     duplicate guard and the anomaly medians no longer see it, and a line in its
+ *                     warnings saying when it was taken back;
+ *   ERPNext         → a Comment on the cancelled document.
+ * Idempotent (a retry that finishes the undo calls it again for the same document) and never throws.
+ * @param {object} erp  per-user ErpNextClient (null → local row only)
+ * @param {{ user, doc: { doctype, erpnext_name }, op?: object, reference?: string }} args
+ *   op is the undo plan of lots/undo.js (named in the Comment when given)
+ * @returns {Promise<{ fingerprint: object|null, comment: object|null }>}
+ */
+async function markCancelled(erp, { user, doc, op = null, reference = null }) {
+  let fingerprint = null;
+  let comment = null;
+  try {
+    const isoNow = new Date().toISOString();
+    const t = (op && op.target) || {};
+    let first = true;
+    try {
+      const had = user && doc ? await fingerprintOf(user.id, doc) : null;
+      if (had && had.review_status === CANCELLED_STATUS) {
+        fingerprint = had;
+        first = false;
+      } else if (had) {
+        const list = had.warnings ? JSON.parse(had.warnings) : [];
+        const note = `Taken back on ${isoNow.slice(0, 10)} (undo): the document is cancelled`;
+        const r = await query(
+          `UPDATE trust_fingerprints SET review_status = $2, receipt_hash = NULL, counterparty_name = NULL, base_amount = NULL, warnings = $3
+           WHERE id = $1 RETURNING *`,
+          [had.id, CANCELLED_STATUS, JSON.stringify([...list, note])]
+        );
+        fingerprint = r.rows[0] || had;
+      }
+    } catch (err) {
+      console.error(`[trust] cancelled mark failed (${doc.doctype} ${doc.erpnext_name}):`, err.message);
+    }
+    if (erp && first) {
+      try {
+        const r = await erp.createResource('Comment', {
+          comment_type: 'Comment',
+          reference_doctype: doc.doctype,
+          reference_name: doc.erpnext_name,
+          content: htmlLines([
+            UNDO_NOTE,
+            `Taken back on ${isoNow.slice(0, 10)}${reference ? ` (Berpal ref ${reference})` : ''}: this ${doc.doctype} was cancelled because the stock operation it belonged to`
+              + `${t.kind ? ` (${opWords(t)}${t.date ? ` of ${t.date}` : ''})` : ''} was undone.`,
+          ]),
+        });
+        comment = (r && r.data) || r || null;
+        console.log(`• [trust] [${ts()}] undo comment on ${doc.doctype} ${doc.erpnext_name}`);
+      } catch (err) {
+        console.error(`[trust] undo comment failed (${doc.doctype} ${doc.erpnext_name}):`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error(`[trust] cancelled mark failed (${doc && doc.doctype} ${doc && doc.erpnext_name}):`, err.message);
   }
   return { fingerprint, comment };
 }
@@ -193,7 +416,7 @@ async function markReviewed(erp, { user, names = null, all = false, expectedCoun
     }
     for (const n of wanted) {
       const row = byName.get(n);
-      if (!row) notFound.push(n);
+      if (!row || row.review_status === CANCELLED_STATUS) notFound.push(n); // a cancelled document is not in the books to review
       else if (row.review_status !== 'pending') alreadyReviewed.push(row.erpnext_name);
       else toMark.push(row);
     }
@@ -239,6 +462,6 @@ async function markReviewed(erp, { user, names = null, all = false, expectedCoun
 }
 
 module.exports = {
-  markPosted, listPending, pendingSummary, markReviewed, commentText, reviewedCommentText,
-  REVIEW_NOTE, STALE_REVIEW_DAYS, MAX_NAMES, MAX_NOTE_CHARS,
+  markPosted, markStockPosted, markCancelled, listPending, pendingSummary, markReviewed, commentText, reviewedCommentText,
+  REVIEW_NOTE, UNDO_NOTE, STOCK_DIRECTION, CANCELLED_STATUS, STALE_REVIEW_DAYS, MAX_NAMES, MAX_NOTE_CHARS,
 };

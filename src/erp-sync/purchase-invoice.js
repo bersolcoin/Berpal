@@ -6,7 +6,7 @@ const {
 const { buildTaxRows, computeTotals } = require('./taxes');
 const { buildInvoiceLines } = require('./invoice-lines');
 
-async function savePurchaseInvoice(user, erp, draft) {
+async function savePurchaseInvoice(user, erp, draft, opts = {}) {
   const supplier = await counterparties.resolveParty(user, erp, draft, 'Supplier');
 
   // Expense side from category_code (5000 COGS for inventory, 5xxx for operating bills).
@@ -14,7 +14,7 @@ async function savePurchaseInvoice(user, erp, draft) {
   const expenseAccount = await resolveErpAccount(user, erp, draft.category_code, companyCurrency(user));
   const dueDate = computeDueDate(draft);
   const totals = computeTotals(draft, `${supplier} bill`);
-  const lines = await buildInvoiceLines(user, erp, draft, 'purchase', { lineAccount: expenseAccount, totals });
+  const lines = await buildInvoiceLines(user, erp, draft, 'purchase', { lineAccount: expenseAccount, totals, lots: opts.lots });
   // VAT (Input VAT) and WHT (deducted to WHT Payable). The WHT row lowers grand_total, so the
   // bill's outstanding — what the supplier is actually paid — is gross − WHT.
   const taxes = await buildTaxRows(user, erp, draft, 'purchase', totals);
@@ -28,8 +28,9 @@ async function savePurchaseInvoice(user, erp, draft) {
     currency: draft.currency,
     // Stock lines receive into the warehouse on submit (no separate Purchase Receipt).
     update_stock: lines.updateStock,
-    ...(lines.updateStock ? { set_warehouse: lines.warehouse } : {}),
+    ...(lines.warehouse ? { set_warehouse: lines.warehouse } : {}),
     ...(draft.invoice_number ? { bill_no: draft.invoice_number } : {}),
+    ...(opts.remark ? { remarks: opts.remark } : {}),
     items: lines.rows,
     ...(taxes.length ? { taxes } : {}),
     // Always: VAT/WHT produce satang amounts, and ERPNext's default rounded total would round the

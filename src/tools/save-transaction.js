@@ -5,6 +5,7 @@ const { cardSignature } = require('./request-confirmation');
 const { attachToDoc } = require('../media/attach');
 const review = require('../trust/review');
 const { computeTotals } = require('../erp-sync/taxes');
+const lots = require('../lots');
 
 /**
  * What a document saved earlier this turn is still owed, from the confirmed draft (no ERPNext
@@ -39,6 +40,8 @@ const definition = {
 };
 
 async function execute(args, ctx) {
+  // Lots bought / sold or a stock operation: the lot gate re-checks its own card and saves.
+  if (lots.applies(ctx.draft)) return require('../lots/gate').saveTransaction(ctx);
   // A card must have gone out in an EARLIER turn: when a turn that sent a card ends, handle()
   // stores the signature of THAT card in confirmation_pending. request_confirmation never touches
   // it, so re-signing in this turn can't stand in for the user's tap. The only card-less save is
@@ -111,4 +114,4 @@ async function execute(args, ctx) {
   }
 }
 
-module.exports = { definition, execute };
+module.exports = { definition, execute, savedDoc };
