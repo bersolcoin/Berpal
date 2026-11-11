@@ -38,7 +38,7 @@ async function loadParent(erp, name, doctype) {
   throw new Error(`could not find ${name} in ERPNext`);
 }
 
-async function savePayment(user, erp, draft) {
+async function savePayment(user, erp, draft, opts = {}) {
   const receiving = draft.direction === 'income';
   const baseCurrency = companyCurrency(user);
 
@@ -118,6 +118,9 @@ async function savePayment(user, erp, draft) {
     reference_no: draft.invoice_number || `WA-${draft.transaction_date}`,
     reference_date: draft.transaction_date,
     remarks: draft.description || `${receiving ? 'Received from' : 'Paid to'} ${party}`,
+    // A gem lot operation's step marker has to survive: without custom_remarks ERPNext writes
+    // its own text over `remarks` on a Payment Entry.
+    ...(opts.remark ? { remarks: `${opts.remark} | ${draft.description || (receiving ? 'Received from' : 'Paid to') + ' ' + party}`, custom_remarks: 1 } : {}),
     references: reference ? [reference] : [],
     docstatus: 1,
   };

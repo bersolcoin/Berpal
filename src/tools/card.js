@@ -17,7 +17,7 @@ const CATEGORY_NAMES = {
   1000: 'Cash', 1100: 'Bank', 1200: 'Accounts Receivable', 1400: 'Other Receivables',
   2000: 'Accounts Payable', 2100: 'Credit Card', 2200: 'Other Payables', 3200: 'Opening Balance Equity',
   4000: 'Sales Revenue', 4100: 'Service Revenue', 4900: 'Other Income',
-  5000: 'Cost of Goods Sold', 5100: 'Meals & Entertainment', 5200: 'Travel', 5210: 'Vehicle Expenses',
+  5000: 'Cost of Goods Sold', 5010: 'Cutting & treatment fees (added to stone cost)', 5100: 'Meals & Entertainment', 5200: 'Travel', 5210: 'Vehicle Expenses',
   5300: 'Office Supplies', 5350: 'Insurance', 5400: 'Rent', 5500: 'Utilities', 5550: 'Telephone & Internet',
   5600: 'Software & Subscriptions', 5700: 'Professional Services', 5800: 'Marketing & Advertising',
   5900: 'Other Expenses', 5950: 'Bank Charges & Fees',
@@ -82,8 +82,10 @@ async function parentDoc(getErp, draft) {
  * @returns {Promise<{ type_label, account_line, amount_line, due_line, settles_line, net_vat_lines, lines }>}
  *   lines: the whole card in order (Date, Amount, items, Net/VAT, WHT, Type, Account,
  *   Counterparty, Due, Settles, Note, then any ⚠ trust warnings); empty fields are left out.
+ *   lineFor(item, index): a caller that words some item lines itself (lots/card.js: one line per
+ *   gem lot) returns the line, or several, for those; null leaves the line as it is.
  */
-async function buildCard(user, draft, getErp = null) {
+async function buildCard(user, draft, getErp = null, { lineFor = null } = {}) {
   const tt = draft.transaction_type || 'cash';
   const cur = draft.currency;
   const t = computeTotals(draft);
@@ -104,8 +106,10 @@ async function buildCard(user, draft, getErp = null) {
     ? `Amount: ${fmt(t.gross * rate)} ${rc} (${fmt(t.gross)} ${cur} @ ${fmtRate(rate)})`
     : `Amount: ${fmt(t.gross)} ${cur}${cur && cur !== rc ? ' (no exchange rate yet)' : ''}`;
 
-  const itemLines = (Array.isArray(draft.items) && draft.items.length > 1) || (draft.items || []).some((it) => it && it.item_code)
-    ? draft.items.map((it) => {
+  const own = (draft.items || []).map((it, i) => (lineFor && it ? lineFor(it, i) : null));
+  const itemLines = (Array.isArray(draft.items) && draft.items.length > 1) || (draft.items || []).some((it, i) => it && (it.item_code || own[i]))
+    ? draft.items.flatMap((it, i) => {
+      if (own[i]) return own[i];
       const qty = it.qty == null ? 1 : Number(it.qty);
       const what = [it.item_code, it.description].filter(Boolean).join(' ');
       return `- ${qty === 1 ? '' : `${qty} × `}${what} @ ${fmt(it.rate)}`;
@@ -129,7 +133,8 @@ async function buildCard(user, draft, getErp = null) {
   } else if (tt === 'invoice_issued') {
     account_line = `${category} → Receivable from ${party}`;
   } else if (tt === 'bill_received') {
-    const stock = (draft.items || []).some((it) => it && it.item_code);
+    // A coded stone or a gem lot (items[].lot) goes into stock, whatever the category says.
+    const stock = (draft.items || []).some((it) => it && (it.item_code || (it.lot && typeof it.lot === 'object')));
     account_line = `${stock ? 'Inventory' : category} → Payable to ${party}`;
   } else if (tt === 'payment') {
     account_line = draft.direction === 'income' ? `Receivable from ${party} → ${wallet}` : `${wallet} → Payable to ${party}`;
@@ -181,4 +186,4 @@ async function buildCard(user, draft, getErp = null) {
   return { type_label: typeLabel(draft), account_line: `Account: ${account_line}`, amount_line, due_line, settles_line, net_vat_lines, warning_lines, lines };
 }
 
-module.exports = { buildCard, categoryName, fmt, CATEGORY_NAMES, WARNING_HEADER };
+module.exports = { buildCard, categoryName, fmt, isoToCard, CATEGORY_NAMES, WARNING_HEADER };

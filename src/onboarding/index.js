@@ -392,6 +392,13 @@ async function closeAccount(user) {
     // The contact cache holds customers' phones and emails: the "customer contact log" the user is
     // told is removed. ERPNext keeps its own Customer/Supplier records with the ledger.
     await c.query('DELETE FROM counterparty_cache WHERE owner_user_id = $1', [user.id]);
+    // Gem lots name suppliers, cutters and memo holders, and their stored plans carry the drafts.
+    // The carats and their value stay in ERPNext with the ledger. Children first: no cascade relied on.
+    await c.query('DELETE FROM lot_certificates WHERE lot_id IN (SELECT id FROM lots WHERE user_id = $1)', [user.id]);
+    await c.query('DELETE FROM lot_op_lines WHERE op_id IN (SELECT id FROM lot_ops WHERE user_id = $1)', [user.id]);
+    for (const table of ['lot_custody', 'lot_mismatches', 'lot_ops', 'lots']) {
+      await c.query(`DELETE FROM ${table} WHERE user_id = $1`, [user.id]);
+    }
     // users.phone stays: it is how the bot recognises this number afterwards and answers
     // "account closed" instead of starting a fresh signup.
     await c.query(

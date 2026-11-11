@@ -177,6 +177,11 @@ class ErpNextClient {
     return this._fetch('DELETE', `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}`);
   }
 
+  /** Cancel a submitted document (docstatus 1 → 2). ERPNext reverses its ledger entries itself. */
+  cancelDoc(doctype, name) {
+    return this._fetch('POST', '/api/method/frappe.client.cancel', { doctype, name });
+  }
+
   /** Call any whitelisted Frappe method (e.g. for balance, reports). */
   callMethod(methodPath, args = {}) {
     // Frappe convention: /api/method/<dotted.path>?arg=val&...

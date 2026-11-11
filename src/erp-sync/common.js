@@ -14,6 +14,7 @@ const ERP_CODE_MAP = {
   '4900': '4210', // Other Income → Interest Income (closest)
   // COGS
   '5000': '5111', // Cost of Goods Sold
+  '5010': '5118', // Cutting & treatment fees → Expenses Included In Valuation (gem lots: src/lots/)
   // Expenses
   '5100': '5204', // Meals & Entertainment → Entertainment Expenses
   '5200': '5216', // Travel

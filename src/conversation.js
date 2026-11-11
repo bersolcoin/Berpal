@@ -1,6 +1,6 @@
 const OpenAI = require('openai');
 const { query } = require('./db');
-const { TOOLS, executeTool } = require('./tools');
+const { toolsFor, executeTool } = require('./tools');
 const { ts } = require('./erp-sync/common');
 const promptSections = require('./prompt');
 // Server-only draft keys (see tools/validate.js): stripped from update_draft and hidden from the prompt.
@@ -8,6 +8,7 @@ const { PROTECTED_DRAFT_KEYS, stripProtected } = require('./tools/validate');
 const mediaIntake = require('./media');
 const wallets = require('./wallets');
 const { WARNING_HEADER } = require('./tools/card');
+const lots = require('./lots');
 
 // 30s/1 retry: a hung completion must not stall a WhatsApp turn (the SDK default is 10 min × 3).
 let openai = process.env.OPENAI_API_KEY
@@ -785,7 +786,7 @@ async function handle(user, userMessage, { voiceTranscript = null } = {}) {
   const armedPreviewAtStart = draft.outreach_preview && draft.outreach_preview.armed
     ? previewKey(draft.outreach_preview)
     : null;
-  const today = new Date().toISOString().slice(0, 10);
+  const today = lots.today(user);
 
   const systemPrompt = await buildSystemPrompt({ user, draft, today });
   const llmMessages = [
@@ -812,7 +813,7 @@ async function handle(user, userMessage, { voiceTranscript = null } = {}) {
       const response = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: llmMessages,
-        tools: TOOLS,
+        tools: toolsFor(user),
         tool_choice: 'auto',
         temperature: 0.2,
         max_tokens: 600,

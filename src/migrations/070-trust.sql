@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS trust_fingerprints (
   transaction_date TEXT,                       -- YYYY-MM-DD
   counterparty_name TEXT,                      -- lower-cased, trimmed, single-spaced
   receipt_hash TEXT,                           -- sha256 hex of the receipt bytes, null if none
-  review_status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'reviewed'
+  review_status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'reviewed' | 'cancelled' (taken back by an undo: trust/review.js)
   warnings TEXT,                               -- JSON list of the card's warning lines
   created_at TEXT NOT NULL                     -- ISO timestamp
 );

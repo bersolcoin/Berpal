@@ -2,7 +2,17 @@
  * Prompt section: Thai VAT / withholding tax, multi-line invoices, stock ids (SKUs) and the stock
  * query. Write side lives in src/erp-sync/taxes.js, invoice-lines.js and items.js.
  */
+const lots = require('../lots');
+
 module.exports = ({ user }) => {
+  // Lot tracking on: parcels by weight are lots (section 65), and a lot code is not a stock id.
+  const lotNote = lots.isGems(user)
+    ? '\n- This trader keeps parcels in LOTS (see GEM LOTS below): a lot code ("L12") is NOT a stock id and a parcel bought or sold by weight is NOT an item_code line; those go in the line\'s lot block. item_code stays for single stones kept by the piece under their own id.'
+    : '';
+  // A lot code looks like "L12"; the examples of stock ids must not look like one to a trader who keeps lots.
+  const gems = lots.isGems(user);
+  const ids = gems ? '"pa2293", "PA-2293", "SKU 4471", "stone #B12"' : '"pa2293", "PA-2293", "R-17", "SKU 4471", "stone #B12"';
+  const whereIs = gems ? 'where is pa2293' : 'where is R-17';
   const reg = user?.vat_registered == null ? 'unknown (ask once when VAT comes up)' : Number(user.vat_registered) === 1 ? 'yes' : 'no';
   return `TAX, LINE ITEMS & STOCK:
 
@@ -36,14 +46,14 @@ LINE ITEMS — draft field items: [{ description, qty, rate, item_code? }] (invo
 - The card's item lines ("- <qty> × <description> @ <rate>") come in \`card.lines\`; copy them verbatim.
 - Single thing, no stock id → no items; just amount + description as before.
 
-STOCK IDS (gem trader inventory):
-- A stock id is a code the user uses for a specific stone/lot: "pa2293", "PA-2293", "R-17", "SKU 4471", "stone #B12". Put it in items[].item_code as said (case, spaces and dashes don't matter — "PA-2293" and "pa2293" are the same stone); one id per line, never "A/B". The stone description ("ruby 7.68ct") goes in items[].description. Never invent a code; carats, colours and gem names alone are NOT a stock id.
+STOCK IDS (gem trader inventory):${lotNote}
+- A stock id is a code the user uses for a specific stone${gems ? '' : '/lot'}: ${ids}. Put it in items[].item_code as said (case, spaces and dashes don't matter — "PA-2293" and "pa2293" are the same stone); one id per line, never "A/B". The stone description ("ruby 7.68ct") goes in items[].description. Never invent a code; carats, colours and gem names alone are NOT a stock id.
 - Example: "bought ruby PA2293 from Gem Source for 50,000 cash" → update_draft { transaction_type:'bill_received', counterparty_name:'Gem Source', payment_terms:'net_0', category_code:'5000', items:[{ item_code:'PA2293', description:'ruby', qty:1, rate:50000 }] }. "sold PA2293 to Jameel for 80,000 USD net 30" → invoice_issued with items:[{ item_code:'PA2293', description:'ruby', qty:1, rate:80000 }]. A stock id mentioned ONLY in the description does not move stock — it MUST be in items[].item_code. But "sold ruby 7.68ct to Jameel for 45000 USD" has NO stock id (a gem name + carats is a description) → no items, no item_code; just amount + description.
 - Buying a coded stone → bill_received (category 5000) with an item_code line: it enters stock at its cost (ex claimable VAT). Selling a coded stone → invoice_issued with the same item_code: it leaves stock and its cost is booked to Cost of Goods Sold automatically.
 - Coded stones always go through invoice_issued / bill_received (a cash JE can't move stock). Paid on the spot → payment_terms net_0, save, then log the payment against it. Walk-in buyer with no name → ask for a name.
 - If request_confirmation says the stone is not in stock (or not on that date), tell the user plainly ("PA2293 isn't in stock — log its purchase first, or record this as an untracked sale?"). Untracked sale = same draft without item_code.
 
 STOCK QUESTIONS → query_stock(item_code?, search?, include_zero?):
-- "what's in stock" / "my inventory" / "stock value" → query_stock(). "do I still have pa2293" / "where is R-17" → query_stock(item_code). "any rubies left" → query_stock(search: 'ruby').
+- "what's in stock" / "my inventory" / "stock value" → query_stock(). "do I still have pa2293" / "${whereIs}" → query_stock(item_code). "any rubies left" → query_stock(search: 'ruby').
 - Reply one line per item: "<item_code> <name> — <qty> @ <valuation_rate> (<stock_value>) <warehouse>", then "Total stock value: <total_value> ${user?.reporting_currency || 'THB'}". unknown_item → "No stone <code> on record." not_in_stock → "<code> is sold out (0 on hand)."`;
 };

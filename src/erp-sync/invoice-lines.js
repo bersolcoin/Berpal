@@ -13,10 +13,16 @@
  *   untracked line → qty 1 at the line amount, "<qty> × <description>" (prints cleanly)
  *   stock line     → the real qty (the Bin must move by it) at the rate rounded down, plus a
  *                    "Rounding" GEN row for the leftover satang (< qty × 0.01)
+ *
+ * Gem lots (src/lots): a line listed in `lots` is one lot. The draft states it as qty 1 at the
+ * line total; its row moves the lot's carats of the lot's batch in the lot's warehouse, at the
+ * best 2-dp rate per carat, with the same "Rounding" row for what the rate cannot carry.
  */
 const { companyCurrency, resolveErpAccount, ensureGenericItem, round2 } = require('./common');
 const { vatTreatment } = require('./taxes');
 const items = require('./items');
+
+const LOT_UOM = 'Carat';
 
 /** [{ qty, rate, rounding }] for a line amount; rounding is the satang a stock line can't carry. */
 function splitLine(amount, qty, stock) {
@@ -28,24 +34,67 @@ function splitLine(amount, qty, stock) {
 }
 
 /**
+ * { rate, rounding } for a lot line: the highest 2-dp rate per carat whose amount (ERPNext rounds
+ * carats × rate to 2 dp) does not exceed the line amount; rounding is what is left over.
+ */
+function splitLotLine(amount, carats) {
+  const fits = (rate) => round2(carats * rate) <= round2(amount);
+  const exact = round2(amount / carats);
+  if (round2(carats * exact) === round2(amount)) return { rate: exact, rounding: 0 };
+  let cents = Math.floor(amount / carats * 100);
+  while (cents > 0 && !fits(cents / 100)) cents -= 1;
+  return { rate: cents / 100, rounding: round2(amount - round2(carats * cents / 100)) };
+}
+
+/**
  * side: 'sales' | 'purchase'. totals: taxes.computeTotals(draft, fallbackDescription).
+ * lots: [{ line, item, batch, warehouse, carats }] for the lines that are gem lots (else none).
  * Returns { rows, updateStock, warehouse }.
  */
-async function buildInvoiceLines(user, erp, draft, side, { lineAccount, totals }) {
+async function buildInvoiceLines(user, erp, draft, side, { lineAccount, totals, lots = null }) {
   const sales = side === 'sales';
   const gross = !sales && vatTreatment(user, draft) === 'non_claimable';
-  const anyStock = totals.lines.some((l) => l.item_code);
+  const lotOf = new Map((lots || []).map((l) => [l.line, l]));
+  const anyStock = totals.lines.some((l, i) => l.item_code && !lotOf.has(i));
   const warehouse = anyStock ? await items.resolveWarehouse(erp) : null;
   // Selling a stock item books COGS at valuation. Set it explicitly so it lands on the same
   // COGS account the chart maps 5000 to, not whatever the company default happens to be.
-  const cogsAccount = sales && anyStock ? await resolveErpAccount(user, erp, '5000', companyCurrency(user)) : null;
+  const cogsAccount = sales && (anyStock || lotOf.size) ? await resolveErpAccount(user, erp, '5000', companyCurrency(user)) : null;
   const accountField = sales ? 'income_account' : 'expense_account';
   const genericCode = () => ensureGenericItem(erp, sales ? 'sale' : 'purchase');
   const accountFields = lineAccount ? { [accountField]: lineAccount } : {};
 
   const rows = [];
-  for (const l of totals.lines) {
+  for (const [i, l] of totals.lines.entries()) {
     const amount = gross ? l.gross : l.net;
+    const lot = lotOf.get(i);
+    if (lot) {
+      const split = splitLotLine(amount, lot.carats);
+      rows.push({
+        item_code: lot.item,
+        qty: lot.carats,
+        rate: split.rate,
+        description: l.description,
+        uom: LOT_UOM,
+        stock_uom: LOT_UOM,
+        conversion_factor: 1,
+        warehouse: lot.warehouse,
+        batch_no: lot.batch,
+        use_serial_batch_fields: 1,
+        ...accountFields,
+        ...(cogsAccount ? { expense_account: cogsAccount } : {}),
+      });
+      if (split.rounding) {
+        rows.push({
+          item_code: await genericCode(),
+          qty: 1,
+          rate: split.rounding,
+          description: `Rounding: ${l.description}`,
+          ...accountFields,
+        });
+      }
+      continue;
+    }
     const stock = !!l.item_code;
     const split = splitLine(amount, l.qty, stock);
     let itemCode;
@@ -75,7 +124,7 @@ async function buildInvoiceLines(user, erp, draft, side, { lineAccount, totals }
       });
     }
   }
-  return { rows, updateStock: anyStock ? 1 : 0, warehouse };
+  return { rows, updateStock: anyStock || lotOf.size ? 1 : 0, warehouse };
 }
 
-module.exports = { buildInvoiceLines, splitLine };
+module.exports = { buildInvoiceLines, splitLine, splitLotLine };
