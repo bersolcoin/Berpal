@@ -78,7 +78,9 @@ async function save(user, erp, draft) {
   //    has currency matching the payment. Without this, ERPNext rejects a USD
   //    payment landing in a THB-only cash account. For Bank/Card the draft
   //    must carry wallet_name so the leaf is identifiable later.
-  const walletAccount = await resolveWalletAccount(
+  //    The web form passes the exact account (draft.wallet_account) the
+  //    user picked — no fuzzy match, no auto-create.
+  const walletAccount = draft.wallet_account || await resolveWalletAccount(
     erp,
     draft.payment_account_code,
     draft.currency,

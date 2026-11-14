@@ -135,7 +135,7 @@ async function resolve(user, erp, payload, userInput) {
  * so the sale's gross profit reflects reality without inventing a
  * supplier or touching any wallet.
  */
-async function bookOpeningStock(user, erp, { payload, totalCost, currency, openingDate }) {
+async function bookOpeningStock(user, erp, { payload, unitCost, qty, totalCost, currency, openingDate }) {
   const cogsAccount = await resolveErpAccount(user, erp, '5000', user.reporting_currency);
   if (!cogsAccount) return { ok: false, error: 'Could not resolve a Cost of Goods Sold account on this Company.' };
   const equityAccount = await resolveErpAccount(user, erp, '3200', user.reporting_currency);
@@ -159,11 +159,33 @@ async function bookOpeningStock(user, erp, { payload, totalCost, currency, openi
   const result = await erp.createResource('Journal Entry', payload2);
   const erpName = result.data?.name;
   console.log(`• [todos] [${ts()}] open-stock JE posted: ${erpName} (${totalCost} ${user.reporting_currency})`);
+
+  // ALSO post a Stock Reconciliation so the Item's on-hand qty in
+  // /inventory reflects the opening balance. Skipped when payload has
+  // no item_code (legacy GEN-SALE rows pre-dating per-SKU plumbing) or
+  // qty<=0. Non-fatal: the JE is the load-bearing entry; the SR is
+  // bookkeeping polish for inventory views.
+  let stockReconciliationName = null;
+  if (payload?.item_code && qty > 0 && !String(payload.item_code).startsWith('GEN-')) {
+    try {
+      const { postOpeningStockReconciliation } = require('../../erp-sync/stock');
+      stockReconciliationName = await postOpeningStockReconciliation(user, erp, {
+        itemCode: payload.item_code,
+        qty,
+        valuationRate: unitCost,
+        postingDate: openingDate,
+      });
+    } catch (srErr) {
+      console.warn(`• [todos] [${ts()}]   open-stock SR failed for ${payload.item_code}: ${srErr.message}`);
+    }
+  }
+
   return {
     ok: true,
     action: 'open_stock_booked',
     journal_entry_name: erpName,
     journal_entry_doctype: 'Journal Entry',
+    stock_reconciliation_name: stockReconciliationName,
   };
 }
 

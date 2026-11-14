@@ -39,6 +39,11 @@ function accountTypeForCode(parentCode) {
 
 function buildLeafName(accountType, currency, walletName) {
   const typeWord = accountType === 'Credit Card' ? 'Card' : accountType;
+  // Names like "Cash (USD)" (onboarding's auto-named cash wallets) already
+  // carry the currency — strip it so we don't produce "Cash (USD) (USD)".
+  if (walletName) {
+    walletName = walletName.replace(new RegExp(`\\s*\\(${currency}\\)\\s*$`, 'i'), '') || null;
+  }
   let base;
   if (!walletName) {
     base = typeWord;

@@ -268,6 +268,19 @@ async function migrate() {
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS state_province TEXT`);
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS postal_code TEXT`);
 
+  // Magic (magic.link) identity — issuer is Magic's stable user id;
+  // wallet_address is the embedded wallet Magic creates (keys stay with Magic).
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS magic_issuer TEXT`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_magic_issuer ON users(magic_issuer)`);
+
+  // Catalog category picked at onboarding (e.g. 'gemstones') — informational;
+  // what's switched on lives in business_categories (src/catalog).
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS industry TEXT`);
+  // Legacy: UI preferences now live on people.ui_prefs (per person).
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_prefs JSONB NOT NULL DEFAULT '{}'::jsonb`);
+  await query(`ALTER TABLE users ALTER COLUMN industry DROP DEFAULT`);
+
   // Multi-tenancy: store the ERPNext Company abbreviation so we can compute
   // per-company namespaces (Item Group, Warehouse prefix, etc.) without
   // round-tripping to ERPNext on every request. UNIQUE because ERPNext
@@ -284,6 +297,92 @@ async function migrate() {
           UNIQUE (erpnext_company_abbr);
       END IF;
     END $$;
+  `);
+
+  // ── People ↔ businesses ─────────────────────────────────────────────
+  // A `users` row is one BUSINESS (tenant): its ERPNext Company, API keys,
+  // currency, settings. Every tenant-scoped table keys on users.id. The
+  // person who signs in (phone, verified by SMS) lives in `people`; which
+  // businesses they can open lives in `memberships`. One person can run
+  // several businesses, and later several people (staff) can share one.
+  // The session's user_id is the ACTIVE business; it's only ever set after
+  // checking membership (login, switch, onboarding finalize), and page /
+  // API loaders re-check it (src/auth/business.js).
+  await query(`
+    CREATE TABLE IF NOT EXISTS people (
+      id                SERIAL PRIMARY KEY,
+      phone             TEXT NOT NULL UNIQUE,
+      display_name      TEXT,
+      email             TEXT,
+      ui_prefs          JSONB NOT NULL DEFAULT '{}'::jsonb,
+      last_business_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL
+    )
+  `);
+  await query(`
+    CREATE TABLE IF NOT EXISTS memberships (
+      person_id   INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      role        TEXT NOT NULL DEFAULT 'owner',      -- 'owner' (staff roles later)
+      created_at  TEXT NOT NULL,
+      PRIMARY KEY (person_id, user_id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id)`);
+  // Team invites. The ONLY way into someone else's business: a member
+  // invites a phone number with a role; that number signs in, sees
+  // "Join business" on /onboarding (or in the business switcher) and
+  // accepts → a membership. No searching for businesses, no join requests
+  // (a wrong approval would leak a company's books). One pending invite
+  // per business + phone.
+  await query(`
+    CREATE TABLE IF NOT EXISTS business_invites (
+      id            SERIAL PRIMARY KEY,
+      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      phone         TEXT NOT NULL,
+      role          TEXT NOT NULL,                     -- admin | manager | staff
+      invited_by    INTEGER REFERENCES people(id) ON DELETE SET NULL,
+      status        TEXT NOT NULL DEFAULT 'pending',   -- pending | accepted | declined | revoked
+      sms_sent_at   TEXT,
+      created_at    TEXT NOT NULL,
+      responded_at  TEXT
+    )
+  `);
+  await query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_business_invites_pending
+      ON business_invites (user_id, phone) WHERE status = 'pending'
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_business_invites_phone ON business_invites(phone) WHERE status = 'pending'`);
+  // No name on invites — the person gives their own when accepting.
+  await query(`ALTER TABLE business_invites DROP COLUMN IF EXISTS name`);
+  // Who invited a member (set when they accept).
+  await query(`ALTER TABLE memberships ADD COLUMN IF NOT EXISTS invited_by INTEGER REFERENCES people(id) ON DELETE SET NULL`);
+  await query(`ALTER TABLE memberships DROP COLUMN IF EXISTS sms_sent_at`);
+  await query(`ALTER TABLE people ADD COLUMN IF NOT EXISTS last_login_at TEXT`);
+  // One phone can now own several businesses — users.phone is the owner's
+  // contact phone, no longer unique.
+  await query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_phone_key`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone)`);
+  // Backfill (one-time per business): a business nobody is a member of
+  // belongs to the person with its phone. Carries name / email / UI prefs
+  // over to the person.
+  await query(`
+    INSERT INTO people (phone, display_name, email, ui_prefs, created_at, updated_at)
+    SELECT DISTINCT ON (u.phone) u.phone, u.display_name, u.email, u.ui_prefs, u.created_at, u.updated_at
+      FROM users u
+     WHERE u.erpnext_company IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = u.id)
+     ORDER BY u.phone, u.id
+    ON CONFLICT (phone) DO NOTHING
+  `);
+  await query(`
+    INSERT INTO memberships (person_id, user_id, role, created_at)
+    SELECT p.id, u.id, 'owner', u.created_at
+      FROM users u JOIN people p ON p.phone = u.phone
+     WHERE u.erpnext_company IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = u.id)
+    ON CONFLICT DO NOTHING
   `);
 
   // Counterparty cache: link to a platform user when the counterparty's
@@ -415,6 +514,187 @@ async function migrate() {
       WHERE related_name IS NOT NULL
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_todos_user ON todos(user_id)`);
+
+  // Per-industry attribute schemas for the Item catalog. The LLM's
+  // create_item tool looks up the user's industry and asks for each
+  // required field. ERPNext-side, every schema field gets a Custom Field
+  // installed on the Item doctype (site-wide; see src/erp-sync/item-custom-fields.js).
+  // field_type: 'select' (uses options_json), 'data' (text), 'float',
+  // 'int', 'check' (boolean). ordinal drives the ask order.
+  await query(`
+    CREATE TABLE IF NOT EXISTS industry_attribute_schema (
+      industry      TEXT NOT NULL,
+      field_key     TEXT NOT NULL,
+      field_label   TEXT NOT NULL,
+      field_type    TEXT NOT NULL,
+      required      BOOLEAN NOT NULL DEFAULT FALSE,
+      options_json  TEXT,
+      ordinal       INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (industry, field_key)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_industry_attr_industry ON industry_attribute_schema(industry, ordinal)`);
+
+  // ui: 'essential' (always on item forms) | 'more' (behind "+ More
+  // details") | 'system' (server-set, e.g. gem family/variety).
+  await query(`ALTER TABLE industry_attribute_schema ADD COLUMN IF NOT EXISTS ui TEXT NOT NULL DEFAULT 'more'`);
+
+  // Item category tree per industry: family → variety, with the lot-code
+  // prefix used for auto-numbering (AQ → AQ1405). Mirrored per tenant as
+  // ERPNext Item Groups (see src/erp-sync/item-group.js).
+  // owner_user_id NULL = built-in (shared catalog); set = that business's
+  // own addition (Settings → Product categories).
+  await query(`
+    CREATE TABLE IF NOT EXISTS item_categories (
+      id             SERIAL PRIMARY KEY,
+      industry       TEXT NOT NULL,
+      family         TEXT NOT NULL,
+      variety        TEXT NOT NULL,
+      code_prefix    TEXT,
+      ordinal        INTEGER NOT NULL DEFAULT 0,
+      owner_user_id  INTEGER
+    )
+  `);
+  // Upgrade the first version (PK on industry+variety, no owner).
+  await query(`ALTER TABLE item_categories ADD COLUMN IF NOT EXISTS owner_user_id INTEGER`);
+  await query(`ALTER TABLE item_categories ADD COLUMN IF NOT EXISTS id SERIAL`);
+  await query(`
+    DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.key_column_usage
+                  WHERE table_name = 'item_categories' AND constraint_name = 'item_categories_pkey'
+                    AND column_name = 'variety') THEN
+        ALTER TABLE item_categories DROP CONSTRAINT item_categories_pkey;
+        ALTER TABLE item_categories ADD PRIMARY KEY (id);
+      END IF;
+    END $$
+  `);
+  // Top-level category per variety (Gemstones, Watches, …).
+  await query(`ALTER TABLE item_categories ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'Gemstones'`);
+
+  // Top-level categories. uom = ERPNext stock unit for its lots (Carat for
+  // gems, Nos = pieces, Gram); attribute_set = which industry_attribute_schema
+  // fields its lots carry (NULL = none, just code/name/qty/price).
+  await query(`
+    CREATE TABLE IF NOT EXISTS item_category_roots (
+      id             SERIAL PRIMARY KEY,
+      industry       TEXT NOT NULL,
+      name           TEXT NOT NULL,
+      uom            TEXT NOT NULL DEFAULT 'Nos',
+      attribute_set  TEXT,
+      ordinal        INTEGER NOT NULL DEFAULT 0,
+      owner_user_id  INTEGER
+    )
+  `);
+  // Names are unique per business (whatever template a row came from).
+  await query(`DROP INDEX IF EXISTS uq_item_category_roots_name`);
+  await query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_item_category_roots_owner_name
+      ON item_category_roots ((COALESCE(owner_user_id, 0)), lower(name))
+  `);
+
+  await query(`DROP INDEX IF EXISTS uq_item_categories_variety`);
+  await query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_item_categories_owner_variety
+      ON item_categories ((COALESCE(owner_user_id, 0)), lower(variety))
+  `);
+
+  // Earlier iterations let businesses edit fields/varieties; the catalog is
+  // now admin-only (src/catalog/*, admin panel later) — drop those tables.
+  await query(`DROP TABLE IF EXISTS category_fields`);
+  await query(`DROP TABLE IF EXISTS business_hidden_varieties`);
+
+  // Requests to extend the catalog (new category, variety, dropdown option
+  // or field). Reviewed by us; approved ones get added to src/catalog/* for
+  // everyone. status: pending | added | declined.
+  await query(`
+    CREATE TABLE IF NOT EXISTS catalog_requests (
+      id             SERIAL PRIMARY KEY,
+      owner_user_id  INTEGER NOT NULL,
+      template       TEXT NOT NULL,
+      kind           TEXT NOT NULL,
+      field_key      TEXT,
+      value          TEXT NOT NULL,
+      note           TEXT,
+      status         TEXT NOT NULL DEFAULT 'pending',
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      reviewed_at    TIMESTAMPTZ
+    )
+  `);
+
+  // The product catalog is OURS (admin-only: src/catalog/*, admin panel
+  // later): shared rows with owner_user_id NULL. A business only switches
+  // categories on/off (business_categories); varieties and fields are
+  // view-only for it.
+  await query(`
+    CREATE TABLE IF NOT EXISTS business_categories (
+      owner_user_id  INTEGER NOT NULL,
+      category_id    INTEGER NOT NULL,
+      PRIMARY KEY (owner_user_id, category_id)
+    )
+  `);
+
+  const gem = require('./catalog/gemstones');
+  for (const [i, [key, label, type, required, options, ui]] of gem.ATTRIBUTES.entries()) {
+    await query(
+      `INSERT INTO industry_attribute_schema
+         (industry, field_key, field_label, field_type, required, options_json, ordinal, ui)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (industry, field_key) DO UPDATE SET
+         field_label = EXCLUDED.field_label,
+         field_type = EXCLUDED.field_type,
+         required = EXCLUDED.required,
+         options_json = EXCLUDED.options_json,
+         ordinal = EXCLUDED.ordinal,
+         ui = EXCLUDED.ui`,
+      [gem.INDUSTRY, key, label, type, required, options ? JSON.stringify(options) : null, i, ui]
+    );
+  }
+  await query(
+    `DELETE FROM industry_attribute_schema WHERE industry = $1 AND NOT (field_key = ANY($2))`,
+    [gem.INDUSTRY, gem.ATTRIBUTES.map((a) => a[0])]
+  );
+
+  // Shared catalog seed — UPSERT so edits to src/catalog/* land on restart.
+  for (const c of require('./catalog').CATALOG.filter((x) => !x.comingSoon)) {
+    await query(
+      `INSERT INTO item_category_roots (industry, name, uom, attribute_set, ordinal, owner_user_id)
+       VALUES ($1, $2, $3, $4, $5, NULL)
+       ON CONFLICT ((COALESCE(owner_user_id, 0)), lower(name)) DO UPDATE SET
+         industry = EXCLUDED.industry, uom = EXCLUDED.uom,
+         attribute_set = EXCLUDED.attribute_set, ordinal = EXCLUDED.ordinal`,
+      [c.key, c.name, c.uom, c.attribute_set, c.ordinal]
+    );
+    for (const [i, v] of c.varieties.entries()) {
+      await query(
+        `INSERT INTO item_categories (industry, category, family, variety, code_prefix, ordinal, owner_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, NULL)
+         ON CONFLICT ((COALESCE(owner_user_id, 0)), lower(variety)) DO UPDATE SET
+           category = EXCLUDED.category, family = EXCLUDED.family,
+           code_prefix = EXCLUDED.code_prefix, ordinal = EXCLUDED.ordinal`,
+        [c.key, c.name, v.family, v.variety, v.prefix, i]
+      );
+    }
+  }
+
+  // One-time: an earlier version copied the catalog into each business.
+  // Convert those copies into "enabled" choices on the shared rows.
+  const copies = await query(
+    `SELECT own.id AS own_id, own.owner_user_id, shared.id AS shared_id
+       FROM item_category_roots own
+       LEFT JOIN item_category_roots shared
+              ON shared.owner_user_id IS NULL AND lower(shared.name) = lower(own.name)
+      WHERE own.owner_user_id IS NOT NULL`
+  );
+  for (const c of copies.rows) {
+    if (c.shared_id) {
+      await query(
+        `INSERT INTO business_categories (owner_user_id, category_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [c.owner_user_id, c.shared_id]
+      );
+    }
+  }
+  await query(`DELETE FROM item_categories WHERE owner_user_id IS NOT NULL`);
+  await query(`DELETE FROM item_category_roots WHERE owner_user_id IS NOT NULL`);
 }
 
 /**

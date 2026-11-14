@@ -81,7 +81,7 @@ export default async function TodosPage() {
                       href={sourceHref}
                       className="inline-block text-xs text-[var(--color-brand-accent)] hover:underline"
                     >
-                      {t.related_doctype}: {friendlyAccountName(t.related_name) || t.related_name}
+                      {t.related_doctype}: {friendlyAccountName(t.related_name, user.erpnext_company_abbr) || t.related_name}
                     </Link>
                   )}
                 </div>

@@ -1,7 +1,7 @@
 /**
  * POST /api/auth/send-otp
  * Body: { phone: "+66..." }
- * Generates a 6-digit code, stores hash, sends via WhatsApp.
+ * Sends a 6-digit SMS code via Twilio Verify.
  */
 
 const { sendOtp } = require('../../../../src/auth/otp');
@@ -30,9 +30,9 @@ export async function POST(request) {
     );
   }
 
-  const result = await sendOtp(phone, { channel: 'whatsapp' });
+  const result = await sendOtp(phone);
   if (!result.ok) {
     return Response.json(result, { status: 400 });
   }
-  return Response.json({ ok: true, expires_at: result.expires_at });
+  return Response.json({ ok: true });
 }

@@ -46,7 +46,8 @@ function buildCountries() {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export default function CountrySelect({ value, onChange }) {
+// compact: 44px tall + text-sm, to sit beside an h-11 input (forms in the app).
+export default function CountrySelect({ value, onChange, compact = false }) {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState('');
   const ref = useRef(null);
@@ -88,15 +89,17 @@ export default function CountrySelect({ value, onChange }) {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-2 px-3 py-3 border border-slate-300 rounded-l-lg bg-white hover:bg-slate-50 transition min-w-[110px]"
+        className={`flex items-center gap-2 px-3 border border-slate-300 rounded-l-lg bg-white hover:bg-slate-50 transition min-w-[110px] ${
+          compact ? 'h-11' : 'py-3'
+        }`}
       >
         {selected ? (
           <>
             <span className={`fi fi-${selected.code.toLowerCase()} fis rounded-sm shrink-0 w-5 h-5`} aria-hidden="true" />
-            <span className="text-base font-medium text-slate-700 tabular">{selected.dialCode}</span>
+            <span className={`${compact ? 'text-sm' : 'text-base'} font-medium text-slate-700 tabular`}>{selected.dialCode}</span>
           </>
         ) : (
-          <span className="text-base text-slate-400">Country</span>
+          <span className={`${compact ? 'text-sm' : 'text-base'} text-slate-400`}>Country</span>
         )}
         <CaretDown size={12} weight="regular" className="ml-auto text-slate-400" />
       </button>

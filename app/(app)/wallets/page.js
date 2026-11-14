@@ -7,6 +7,7 @@ import Link from 'next/link';
 import { getAppContext } from '../_lib/context';
 import { getCashBankBalance } from '../../../src/erp-query';
 import PageHeader from '../_components/PageHeader';
+import { Wallet } from '@phosphor-icons/react/dist/ssr';
 import Card from '../_components/Card';
 import Empty from '../_components/Empty';
 import { money, friendlyAccountName, accountUrl } from '../_components/format';
@@ -68,9 +69,9 @@ export default async function WalletsPage() {
                         <Link
                           href={accountUrl(w)}
                           className="text-slate-900 hover:text-[var(--color-brand-accent)]"
-                          title={friendlyAccountName(w.erpnext_name) || w.account_name}
+                          title={friendlyAccountName(w.erpnext_name, user.erpnext_company_abbr) || w.account_name}
                         >
-                          {friendlyAccountName(w.erpnext_name) || w.account_name}
+                          {friendlyAccountName(w.erpnext_name, user.erpnext_company_abbr) || w.account_name}
                         </Link>
                       </div>
                     </td>

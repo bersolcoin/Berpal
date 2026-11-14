@@ -8,6 +8,9 @@ import { getAppContext } from './_lib/context';
 import { countPendingLinks } from '../../src/erp-query';
 import { query } from '../../src/db';
 import Shell from './_components/Shell';
+import { getSession } from '../../src/auth/session';
+const { listBusinesses } = require('../../src/auth/business');
+const { listInvitesForPhone } = require('../../src/team');
 
 export const dynamic = 'force-dynamic';
 
@@ -27,14 +30,22 @@ export default async function AppShellLayout({ children }) {
     limit: 1,
   });
 
-  const [pendingInboxCount, pendingTodosCount] = await Promise.all([
+  const { phone } = await getSession();
+  const [pendingInboxCount, pendingTodosCount, businesses, inviteCount] = await Promise.all([
     countPendingLinks(user.id).catch(() => 0),
     query(`SELECT COUNT(*)::int AS n FROM todos WHERE user_id = $1`, [user.id])
       .then((r) => r.rows[0]?.n || 0)
       .catch(() => 0),
+    listBusinesses(phone).then((list) => list.map((b) => ({ id: b.id, name: b.name, role: b.role }))),
+    listInvitesForPhone(phone).then((l) => l.length).catch(() => 0),
   ]);
 
+  // The signed-in person's role in the active business (listBusinesses carries it).
+  const role = businesses.find((b) => b.id === user.id)?.role || null;
+
   const safeUser = {
+    id: user.id,
+    role,
     display_name: user.display_name,
     phone: user.phone,
     erpnext_company: user.erpnext_company,
@@ -46,6 +57,8 @@ export default async function AppShellLayout({ children }) {
       user={safeUser}
       pendingInboxCount={pendingInboxCount}
       pendingTodosCount={pendingTodosCount}
+      businesses={businesses}
+      inviteCount={inviteCount}
     >
       {children}
     </Shell>

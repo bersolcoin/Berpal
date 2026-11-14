@@ -18,6 +18,7 @@ import {
   Package,
   Briefcase,
   UsersThree,
+  UsersFour,
   ListBullets,
   ListChecks,
   Gear,
@@ -27,6 +28,7 @@ import {
   ShoppingBag,
 } from '@phosphor-icons/react';
 import LogoutButton from './LogoutButton';
+import CompanySwitcher from './CompanySwitcher';
 
 /**
  * Nav items have an optional `showFor` set — controls which business_type
@@ -53,6 +55,7 @@ const NAV = [
   { href: '/services', label: 'Services', Icon: Briefcase, showFor: new Set(['service', 'both', null]) },
   { href: '/contacts', label: 'Contacts', Icon: UsersThree },
   { href: '/accounts', label: 'Accounts', Icon: ListBullets },
+  { href: '/team', label: 'Team', Icon: UsersFour, adminOnly: true },
   { href: '/settings', label: 'Settings', Icon: Gear },
 ];
 
@@ -61,15 +64,18 @@ const BADGE_TONE = {
   orange: 'bg-orange-500 text-white',
 };
 
-export default function Shell({ user, pendingInboxCount = 0, pendingTodosCount = 0, children }) {
+export default function Shell({ user, pendingInboxCount = 0, pendingTodosCount = 0, businesses = [], inviteCount = 0, children }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
   const badges = { pendingInboxCount, pendingTodosCount };
   const businessType = user.business_type || null;
+  // adminOnly items (Team) show for owner / admin only — the pages and
+  // APIs behind them check the role too.
+  const isAdmin = user.role === 'owner' || user.role === 'admin';
   const visibleNav = NAV.filter(
-    (item) => !item.showFor || item.showFor.has(businessType)
+    (item) => (!item.showFor || item.showFor.has(businessType)) && (!item.adminOnly || isAdmin)
   );
 
   return (
@@ -105,20 +111,18 @@ export default function Shell({ user, pendingInboxCount = 0, pendingTodosCount =
           ${drawerOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}
         `}
       >
-        <div className="px-5 py-5 border-b border-[var(--color-border)] flex items-center justify-between">
-          <div>
-            <img src="/logo.svg" alt="Berpal" className="w-6 h-6" />
-            <div className="text-xs text-[var(--color-ink-muted)] mt-2 truncate max-w-[160px]">
-              {user.erpnext_company}
-            </div>
+        <div className="px-4 py-5 border-b border-[var(--color-border)]">
+          <div className="flex items-center justify-between">
+            <img src="/logo.svg" alt="Berpal" className="w-6 h-6 ml-1" />
+            <button
+              aria-label="Close menu"
+              onClick={() => setDrawerOpen(false)}
+              className="md:hidden p-2 -mr-2 rounded hover:bg-slate-100 text-slate-500"
+            >
+              <X size={18} weight={ICON_WEIGHT} />
+            </button>
           </div>
-          <button
-            aria-label="Close menu"
-            onClick={() => setDrawerOpen(false)}
-            className="md:hidden p-2 -mr-2 rounded hover:bg-slate-100 text-slate-500"
-          >
-            <X size={18} weight={ICON_WEIGHT} />
-          </button>
+          <CompanySwitcher currentId={user.id} currentName={user.erpnext_company} businesses={businesses} inviteCount={inviteCount} />
         </div>
 
         <nav className="flex-1 px-2 py-4 overflow-y-auto">

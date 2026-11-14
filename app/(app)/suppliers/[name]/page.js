@@ -32,8 +32,8 @@ export default async function SupplierDetail({ params }) {
 
   return (
     <>
-      <PageHeader
-        title={supplier.display_name || friendlyPartyName(supplierName)}
+      <PageHeader back="/suppliers" backLabel="Back to Suppliers"
+        title={supplier.display_name || friendlyPartyName(supplierName, user.erpnext_company_abbr)}
         subtitle={
           <span>
             <Link href="/suppliers" className="text-[var(--color-brand-accent)] hover:underline">

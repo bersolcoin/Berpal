@@ -19,7 +19,7 @@ export default async function SuppliersPage() {
 
   return (
     <>
-      <PageHeader
+      <PageHeader back="/contacts" backLabel="Back to Contacts"
         title="Suppliers"
         subtitle="Vendors you owe money to. Suppliers with open bills appear first."
       />

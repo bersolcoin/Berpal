@@ -8,7 +8,9 @@
  *   {
  *     rows: [{
  *       doctype, erpnext_name, kind, party, posting_date,
- *       currency, amount, status, raw
+ *       currency, amount, status, raw,
+ *       flow,        // { from: [names], to: [names] } — where value moved (credit → debit)
+ *       direction,   // 'in' | 'out' | 'transfer' | 'neutral' (company view)
  *     }, ...],
  *     hasMore: boolean
  *   }
@@ -23,6 +25,25 @@
  */
 
 const DEFAULT_LIMIT_PER_DOCTYPE = 50;
+
+// Accounts that are the business's money (wallets).
+const WALLET_TYPES = new Set(['Cash', 'Bank']);
+
+const unique = (list) => [...new Set(list)];
+
+/**
+ * Money in or out from the company's point of view: debiting a wallet
+ * brings money in, crediting one sends it out, both = a transfer between
+ * wallets, neither (accruals, reclassifications) = neutral.
+ */
+function journalDirection(lines) {
+  const debitWallet = lines.some((l) => Number(l.debit) > 0 && WALLET_TYPES.has(l.account_type));
+  const creditWallet = lines.some((l) => Number(l.credit) > 0 && WALLET_TYPES.has(l.account_type));
+  if (debitWallet && creditWallet) return 'transfer';
+  if (debitWallet) return 'in';
+  if (creditWallet) return 'out';
+  return 'neutral';
+}
 
 async function listRecentTransactions(user, erp, { limit = 25, offset = 0, filters = {} } = {}) {
   const perType = Math.max(limit + offset + 1, DEFAULT_LIMIT_PER_DOCTYPE);
@@ -58,6 +79,7 @@ async function listRecentTransactions(user, erp, { limit = 25, offset = 0, filte
       filters: baseFilters(),
       fields: [
         'name', 'payment_type', 'party_type', 'party',
+        'paid_from', 'paid_to',
         'posting_date', 'paid_amount',
         'paid_from_account_currency', 'paid_to_account_currency',
         'docstatus',
@@ -73,10 +95,29 @@ async function listRecentTransactions(user, erp, { limit = 25, offset = 0, filte
     }),
   ]);
 
+  // Journal lines for from → to + direction: credited accounts are the
+  // source, debited the destination. One query for all listed journals.
+  const jeNames = (je.data || []).map((r) => r.name);
+  const jeLines = new Map();
+  if (jeNames.length) {
+    const lines = await erp.listResource('Journal Entry', {
+      filters: [['name', 'in', jeNames]],
+      fields: ['name', 'accounts.account', 'accounts.debit', 'accounts.credit', 'accounts.account_type'],
+      limit: 0,
+    });
+    for (const l of lines.data || []) {
+      if (!jeLines.has(l.name)) jeLines.set(l.name, []);
+      jeLines.get(l.name).push(l);
+    }
+  }
+
   const rows = [];
 
   for (const r of si.data || []) {
     rows.push({
+      direction: 'in',
+      // Accounting direction (credit → debit): Sales → the customer, who now owes.
+      flow: { from: ['Sales'], to: [r.customer].filter(Boolean) },
       doctype: 'Sales Invoice',
       erpnext_name: r.name,
       kind: 'Invoice',
@@ -91,6 +132,9 @@ async function listRecentTransactions(user, erp, { limit = 25, offset = 0, filte
   }
   for (const r of pi.data || []) {
     rows.push({
+      direction: 'out',
+      // Credit → debit: the supplier (now owed) → purchases / stock.
+      flow: { from: [r.supplier].filter(Boolean), to: ['Purchases'] },
       doctype: 'Purchase Invoice',
       erpnext_name: r.name,
       kind: 'Purchase',
@@ -104,7 +148,13 @@ async function listRecentTransactions(user, erp, { limit = 25, offset = 0, filte
     });
   }
   for (const r of pe.data || []) {
+    const receive = r.payment_type === 'Receive';
     rows.push({
+      direction: receive ? 'in' : 'out',
+      // Receive: party → wallet; Pay: wallet → party.
+      flow: receive
+        ? { from: [r.party || r.paid_from].filter(Boolean), to: [r.paid_to].filter(Boolean) }
+        : { from: [r.paid_from].filter(Boolean), to: [r.party || r.paid_to].filter(Boolean) },
       doctype: 'Payment Entry',
       erpnext_name: r.name,
       kind: r.payment_type === 'Receive' ? 'Receipt' : 'Payment',
@@ -119,7 +169,13 @@ async function listRecentTransactions(user, erp, { limit = 25, offset = 0, filte
   }
   for (const r of je.data || []) {
     const isExpense = /expense|bill|cost/i.test(r.title || '');
+    const lines = jeLines.get(r.name) || [];
     rows.push({
+      direction: journalDirection(lines),
+      flow: {
+        from: unique(lines.filter((l) => Number(l.credit) > 0).map((l) => l.account)),
+        to: unique(lines.filter((l) => Number(l.debit) > 0).map((l) => l.account)),
+      },
       doctype: 'Journal Entry',
       erpnext_name: r.name,
       kind: isExpense ? 'Expense' : 'Cash',

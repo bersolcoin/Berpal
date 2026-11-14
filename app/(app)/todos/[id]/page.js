@@ -74,17 +74,9 @@ export default async function TodoDetailPage({ params }) {
 
   return (
     <>
-      <PageHeader
+      <PageHeader back="/todos" backLabel="Back to Todos"
         title="Resolve todo"
         subtitle={KIND_LABEL[todo.kind] || todo.kind}
-        right={
-          <Link
-            href="/todos"
-            className="text-sm text-[var(--color-ink-muted)] hover:text-slate-900"
-          >
-            ← Back to todos
-          </Link>
-        }
       />
 
       <div className="bg-white border border-[var(--color-border)] rounded-xl p-5 mb-4">
@@ -113,6 +105,7 @@ export default async function TodoDetailPage({ params }) {
           wallets={wallets}
           suppliers={suppliers}
           defaultCurrency={user.default_currency || 'USD'}
+          abbr={user.erpnext_company_abbr}
           reportingCurrency={user.reporting_currency || user.default_currency || 'USD'}
         />
       )}

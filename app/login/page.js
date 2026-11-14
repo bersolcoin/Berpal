@@ -7,11 +7,10 @@
  * we ping ipapi.co to pre-select the user's country (best-effort; if the
  * lookup fails we just default to US).
  *
- * Sandbox mode: OTP is a plain WhatsApp text. The user must have first
- * joined the Twilio sandbox by sending the join code to +1 415 523 8886.
+ * The code is sent by SMS via Twilio Verify (src/auth/otp.js).
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
   getCountryCallingCode,
@@ -24,7 +23,7 @@ import CountrySelect from './CountrySelect';
 
 const STEPS = { PHONE: 'phone', CODE: 'code' };
 const DEFAULT_COUNTRY = 'US';
-const RESEND_COOLDOWN_SECONDS = 30; // matches MIN_RESEND_GAP_MS in src/auth/otp.js
+const RESEND_COOLDOWN_SECONDS = 30;
 
 /**
  * National-formatted example number for the selected country, e.g.
@@ -43,7 +42,16 @@ function placeholderFor(country) {
   return '818-8888';
 }
 
+// useSearchParams() needs a Suspense boundary for production prerendering.
 export default function LoginPage() {
+  return (
+    <Suspense>
+      <LoginForm />
+    </Suspense>
+  );
+}
+
+function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const expired = searchParams.get('expired') === '1';
@@ -138,7 +146,7 @@ export default function LoginPage() {
         return;
       }
       setStep(STEPS.CODE);
-      setInfo(`Code sent via WhatsApp to ${phone}. Check your messages.`);
+      setInfo(`Code sent by SMS to ${phone}.`);
       setResendIn(RESEND_COOLDOWN_SECONDS);
     } catch (err) {
       setError(err.message || 'Network error.');
@@ -209,13 +217,8 @@ export default function LoginPage() {
     <main className="max-w-md mx-auto px-6 py-6 sm:py-16">
       <img src="/logo.svg" alt="Berpal" className="w-8 h-8 sm:w-9 sm:h-9 mb-4 sm:mb-8" />
       <h1 className="text-xl sm:text-2xl font-semibold tracking-tight mb-1.5 sm:mb-2">Sign in</h1>
-      {expired && (
-        <div className="mb-4 px-3 py-2 rounded-md bg-amber-50 border border-amber-200 text-xs text-amber-900">
-          Your onboarding session expired. Please sign in again to continue.
-        </div>
-      )}
       <p className="text-sm text-slate-600 mb-4 sm:mb-6">
-        {step === STEPS.PHONE ? 'Enter your WhatsApp number' : 'Enter the 6-digit code'}
+        {step === STEPS.PHONE ? 'Enter your mobile number — we’ll text you a code.' : 'Enter the 6-digit code'}
       </p>
 
       {step === STEPS.PHONE && (
@@ -320,22 +323,12 @@ export default function LoginPage() {
 
       {info && <p className="mt-4 text-sm text-emerald-700">{info}</p>}
       {error && <p className="mt-4 text-sm text-red-700">{error}</p>}
-
-      {step === STEPS.PHONE && (
-      <div className="mt-6 sm:mt-12">
-        <p className="text-xs text-slate-500 mb-2 sm:mb-3">
-          First time? Join the WhatsApp sandbox.
-        </p>
-        <a
-          href="https://wa.me/14155238886?text=join%20explore-individual"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex items-center justify-center gap-2 w-full py-3 bg-orange-500 hover:bg-orange-600 text-white rounded-lg text-sm font-medium transition"
-        >
-          Join Twilio sandbox →
-        </a>
-      </div>
+      {expired && (
+        <div className="mt-6 px-3 py-2 rounded-md bg-amber-50 border border-amber-200 text-xs text-amber-900">
+          Your onboarding session expired. Please sign in again to continue.
+        </div>
       )}
+
     </main>
   );
 }

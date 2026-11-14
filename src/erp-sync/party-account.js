@@ -23,11 +23,30 @@ const { upsertAccountInCoaCache } = require('./coa-cache');
 
 const _cache = new Map();
 
+/** Company.default_receivable_account / default_payable_account (memoized). */
+const _defaults = new Map();
+async function getCompanyDefaultPartyAccount(erp, accountType) {
+  const key = `${erp.company}|${accountType}`;
+  if (!_defaults.has(key)) {
+    const field = accountType === 'Receivable' ? 'default_receivable_account' : 'default_payable_account';
+    try {
+      const r = await erp.getResource('Company', erp.company);
+      _defaults.set(key, r.data?.[field] || null);
+    } catch {
+      _defaults.set(key, null);
+    }
+  }
+  return _defaults.get(key);
+}
+
 async function resolvePartyAccount(erp, accountType, currency, user = null) {
   const cacheKey = `${erp.company}|${accountType}|${currency}`;
   if (_cache.has(cacheKey)) return _cache.get(cacheKey);
 
-  // 1. Existing leaf account in this currency?
+  // 1. Existing leaf account in this currency? A chart can hold several
+  //    leaves of this type (v16 flags "Employee Advances" as Payable too),
+  //    so prefer the Company's default party account, then a Debtors /
+  //    Creditors name — never just whichever row ERPNext returns first.
   const existing = await erp.listResource('Account', {
     filters: [
       ['company', '=', erp.company],
@@ -35,12 +54,19 @@ async function resolvePartyAccount(erp, accountType, currency, user = null) {
       ['account_currency', '=', currency],
       ['is_group', '=', 0],
     ],
-    fields: ['name'],
-    limit: 1,
+    fields: ['name', 'account_name'],
+    limit: 50,
   });
-  if (existing.data && existing.data.length > 0) {
-    _cache.set(cacheKey, existing.data[0].name);
-    return existing.data[0].name;
+  const leaves = existing.data || [];
+  if (leaves.length > 0) {
+    const companyDefault = await getCompanyDefaultPartyAccount(erp, accountType);
+    const baseWord = accountType === 'Receivable' ? 'debtors' : 'creditors';
+    const pick =
+      leaves.find((a) => a.name === companyDefault) ||
+      leaves.find((a) => (a.account_name || '').toLowerCase().includes(baseWord)) ||
+      leaves[0];
+    _cache.set(cacheKey, pick.name);
+    return pick.name;
   }
 
   // 2. Locate the parent group ("Accounts Receivable" / "Accounts Payable").

@@ -5,6 +5,15 @@ const authToken = process.env.TWILIO_AUTH_TOKEN;
 const confirmationContentSid = process.env.TWILIO_CONFIRMATION_CONTENT_SID;
 const b2bLinkContentSid = process.env.TWILIO_B2B_LINK_CONTENT_SID;
 
+// WhatsApp is on hold (web-first since 2026-11-11). Every outbound WhatsApp
+// send no-ops unless WHATSAPP_ENABLED=true — otherwise the dead sandbox
+// sender just times out (30s) inside onboarding and other web flows.
+function whatsappDisabled(what) {
+  if (process.env.WHATSAPP_ENABLED === 'true') return false;
+  console.log(`[twilio] WhatsApp disabled — skipped ${what}`);
+  return true;
+}
+
 function resolveFromNumber() {
   const env = (process.env.TWILIO_ENV || 'sandbox').toLowerCase();
   const sandbox = process.env.TWILIO_WHATSAPP_NUMBER_SANDBOX;
@@ -34,6 +43,7 @@ function normalizeWhatsappAddress(addr) {
 }
 
 async function sendConfirmation(toAddress, summaryText) {
+  if (whatsappDisabled('confirmation')) return null;
   if (!client) {
     console.error('[twilio] cannot send confirmation: client not configured');
     return null;
@@ -74,6 +84,7 @@ async function sendConfirmation(toAddress, summaryText) {
  * carry OriginalRepliedMessageSid which lets us route them back.
  */
 async function sendB2BLinkProposal(toAddress, bodyText) {
+  if (whatsappDisabled('B2B proposal')) return null;
   if (!client) {
     console.error('[twilio] cannot send B2B proposal: client not configured');
     return null;
@@ -106,6 +117,7 @@ async function sendB2BLinkProposal(toAddress, bodyText) {
 }
 
 async function sendText(toAddress, text) {
+  if (whatsappDisabled('text')) return null;
   if (!client) {
     console.error('[twilio] cannot send text: client not configured');
     return null;

@@ -73,12 +73,7 @@ async function getAccountLedger(user, erp, { accountName, limit = 100 } = {}) {
 
   let closing = 0;
   try {
-    const b = await erp.callMethod('erpnext.accounts.utils.get_balance_on', {
-      account: accountName,
-      date: new Date().toISOString().slice(0, 10),
-      company: erp.company,
-    });
-    closing = Number(b.message) || 0;
+    closing = await erp.getAccountBalance(accountName);
   } catch (err) {
     console.warn(`[account-ledger] balance lookup failed: ${err.message}`);
   }

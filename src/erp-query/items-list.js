@@ -13,15 +13,14 @@
  * Returns { rows, hasMore } for pagination.
  */
 
-const { getCompanyItemGroupName } = require('../erp-sync/item-group');
+const { tenantItemGroupFilter } = require('../erp-sync/item-group');
 
 async function listItems(user, erp, { isStockItem, limit = 50, offset = 0 } = {}) {
   const filters = [['disabled', '=', 0]];
   if (isStockItem === true) filters.push(['is_stock_item', '=', 1]);
   if (isStockItem === false) filters.push(['is_stock_item', '=', 0]);
 
-  const itemGroup = getCompanyItemGroupName(user?.erpnext_company_abbr);
-  if (itemGroup) filters.push(['item_group', '=', itemGroup]);
+  filters.push(...tenantItemGroupFilter(user?.erpnext_company_abbr));
 
   const itemsResult = await erp.listResource('Item', {
     filters,
@@ -84,8 +83,7 @@ async function countItems(user, erp, { isStockItem } = {}) {
   const filters = [['disabled', '=', 0]];
   if (isStockItem === true) filters.push(['is_stock_item', '=', 1]);
   if (isStockItem === false) filters.push(['is_stock_item', '=', 0]);
-  const itemGroup = getCompanyItemGroupName(user?.erpnext_company_abbr);
-  if (itemGroup) filters.push(['item_group', '=', itemGroup]);
+  filters.push(...tenantItemGroupFilter(user?.erpnext_company_abbr));
   const r = await erp.callMethod('frappe.client.get_count', {
     doctype: 'Item',
     filters,

@@ -56,8 +56,8 @@ export default async function ContactDetail({ params }) {
 
   return (
     <>
-      <PageHeader
-        title={friendlyPartyName(displayName)}
+      <PageHeader back="/contacts" backLabel="Back to Contacts"
+        title={friendlyPartyName(displayName, user.erpnext_company_abbr)}
         subtitle={
           <span>
             <Link href="/contacts" className="text-[var(--color-brand-accent)] hover:underline">Contacts</Link>

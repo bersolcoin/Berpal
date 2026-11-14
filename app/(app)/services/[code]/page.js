@@ -10,7 +10,7 @@ import { getItemDetail } from '../../../../src/erp-query';
 import PageHeader from '../../_components/PageHeader';
 import Card from '../../_components/Card';
 import Empty from '../../_components/Empty';
-import { money, date } from '../../_components/format';
+import { money, date, friendlyName, friendlyItemCode } from '../../_components/format';
 
 export const dynamic = 'force-dynamic';
 
@@ -30,14 +30,14 @@ export default async function ServiceDetail({ params }) {
 
   return (
     <>
-      <PageHeader
-        title={item.item_name || item.item_code}
+      <PageHeader back="/services" backLabel="Back to Services"
+        title={item.item_name || friendlyItemCode(item.item_code, user.erpnext_company_abbr)}
         subtitle={
           <span>
             <Link href="/services" className="text-[var(--color-brand-accent)] hover:underline">Services</Link>
             {' / '}
-            <span className="font-mono text-xs">{item.item_code}</span>
-            {item.item_group && <span className="ml-2 text-xs">({item.item_group})</span>}
+            <span className="font-mono text-xs">{friendlyItemCode(item.item_code, user.erpnext_company_abbr)}</span>
+            {item.item_group && <span className="ml-2 text-xs">({friendlyName(item.item_group, user.erpnext_company_abbr)})</span>}
           </span>
         }
       />

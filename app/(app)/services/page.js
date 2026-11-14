@@ -10,7 +10,7 @@ import PageHeader from '../_components/PageHeader';
 import Card from '../_components/Card';
 import Empty from '../_components/Empty';
 import Pagination from '../_components/Pagination';
-import { money, date } from '../_components/format';
+import { money, date, friendlyName, friendlyItemCode } from '../_components/format';
 
 export const dynamic = 'force-dynamic';
 
@@ -67,15 +67,15 @@ export default async function ServicesPage({ searchParams }) {
                           className="text-slate-900 hover:text-[var(--color-brand-accent)] font-medium"
                           title={item.item_name}
                         >
-                          {item.item_name || item.item_code}
+                          {item.item_name || friendlyItemCode(item.item_code, user.erpnext_company_abbr)}
                         </Link>
                         <div className="text-xs text-[var(--color-ink-muted)] font-mono truncate">
-                          {item.item_code}
+                          {friendlyItemCode(item.item_code, user.erpnext_company_abbr)}
                         </div>
                       </div>
                     </td>
-                    <td className="py-2.5 pr-4 text-[var(--color-ink-muted)] text-xs truncate max-w-[160px]" title={item.item_group}>
-                      {item.item_group || '—'}
+                    <td className="py-2.5 pr-4 text-[var(--color-ink-muted)] text-xs truncate max-w-[160px]" title={friendlyName(item.item_group, user.erpnext_company_abbr)}>
+                      {friendlyName(item.item_group, user.erpnext_company_abbr) || '—'}
                     </td>
                     <td className="py-2.5 pr-4 text-[var(--color-ink-muted)] tabular text-xs whitespace-nowrap">
                       {date(item.modified)}

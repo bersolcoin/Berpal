@@ -1,7 +1,6 @@
 /**
  * Current cash + bank + credit-card position across all of the user's wallets.
- * Per-account balance pulled from ERPNext via erpnext.accounts.utils.get_balance_on
- * (the same call ERPNext's own dashboards use).
+ * Per-account balance summed from ERPNext GL Entries (erp.getAccountBalance).
  *
  * Returns:
  *   {
@@ -39,15 +38,10 @@ async function getCashBankBalance(user, erp, { asOf = null } = {}) {
     // in the account's currency by default.
     let balance = 0;
     try {
-      const r = await erp.callMethod('erpnext.accounts.utils.get_balance_on', {
-        account: w.name,
-        date,
-        company: erp.company,
-      });
-      balance = Number(r.message) || 0;
+      balance = await erp.getAccountBalance(w.name, date);
     } catch (err) {
       // If a single account fails, log and continue rather than aborting the whole query.
-      console.warn(`[cash-bank-balance] get_balance_on failed for ${w.name}: ${err.message}`);
+      console.warn(`[cash-bank-balance] balance lookup failed for ${w.name}: ${err.message}`);
     }
 
     // For Credit Card (liability), ERPNext stores the credit as positive on

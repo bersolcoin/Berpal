@@ -67,7 +67,7 @@ export default async function DashboardPage() {
         {recent.rows.length === 0 ? (
           <Empty title="No transactions yet" hint="Try messaging the bot on WhatsApp to record your first sale or expense." />
         ) : (
-          <TransactionsTable rows={recent.rows} defaultCurrency={base} />
+          <TransactionsTable rows={recent.rows} defaultCurrency={base} abbr={user.erpnext_company_abbr} />
         )}
       </Card>
     </>

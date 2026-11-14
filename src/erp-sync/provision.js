@@ -13,7 +13,9 @@
  *   5. Provision starter wallets (cash + each bank) — creates per-currency
  *      Account leaves and posts Opening Balance JEs against
  *      Opening Balance Equity for any non-zero starting amounts.
- *   6. UPSERT into our `users` table (idempotent on phone).
+ *   6. INSERT the business into our `users` table and make the signing-up
+ *      person (phone) its owner (people / memberships) — a person can
+ *      own several businesses, so this never overwrites an existing one.
  *
  * If a wallet's opening balance is in a different currency from the
  * company currency, an FX rate is fetched via frankfurter.app. Failure
@@ -22,11 +24,13 @@
  */
 
 const { query } = require('../db');
+const { ensurePerson, addMembership, rememberBusiness } = require('../auth/business');
 const { getAdminClient } = require('../erp-admin');
 const { ts } = require('../log');
 const erpnext = require('../erpnext');
 const { resolveWalletAccount } = require('./wallet');
 const { recordOpeningBalance } = require('./opening-balance');
+const { enableCategoriesByKey } = require('../catalog');
 const { ensureCompanyItemGroup, getCompanyItemGroupName } = require('./item-group');
 const { ensureCustomerGroup, ensureSupplierGroup, getCustomerGroupName, getSupplierGroupName } = require('./party-group');
 const { applyTenantFence } = require('./user-permission');
@@ -121,10 +125,16 @@ async function resolveUniqueAbbr(admin, candidate) {
   throw new Error(`could not find a unique Company abbr starting from "${candidate}"`);
 }
 
-function buildUserEmail({ phone, email }) {
-  if (email) return email;
-  const sanitized = String(phone).replace(/[^0-9]/g, '');
-  return `bot+${sanitized}@berpal.local`;
+/**
+ * The ERPNext bot user is per BUSINESS, never per person: its User
+ * Permissions fence it to one Company, so sharing it across a person's
+ * businesses would let each see the others' books. Keyed on the Company
+ * abbr (site-unique). (Businesses created before multi-business support
+ * keep their phone/email-based bot user — their stored API keys still
+ * point at it.)
+ */
+function buildUserEmail({ abbr }) {
+  return `bot+${String(abbr).toLowerCase().replace(/[^a-z0-9]/g, '')}@berpal.local`;
 }
 
 /**
@@ -183,6 +193,7 @@ async function provisionTenant({
   abbreviation = null,
   email = null,
   business_type = null,        // 'service' | 'product' | 'both'
+  catalog_template = null,     // catalog category key to switch on (e.g. 'gemstones')
   entity_type = null,          // 'individual' | 'company'
   nature_of_business = null,
   tax_id = null,
@@ -192,6 +203,9 @@ async function provisionTenant({
   state_province = null,
   postal_code = null,
   wallets = [],                // [{ type: 'cash'|'bank', name, currency, opening_balance }]
+  // Progress hook for the onboarding UI: onProgress(stepKey, detail?).
+  // Step keys: company → access → workspace → wallets → finish.
+  onProgress = () => {},
 }) {
   if (!phone || !business_name || !country || !currency) {
     throw new Error('provision: phone, business_name, country, currency are all required');
@@ -199,14 +213,16 @@ async function provisionTenant({
 
   const partial = {};
   const admin = getAdminClient();
-  const userEmail = buildUserEmail({ phone, email });
   const candidateAbbr = (abbreviation || deriveAbbreviation(business_name)).slice(0, 10);
   // Resolve abbr against ERPNext to avoid collision (Company.abbr is
   // site-unique). If candidate is free, returns as-is.
   const abbr = await resolveUniqueAbbr(admin, candidateAbbr);
+  const userEmail = buildUserEmail({ abbr });
   if (abbr !== candidateAbbr) {
     console.log(`• [provision] [${ts()}] abbr "${candidateAbbr}" taken; using "${abbr}"`);
   }
+
+  onProgress('company');
 
   // ── 1. Create Company ───────────────────────────────────────────────
   // ERPNext Country lookup is by full English name, not ISO code.
@@ -251,11 +267,19 @@ async function provisionTenant({
     }
   }
 
+  onProgress('access');
+
   // ── 2. Create User ──────────────────────────────────────────────────
   try {
-    await admin.getResource('User', userEmail);
+    const existingUser = await admin.getResource('User', userEmail);
     partial.user = userEmail;
     console.log(`• [provision] [${ts()}] User "${userEmail}" already exists — reusing`);
+    // A wiped tenant leaves its bot user disabled (ERPNext v16 can't
+    // delete it) — re-enable so the fresh API keys below actually work.
+    if (!existingUser.data?.enabled) {
+      await admin.updateResource('User', userEmail, { enabled: 1 });
+      console.log(`• [provision] [${ts()}] re-enabled User "${userEmail}"`);
+    }
   } catch (err) {
     try {
       const personName = (display_name || business_name).trim();
@@ -355,6 +379,8 @@ async function provisionTenant({
     console.warn(`• [provision] [${ts()}] could not set FX account: ${err.message}`);
   }
 
+  onProgress('workspace');
+
   // ── 4b. Per-tenant master-data groups + User Permission fence ───────
   // ERPNext multi-tenancy: bind the bot user to its Company AND to
   // per-tenant Customer/Supplier/Item groups so it can't see or modify
@@ -398,6 +424,8 @@ async function provisionTenant({
     console.warn(`• [provision] [${ts()}] tenant fence skipped (RUN harden-tenant!): ${err.message}`);
   }
 
+  onProgress('wallets');
+
   // ── 5. Provision starter wallets ────────────────────────────────────
   // Build a per-user ERPNext client so wallet/JE creation is scoped to
   // this Company (admin client uses a fixed company).
@@ -421,6 +449,7 @@ async function provisionTenant({
     const wCcy = w.currency || currency;
     const wOpening = Number(w.opening_balance) || 0;
     const parentCode = w.type === 'bank' ? '1100' : '1000';
+    onProgress('wallets', wOpening > 0 ? `${wName} — opening balance ${wOpening} ${wCcy}` : wName);
     try {
       const erpName = await resolveWalletAccount(erp, parentCode, wCcy, wName);
       partial.wallets.push({ kind: w.type === 'bank' ? 'bank' : 'cash', name: erpName });
@@ -432,9 +461,13 @@ async function provisionTenant({
     }
   }
 
-  // ── 6. Persist to users table ───────────────────────────────────────
+  onProgress('finish');
+
+  // ── 6. Persist the business + its owner ─────────────────────────────
+  // Always a new users row (one per business). The person may already
+  // own other businesses — those rows are untouched.
   const now = new Date().toISOString();
-  const upsert = await query(
+  const inserted = await query(
     `INSERT INTO users (
        phone, email, display_name,
        default_currency, reporting_currency, country,
@@ -452,26 +485,6 @@ async function provisionTenant({
        $14, $15, $16, $17, $18,
        $19, $19
      )
-     ON CONFLICT (phone) DO UPDATE SET
-       email = COALESCE(EXCLUDED.email, users.email),
-       display_name = COALESCE(EXCLUDED.display_name, users.display_name),
-       default_currency = EXCLUDED.default_currency,
-       reporting_currency = EXCLUDED.reporting_currency,
-       country = EXCLUDED.country,
-       erpnext_company = EXCLUDED.erpnext_company,
-       erpnext_company_abbr = EXCLUDED.erpnext_company_abbr,
-       erpnext_api_key = EXCLUDED.erpnext_api_key,
-       erpnext_api_secret = EXCLUDED.erpnext_api_secret,
-       business_type = COALESCE(EXCLUDED.business_type, users.business_type),
-       entity_type = COALESCE(EXCLUDED.entity_type, users.entity_type),
-       nature_of_business = COALESCE(EXCLUDED.nature_of_business, users.nature_of_business),
-       tax_id = COALESCE(EXCLUDED.tax_id, users.tax_id),
-       address_line1 = COALESCE(EXCLUDED.address_line1, users.address_line1),
-       address_line2 = COALESCE(EXCLUDED.address_line2, users.address_line2),
-       city = COALESCE(EXCLUDED.city, users.city),
-       state_province = COALESCE(EXCLUDED.state_province, users.state_province),
-       postal_code = COALESCE(EXCLUDED.postal_code, users.postal_code),
-       updated_at = EXCLUDED.updated_at
      RETURNING id`,
     [
       phone,
@@ -495,8 +508,23 @@ async function provisionTenant({
       now,
     ]
   );
-  const userId = upsert.rows[0]?.id;
-  console.log(`• [provision] [${ts()}] users.id=${userId} provisioned (phone=${phone}, company=${companyName})`);
+  const userId = inserted.rows[0]?.id;
+  const person = await ensurePerson(phone, { display_name, email });
+  await addMembership(person.id, userId, 'owner');
+  // Opened next — /api/onboarding/finalize binds the session to it.
+  await rememberBusiness(phone, userId);
+  console.log(`• [provision] [${ts()}] users.id=${userId} provisioned (phone=${phone}, company=${companyName}, owner person=${person.id})`);
+
+  // ── 6.2. Product categories switched on at onboarding ──────────────
+  if (catalog_template) {
+    try {
+      await query(`UPDATE users SET industry = $1 WHERE id = $2`, [catalog_template, userId]);
+      await enableCategoriesByKey(userId, [catalog_template]);
+      console.log(`• [provision] [${ts()}] product categories: "${catalog_template}" switched on`);
+    } catch (err) {
+      console.warn(`• [provision] [${ts()}] catalog template "${catalog_template}" failed: ${err.message}`);
+    }
+  }
 
   // ── 6.5. Seed the chart-of-accounts cache ───────────────────────────
   // Pull the post-provisioning CoA snapshot (standard chart + the
@@ -517,11 +545,11 @@ async function provisionTenant({
     // companyName) — ERPNext strips '&' and other punctuation, which
     // makes "SS & Co" come back as "SS Co" and feels wrong on the
     // very first message the user sees.
-    await twilio.sendText(
+    const sent = await twilio.sendText(
       phone,
       `Congratulations! I'm here to assist you with ${business_name}. Let me know when you need me.`
     );
-    console.log(`• [provision] [${ts()}] welcome message sent to ${phone}`);
+    if (sent) console.log(`• [provision] [${ts()}] welcome message sent to ${phone}`);
   } catch (err) {
     console.warn(`• [provision] [${ts()}] welcome message failed: ${err.message}`);
   }

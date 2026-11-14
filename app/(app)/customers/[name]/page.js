@@ -36,8 +36,8 @@ export default async function CustomerDetail({ params }) {
 
   return (
     <>
-      <PageHeader
-        title={customer.display_name || friendlyPartyName(customerName)}
+      <PageHeader back="/customers" backLabel="Back to Customers"
+        title={customer.display_name || friendlyPartyName(customerName, user.erpnext_company_abbr)}
         subtitle={
           <span>
             <Link href="/customers" className="text-[var(--color-brand-accent)] hover:underline">

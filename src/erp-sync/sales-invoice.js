@@ -11,7 +11,7 @@
  */
 
 const { resolveOrCreateCustomer } = require('./customer');
-const { ensureGenericSalesItem } = require('./item');
+const { ensureGenericSalesItem, resolveItem } = require('./item');
 const { resolveErpAccount } = require('./account');
 const { resolvePartyAccount } = require('./party-account');
 const { ts } = require('../log');
@@ -31,7 +31,45 @@ async function save(user, erp, draft) {
     email: draft.counterparty_email,
   });
 
-  const itemCode = await ensureGenericSalesItem(user, erp);
+  // Build the SI line items. For product/both: every line is a real
+  // resolved Item (resolveItem throws NEW_ITEM/AMBIGUOUS_ITEM, which
+  // bubbles to the LLM with structured info). For service or legacy
+  // single-line drafts (no items[]): fall back to the per-tenant
+  // GEN-SALE placeholder so the flow doesn't break.
+  const bt = user.business_type;
+  const requireRealItems = bt === 'product' || bt === 'both';
+  let siLineItems;
+  if (Array.isArray(draft.items) && draft.items.length > 0) {
+    siLineItems = [];
+    for (const line of draft.items) {
+      if (!line?.item_code) {
+        return { ok: false, error: 'item line missing item_code' };
+      }
+      const hit = await resolveItem(user, erp, {
+        code: line.item_code,
+        description: line.description || null,
+      });
+      siLineItems.push({
+        resolved_item: hit.erpnext_name,
+        qty: Number(line.qty) || 1,
+        rate: Number(line.rate) || 0,
+        description: line.description || hit.item_name || line.item_code,
+        weight_ct: typeof line.weight_ct === 'number' ? line.weight_ct : null,
+      });
+    }
+  } else if (requireRealItems) {
+    return { ok: false, error: 'product/both business_type requires draft.items[]' };
+  } else {
+    // Service or legacy fallback.
+    const genericCode = await ensureGenericSalesItem(user, erp);
+    siLineItems = [{
+      resolved_item: genericCode,
+      qty: 1,
+      rate: Number(draft.amount) || 0,
+      description: draft.description || `${customerName} invoice`,
+      weight_ct: null,
+    }];
+  }
 
   // Resolve income account from category_code (4000 → 4110 - Sales - TTC)
   const incomeAccount = await resolveErpAccount(
@@ -56,15 +94,16 @@ async function save(user, erp, draft) {
     posting_date: postingDate,
     due_date: dueDate,
     currency: draft.currency,
-    items: [
-      {
-        item_code: itemCode,
-        qty: 1,
-        rate: draft.amount,
-        description: draft.description || `${customerName} invoice`,
-        ...(incomeAccount ? { income_account: incomeAccount } : {}),
-      },
-    ],
+    items: siLineItems.map((l) => ({
+      item_code: l.resolved_item,
+      qty: l.qty,
+      rate: l.rate,
+      description: l.description,
+      ...(incomeAccount ? { income_account: incomeAccount } : {}),
+      // weight_ct is a Custom Field on Item — propagating it onto the SI
+      // line as well requires a separate Sales Invoice Item Custom Field;
+      // out of scope here. The Item itself carries it for reports.
+    })),
     docstatus: 1, // submit on create
   };
 
@@ -141,35 +180,58 @@ async function save(user, erp, draft) {
     console.warn(`• [conversation] [${ts()}] linked-txn propose skipped: ${err.message}`);
   }
 
-  // Pending-TODO trigger: every product sale where we don't have a
-  // purchase record for the goods becomes a follow-up (the user fills
-  // in supplier + cost later via /todos or by asking the bot).
-  // Two filters:
-  //   - business_type: services-only tenants don't sell goods at all
-  //   - category_code: 4100 (Service/Consulting/Fees) means this
-  //     specific invoice is for labor, not goods — nothing was "bought"
-  //     to fulfill it, so no purchase-record question to ask.
-  // Idempotent via the (user_id, kind, related_name) unique index, so
-  // re-saves of the same invoice never produce duplicates.
+  // Pending-TODO trigger: every line item we sold without a prior
+  // purchase record becomes a follow-up so the user fills in supplier +
+  // cost basis later. One todo per line per SI. Idempotent via
+  // (user_id, kind, related_name) — except related_name is the SI doc
+  // name, so for multi-line we need to disambiguate by item_code in
+  // the payload (the existing index dedups per-SI; we deliberately
+  // accept one todo per SI for V1 — the resolver handles all lines).
   try {
     const bizType = user.business_type;
     const isServiceRevenue = draft.category_code === '4100';
     if (!isServiceRevenue && (bizType === 'product' || bizType === 'both')) {
-      await createTodo({
-        userId: user.id,
-        kind: 'unknown_item_purchase',
-        payload: {
-          item_code: itemCode,
-          item_name: draft.description || '(item)',
-          qty_sold: 1,
-          amount_sold: Number(draft.amount) || 0,
-          currency: draft.currency,
-          invoice_ref: erpName,
-          customer_name: customerName,
-        },
-        relatedDoctype: 'Sales Invoice',
-        relatedName: erpName,
-      });
+      for (const line of siLineItems) {
+        // Skip the generic placeholder fallback — that's not a real SKU.
+        if (line.resolved_item.startsWith('GEN-SALE')) continue;
+        // Check for prior Purchase Invoice lines on this item. If any
+        // exist, cost basis is established; no todo needed.
+        let hasPriorPurchase = false;
+        try {
+          const r = await erp.listResource('Purchase Invoice Item', {
+            filters: [['item_code', '=', line.resolved_item], ['docstatus', '=', 1]],
+            fields: ['name'],
+            limit: 1,
+          });
+          hasPriorPurchase = (r.data || []).length > 0;
+        } catch (probeErr) {
+          // Non-fatal — assume no prior, enqueue the todo to be safe.
+          console.warn(`• [conversation] [${ts()}]   purchase-history probe failed for ${line.resolved_item}: ${probeErr.message}`);
+        }
+        if (hasPriorPurchase) continue;
+
+        // The todos table has UNIQUE(user_id, kind, related_name) — one
+        // todo per SI not per-line. For multi-line, we attach the first
+        // line missing history; users with multi-line bills can re-enqueue
+        // via re-saves if needed. (V1 simplification.)
+        await createTodo({
+          userId: user.id,
+          kind: 'unknown_item_purchase',
+          payload: {
+            item_code: line.resolved_item,
+            item_name: line.description || '(item)',
+            qty_sold: line.qty,
+            weight_ct: line.weight_ct || null,
+            amount_sold: Number(line.qty) * Number(line.rate) || 0,
+            currency: draft.currency,
+            invoice_ref: erpName,
+            customer_name: customerName,
+          },
+          relatedDoctype: 'Sales Invoice',
+          relatedName: erpName,
+        });
+        break; // first line with no prior history → todo enqueued, stop
+      }
     }
   } catch (err) {
     console.warn(`• [conversation] [${ts()}] todo enqueue skipped: ${err.message}`);

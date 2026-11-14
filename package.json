@@ -13,6 +13,7 @@
     "reset": "node scripts/reset-conversations.js"
   },
   "dependencies": {
+    "@magic-sdk/admin": "^2.8.4",
     "@phosphor-icons/react": "^2.1.10",
     "bcryptjs": "^3.0.3",
     "dotenv": "^16.4.5",
@@ -20,6 +21,7 @@
     "flag-icons": "^7.5.0",
     "iron-session": "^8.0.4",
     "libphonenumber-js": "^1.11.20",
+    "magic-sdk": "^33.13.0",
     "next": "^16.2.6",
     "openai": "^4.77.0",
     "pg": "^8.20.0",

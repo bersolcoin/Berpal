@@ -37,6 +37,7 @@ const COUNTRY_DEFAULT_CURRENCY = {
 
 const initialForm = {
   business_type: '',
+  catalog_template: 'gemstones', // the only live catalog category for now
   entity_type: '',
   business_name: '',
   nature_of_business: '',
@@ -56,9 +57,13 @@ const initialForm = {
   wallets: [{ type: 'cash', name: 'Cash', currency: '', opening_balance: '' }],
 };
 
-export default function OnboardingFlow({ defaultDisplayName = '' }) {
+// `cancelHref`: set when adding another business — "Cancel" goes back
+// there instead of the Logout button.
+export default function OnboardingFlow({ defaultDisplayName = '', onBackToStart = null, cancelHref = null }) {
   const router = useRouter();
   const [step, setStep] = useState(1);
+  // Live provisioning progress for the overlay: { step, detail }.
+  const [progress, setProgress] = useState({ step: null, detail: null });
   const [form, setForm] = useState({ ...initialForm, display_name: defaultDisplayName });
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -135,10 +140,25 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
   }
 
   function updateWallet(idx, key, value) {
-    setForm((prev) => ({
-      ...prev,
-      wallets: prev.wallets.map((w, i) => (i === idx ? { ...w, [key]: value } : w)),
-    }));
+    setForm((prev) => {
+      const wallets = prev.wallets.map((w, i) => (i === idx ? { ...w, [key]: value } : w));
+      // Switching a row to cash: if its currency is already taken by another
+      // cash wallet, move it to the first free currency.
+      const w = wallets[idx];
+      if (key === 'type' && value === 'cash') {
+        const used = new Set(
+          wallets
+            .filter((x, j) => j !== idx && (j === 0 || x.type === 'cash'))
+            .map((x) => (x.currency || prev.default_currency || '').toUpperCase())
+        );
+        const cur = (w.currency || prev.default_currency || '').toUpperCase();
+        if (used.has(cur)) {
+          const free = COMMON_CURRENCIES.find((c) => !used.has(c));
+          if (free) wallets[idx] = { ...w, currency: free };
+        }
+      }
+      return { ...prev, wallets };
+    });
   }
 
   function removeWallet(idx) {
@@ -148,7 +168,36 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
     }));
   }
 
+  // Cash wallets aren't user-named: the default (row 0) is "Cash", extra
+  // cash wallets are "Cash (<CCY>)". Only bank wallets take a typed name.
+  function walletName(w, i) {
+    if (i === 0) return 'Cash';
+    if (w.type === 'cash') return `Cash (${(w.currency || form.default_currency || '').toUpperCase()})`;
+    return w.name.trim();
+  }
+  // Wallet names must be unique (case-insensitive) — this also blocks a
+  // second cash wallet in the same currency, since cash names derive from it.
+  function isDuplicateName(w, i) {
+    const name = walletName(w, i).toLowerCase();
+    if (!name) return false;
+    return form.wallets.some((x, j) => j < i && walletName(x, j).toLowerCase() === name) ||
+      // "Cash (THB)" when THB is home currency duplicates the default "Cash".
+      (i > 0 && w.type === 'cash' && cashCurrency(w) === cashCurrency(form.wallets[0]));
+  }
+  function cashCurrency(w) {
+    return (w.currency || form.default_currency || '').toUpperCase();
+  }
+  // Currencies already taken by cash wallets other than row `idx`.
+  function usedCashCurrencies(idx) {
+    return new Set(
+      form.wallets
+        .filter((w, j) => j !== idx && (j === 0 || w.type === 'cash'))
+        .map((w) => (w.currency || form.default_currency || '').toUpperCase())
+    );
+  }
+
   function step1Valid() {
+    if (form.business_type !== 'service' && !form.catalog_template) return false;
     return form.business_type && form.entity_type && form.business_name.trim().length >= 2;
   }
   function step2Valid() {
@@ -159,13 +208,15 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
     // Every named wallet must have a name (we filter unnamed rows on submit
     // but require at least one named row so the new account has somewhere
     // to land its first transaction).
-    const named = form.wallets.filter((w) => w.name.trim());
+    const named = form.wallets.filter((w, i) => walletName(w, i));
     if (named.length === 0) return false;
+    if (form.wallets.some(isDuplicateName)) return false;
     return true;
   }
 
   async function submit() {
     setError('');
+    setProgress({ step: null, detail: null });
     if (!step1Valid() || !step2Valid() || !step3Valid()) {
       setError('Some required fields are missing.');
       return;
@@ -177,6 +228,7 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           business_type: form.business_type,
+          catalog_template: form.business_type === 'service' ? null : form.catalog_template,
           entity_type: form.entity_type,
           business_name: form.business_name.trim(),
           nature_of_business: form.nature_of_business.trim() || null,
@@ -191,24 +243,37 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
           display_name: form.display_name.trim(),
           email: form.email.trim() || null,
           wallets: form.wallets
-            .filter((w) => w.name.trim())
+            .map((w, i) => ({ ...w, name: walletName(w, i) }))
+            .filter((w) => w.name)
             .map((w) => ({
               type: w.type === 'bank' ? 'bank' : 'cash',
-              name: w.name.trim(),
+              name: w.name,
               currency: (w.currency || form.default_currency).toUpperCase(),
               opening_balance: Number(w.opening_balance) || 0,
             })),
         }),
       });
-      const data = await r.json();
-      if (!r.ok || !data.ok) {
-        setError(data.error || 'Could not create your workspace.');
-        return;
+      // Validation errors come back as plain JSON; provisioning streams
+      // NDJSON progress lines (see app/api/onboarding/route.js).
+      if (!r.ok || !(r.headers.get('content-type') || '').includes('ndjson')) {
+        const data = await r.json().catch(() => ({}));
+        throw new Error(data.error || 'Could not create your workspace.');
       }
-      router.push(data.dashboard || '/dashboard');
+      const done = await readProgressStream(r, (step, detail) =>
+        setProgress((p) => ({ step, detail: detail || (p.step === step ? p.detail : null) }))
+      );
+
+      const fin = await fetch('/api/onboarding/finalize', { method: 'POST' });
+      const finData = await fin.json().catch(() => ({}));
+      if (!fin.ok || !finData.ok) throw new Error(finData.error || 'Could not open your workspace.');
+
+      // Keep the overlay up (busy stays true) through navigation so the
+      // form doesn't flash back before the dashboard renders.
+      setProgress({ step: 'open', detail: null });
+      router.replace(done.next || '/dashboard');
     } catch (err) {
       setError(err.message || 'Network error.');
-    } finally {
+      setProgress({ step: null, detail: null });
       setBusy(false);
     }
   }
@@ -239,7 +304,7 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
 
   return (
     <div>
-      {busy && step === TOTAL_STEPS && <CreatingOverlay />}
+      {busy && step === TOTAL_STEPS && <CreatingOverlay progress={progress} />}
       <Stepper current={step} />
 
       {step === 1 && (
@@ -262,10 +327,15 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
       {step === 3 && (
         <Step3
           form={form}
+          // A person has one name across all their businesses — shown, not editable.
+          lockName={!!defaultDisplayName}
           setField={setField}
           addWallet={addWallet}
           updateWallet={updateWallet}
           removeWallet={removeWallet}
+          walletName={walletName}
+          isDuplicateName={isDuplicateName}
+          usedCashCurrencies={usedCashCurrencies}
         />
       )}
 
@@ -273,16 +343,17 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={exit}
+            onClick={cancelHref ? () => router.push(cancelHref) : exit}
             disabled={busy}
             className="px-4 py-2.5 text-sm text-slate-500 hover:text-slate-900 hover:bg-slate-50 border border-slate-200 rounded-lg transition disabled:opacity-50"
           >
-            Logout
+            {cancelHref ? 'Cancel' : 'Logout'}
           </button>
-          {step > 1 && (
+          {(step > 1 || onBackToStart) && (
             <button
               type="button"
-              onClick={back}
+              // Step 1 → back to the "new vs join" chooser.
+              onClick={step > 1 ? back : onBackToStart}
               disabled={busy}
               className="px-4 py-2.5 text-sm text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 transition disabled:opacity-50"
             >
@@ -324,17 +395,86 @@ export default function OnboardingFlow({ defaultDisplayName = '' }) {
  * (5–10s usually). Locks the UI so the user can't double-submit or
  * wander to a different step mid-flight.
  */
-function CreatingOverlay() {
+// Provisioning stages, in order — keys match onProgress() in
+// src/erp-sync/provision.js, plus 'open' for the final navigation.
+const PROGRESS_STEPS = [
+  { key: 'company', label: 'Creating your company' },
+  { key: 'access', label: 'Setting up secure access' },
+  { key: 'workspace', label: 'Preparing your accounts' },
+  { key: 'wallets', label: 'Adding your wallets' },
+  { key: 'finish', label: 'Finishing up' },
+  { key: 'open', label: 'Opening your dashboard' },
+];
+
+/**
+ * Read the NDJSON progress stream from POST /api/onboarding. Calls
+ * onStep(step, detail) per progress line; resolves with the 'done' event,
+ * throws on an 'error' event or a stream that ends without one.
+ */
+async function readProgressStream(response, onStep) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (value) buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      const evt = JSON.parse(line);
+      if (evt.type === 'progress') onStep(evt.step, evt.detail);
+      else if (evt.type === 'error') throw new Error(evt.error || 'Could not create your workspace.');
+      else if (evt.type === 'done') return evt;
+    }
+    if (done) throw new Error('Connection lost while creating your workspace. Please try again.');
+  }
+}
+
+/**
+ * Full-screen overlay shown while the workspace is being provisioned.
+ * Shows a live checklist driven by the server's progress stream. Locks the
+ * UI so the user can't double-submit or wander mid-flight.
+ */
+function CreatingOverlay({ progress }) {
+  const current = PROGRESS_STEPS.findIndex((s) => s.key === progress.step);
   return (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-100/95 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-100/95 backdrop-blur-sm px-6">
       <img src="/logo.svg" alt="Berpal" className="w-12 h-12 mb-6" />
-      <div
-        className="w-8 h-8 rounded-full border-2 border-slate-300 border-t-slate-900 animate-spin"
-        role="status"
-        aria-label="Creating your workspace"
-      />
-      <p className="mt-6 text-sm font-medium text-slate-700">Creating your workspace…</p>
-      <p className="mt-1.5 text-xs text-slate-500">Usually 5–10 seconds.</p>
+      <p className="text-sm font-medium text-slate-900 mb-5">Creating your workspace…</p>
+      <ol className="w-full max-w-xs space-y-3" aria-live="polite">
+        {PROGRESS_STEPS.map((s, i) => {
+          const state = i < current ? 'done' : i === current ? 'active' : 'pending';
+          return (
+            <li key={s.key} className="flex items-start gap-3">
+              <span className="mt-0.5 w-5 h-5 shrink-0 flex items-center justify-center">
+                {state === 'done' && (
+                  <span className="w-5 h-5 rounded-full bg-emerald-600 text-white flex items-center justify-center">
+                    <Check size={12} weight="bold" />
+                  </span>
+                )}
+                {state === 'active' && (
+                  <span
+                    className="w-4 h-4 rounded-full border-2 border-slate-300 border-t-slate-900 animate-spin"
+                    role="status"
+                  />
+                )}
+                {state === 'pending' && <span className="w-2 h-2 rounded-full bg-slate-300" />}
+              </span>
+              <div className="min-w-0">
+                <div className={`text-sm ${state === 'pending' ? 'text-slate-400' : 'text-slate-800'}`}>
+                  {s.label}
+                </div>
+                {state === 'active' && progress.detail && (
+                  <div className="text-xs text-slate-500 truncate">{progress.detail}</div>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+      <p className="mt-6 text-xs text-slate-500">This can take up to a minute — please keep this page open.</p>
     </div>
   );
 }
@@ -403,6 +543,38 @@ function Step1({ form, setField }) {
           ))}
         </div>
       </Field>
+
+      {form.business_type && form.business_type !== 'service' && (
+        <Field label="What do you sell?" required>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {[
+              { value: 'gemstones', title: 'Gemstones', hint: '17 gem families, 61 varieties, with gem details (carat, clarity, origin…)' },
+              { value: 'watches', title: 'Watches', hint: 'Coming soon', soon: true },
+            ].map((o) => (
+              <button
+                key={o.value}
+                type="button"
+                disabled={o.soon}
+                onClick={() => setField('catalog_template', o.value)}
+                className={`relative p-3 text-left border rounded-lg transition ${
+                  o.soon
+                    ? 'border-slate-200 bg-slate-50 opacity-60 cursor-not-allowed'
+                    : form.catalog_template === o.value
+                      ? 'border-slate-900 bg-slate-100 shadow-sm ring-1 ring-slate-900/10'
+                      : 'border-slate-200 hover:border-slate-400 hover:bg-slate-50'
+                }`}
+              >
+                {o.soon && (
+                  <span className="absolute top-2 right-2 text-[10px] uppercase tracking-wide font-medium px-1.5 py-0.5 rounded bg-slate-200 text-slate-600">Soon</span>
+                )}
+                <div className="text-sm font-medium text-slate-900">{o.title}</div>
+                <div className="text-xs text-slate-500 mt-0.5">{o.hint}</div>
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-xs text-slate-500">More categories are added over time — switch them on from Inventory → ⚙.</p>
+        </Field>
+      )}
 
       <Field label="Who's running it?" required>
         <div className="grid grid-cols-2 gap-2">
@@ -514,7 +686,7 @@ function Step2({ form, setField, onCountryChange, onCurrencyChange, countryAutoF
 }
 
 // ─── STEP 3 ──────────────────────────────────────────────────────────
-function Step3({ form, setField, addWallet, updateWallet, removeWallet }) {
+function Step3({ form, setField, lockName = false, addWallet, updateWallet, removeWallet, walletName, isDuplicateName, usedCashCurrencies }) {
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -523,8 +695,12 @@ function Step3({ form, setField, addWallet, updateWallet, removeWallet }) {
             type="text"
             value={form.display_name}
             onChange={(e) => setField('display_name', e.target.value)}
+            readOnly={lockName}
+            aria-readonly={lockName}
             placeholder="First Last"
-            className="w-full px-3 py-3 text-sm border border-slate-300 rounded-lg outline-none focus:border-slate-400"
+            className={`w-full px-3 py-3 text-sm border border-slate-300 rounded-lg outline-none ${
+              lockName ? 'bg-slate-50 text-slate-500 cursor-not-allowed' : 'focus:border-slate-400'
+            }`}
           />
         </Field>
 
@@ -614,13 +790,20 @@ function Step3({ form, setField, addWallet, updateWallet, removeWallet }) {
                     <option value="cash">Cash</option>
                     <option value="bank">Bank</option>
                   </select>
-                  <input
-                    type="text"
-                    value={w.name}
-                    onChange={(e) => updateWallet(i, 'name', e.target.value)}
-                    placeholder={w.type === 'bank' ? 'Kasikorn Savings' : 'Cash (USD)'}
-                    className="col-span-8 sm:col-span-4 px-3 py-3 text-sm border border-slate-300 rounded-lg outline-none focus:border-slate-400"
-                  />
+                  {w.type === 'cash' ? (
+                    // Cash wallets are auto-named from their currency.
+                    <div className="col-span-8 sm:col-span-4 px-3 py-3 text-sm rounded-lg bg-slate-100 text-slate-500 select-none">
+                      {walletName(w, i)}
+                    </div>
+                  ) : (
+                    <input
+                      type="text"
+                      value={w.name}
+                      onChange={(e) => updateWallet(i, 'name', e.target.value)}
+                      placeholder="Kasikorn Savings"
+                      className="col-span-8 sm:col-span-4 px-3 py-3 text-sm border border-slate-300 rounded-lg outline-none focus:border-slate-400"
+                    />
+                  )}
                   <select
                     value={w.currency || form.default_currency || ''}
                     onChange={(e) => updateWallet(i, 'currency', e.target.value)}
@@ -629,9 +812,12 @@ function Step3({ form, setField, addWallet, updateWallet, removeWallet }) {
                     {!COMMON_CURRENCIES.includes(w.currency) && w.currency && (
                       <option value={w.currency}>{w.currency}</option>
                     )}
-                    {COMMON_CURRENCIES.map((c) => (
-                      <option key={c} value={c}>{c}</option>
-                    ))}
+                    {COMMON_CURRENCIES
+                      // Cash: hide currencies another cash wallet already uses.
+                      .filter((c) => w.type !== 'cash' || c === (w.currency || form.default_currency) || !usedCashCurrencies(i).has(c))
+                      .map((c) => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
                   </select>
                   <input
                     type="number"
@@ -644,6 +830,13 @@ function Step3({ form, setField, addWallet, updateWallet, removeWallet }) {
                   />
                 </div>
 
+                {isDuplicateName(w, i) && (
+                  <p className="mt-2 text-xs text-red-700">
+                    {w.type === 'cash'
+                      ? 'You already have a cash wallet in this currency — pick another currency or remove this one.'
+                      : 'You already have a wallet with this name — please use a different name.'}
+                  </p>
+                )}
                 <div className="mt-2 flex justify-end">
                   <button
                     type="button"

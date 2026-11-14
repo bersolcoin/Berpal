@@ -50,12 +50,7 @@ async function getExpenseSummary(user, erp, { asOf = null } = {}) {
     operatingLeaves.map(async (a) => {
       let balance = 0;
       try {
-        const b = await erp.callMethod('erpnext.accounts.utils.get_balance_on', {
-          account: a.name,
-          date,
-          company: erp.company,
-        });
-        balance = Number(b.message) || 0;
+        balance = await erp.getAccountBalance(a.name, date);
       } catch (err) {
         console.warn(`[expense-summary] balance lookup failed for ${a.name}: ${err.message}`);
       }

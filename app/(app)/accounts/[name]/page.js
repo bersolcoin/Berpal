@@ -13,7 +13,7 @@ import { getAccountLedger, resolveAccountParam } from '../../../../src/erp-query
 import PageHeader from '../../_components/PageHeader';
 import Card from '../../_components/Card';
 import Empty from '../../_components/Empty';
-import { money, date, friendlyAccountName } from '../../_components/format';
+import { money, date, friendlyAccountName, friendlyAccountList } from '../../_components/format';
 
 export const dynamic = 'force-dynamic';
 
@@ -37,8 +37,8 @@ export default async function AccountLedgerPage({ params }) {
 
   return (
     <>
-      <PageHeader
-        title={friendlyAccountName(ledger.account) || ledger.account_name}
+      <PageHeader back="/accounts" backLabel="Back to Accounts"
+        title={friendlyAccountName(ledger.account, user.erpnext_company_abbr) || ledger.account_name}
         subtitle={
           <span>
             <Link href="/accounts" className="text-[var(--color-brand-accent)] hover:underline">
@@ -99,8 +99,8 @@ export default async function AccountLedgerPage({ params }) {
                       </Link>
                       <div className="text-[10px] text-[var(--color-ink-muted)] uppercase tracking-wide">{e.voucher_type}</div>
                     </td>
-                    <td className="py-2 pr-4 text-xs text-slate-600 max-w-xs truncate" title={e.against}>
-                      {friendlyAccountName(e.against) || '—'}
+                    <td className="py-2 pr-4 text-xs text-slate-600 max-w-xs truncate" title={friendlyAccountList(e.against, user.erpnext_company_abbr)}>
+                      {friendlyAccountList(e.against, user.erpnext_company_abbr) || '—'}
                     </td>
                     <td className="py-2 pr-4 text-right tabular text-slate-700 whitespace-nowrap">
                       {e.debit ? money(e.debit, ledger.currency || user.default_currency) : ''}

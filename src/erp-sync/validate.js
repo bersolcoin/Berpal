@@ -82,6 +82,37 @@ function validateDraft(draft, user) {
         ask_user: tt === 'invoice_issued' ? 'Who did you sell to?' : 'Who sent the bill?',
       });
     }
+    // Multi-line items required for product/both business types — the bot
+    // creates real per-SKU Items in ERPNext. For service, items[] is
+    // optional (free-text description is fine). The LLM is told to populate
+    // items[] from the message; if it didn't, that's an extraction failure
+    // we surface here so the next iteration re-tries.
+    const bt = user.business_type;
+    const requireItems = bt === 'product' || bt === 'both';
+    if (requireItems) {
+      const items = Array.isArray(draft.items) ? draft.items : [];
+      if (items.length === 0) {
+        needs.push({
+          field: 'items',
+          priority: 2,
+          needs_user_input: false,
+          instruction:
+            'Re-extract from the user message: populate items[] with one entry per line — each line needs item_code (SKU verbatim), qty, rate, and weight_ct when mentioned. For single-line sales, items[] still has length=1.',
+        });
+      } else {
+        // Per-line item_code is mandatory.
+        const missingCode = items.some((it) => !it || !it.item_code);
+        if (missingCode) {
+          needs.push({
+            field: 'items[].item_code',
+            priority: 2,
+            needs_user_input: true,
+            ask_user:
+              'Which item is this? Tell me the SKU (e.g. "pa2293") so I can find or add it.',
+          });
+        }
+      }
+    }
     // payment_terms unnecessary when the invoice is being paid in the same
     // breath (paid_now=true) — server defaults to net_0. Otherwise ask.
     if (!draft.paid_now && !draft.payment_terms && !draft.due_date) {

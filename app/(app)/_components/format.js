@@ -125,15 +125,20 @@ export function Flag({ country, currency, square = true, className = '' }) {
  * chart code) and the trailing element if it looks like a company abbr
  * (2–10 chars, mostly uppercase / digits). Rejoin what's left.
  */
-const ABBR_RE = /^[A-Z0-9]{2,10}$/;
+// ERPNext appends the company abbreviation to tenant-scoped names
+// ("Cash - ML", "Paraiba Tourmaline - ML", item code "PA0001-ML"). Every
+// helper below takes the business's abbr and strips exactly that — never
+// a guess from the dash pattern. Without an abbr nothing is stripped.
+// Display only: always keep the full name for lookups and links.
+function stripSuffix(name, abbr) {
+  const s = String(name);
+  return abbr && s.endsWith(` - ${abbr}`) ? s.slice(0, -(abbr.length + 3)) : s;
+}
 
-export function friendlyAccountName(erpName) {
+export function friendlyAccountName(erpName, abbr = null) {
   if (!erpName) return '';
-  const parts = String(erpName).split(' - ');
-  if (parts.length < 2) return erpName;
-  // Drop trailing abbr.
-  if (ABBR_RE.test(parts[parts.length - 1])) parts.pop();
-  // Drop leading numeric code.
+  const parts = stripSuffix(erpName, abbr).split(' - ');
+  // Drop the leading chart number ("1110 - Cash" → "Cash").
   if (parts.length > 1 && /^\d+$/.test(parts[0])) parts.shift();
   return parts.join(' - ') || erpName;
 }
@@ -161,7 +166,43 @@ export function accountUrl(account) {
 /**
  * Strip the company suffix from a customer/supplier name if any.
  */
-export function friendlyPartyName(name) {
+export function friendlyPartyName(name, abbr = null) {
+  return friendlyName(name, abbr);
+}
+
+/** "Paraiba Tourmaline - ML" → "Paraiba Tourmaline" (groups, warehouses, parties). */
+export function friendlyName(name, abbr = null) {
   if (!name) return '';
-  return String(name).replace(/\s+-\s+[A-Z]{2,5}$/, '');
+  return stripSuffix(name, abbr);
+}
+
+/** Item codes carry "-<ABBR>": "PA0001-ML" → "PA0001". */
+export function friendlyItemCode(code, abbr = null) {
+  if (!code) return '';
+  const s = String(code);
+  return abbr && s.endsWith(`-${abbr}`) ? s.slice(0, -(abbr.length + 1)) : s;
+}
+
+/**
+ * Free-text titles that embed account names (Journal Entry titles like
+ * "Opening Balance — 1120 - Cash (USD) (USD) - ML") → "Opening Balance —
+ * Cash (USD)": chart codes and company suffix out, a doubled currency tag
+ * (from an old naming bug) collapsed.
+ */
+export function friendlyTitle(title, abbr = null) {
+  if (!title) return '';
+  return String(title)
+    .split(' — ')
+    .map((part) => friendlyAccountName(part.trim(), abbr))
+    .join(' — ')
+    .replace(/\(([A-Z]{3})\)\s*\(\1\)/g, '($1)');
+}
+
+/** Comma-separated account/party lists (GL "against"): clean each name. */
+export function friendlyAccountList(list, abbr = null) {
+  if (!list) return '';
+  return String(list)
+    .split(/,\s*/)
+    .map((n) => friendlyAccountName(n, abbr))
+    .join(', ');
 }

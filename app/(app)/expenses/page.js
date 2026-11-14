@@ -69,7 +69,7 @@ export default async function ExpensesPage() {
           ) : (
             <>
               <div className="text-xl font-semibold mt-2 text-slate-900 truncate">
-                {friendlyAccountName(active[0].erpnext_name)}
+                {friendlyAccountName(active[0].erpnext_name, user.erpnext_company_abbr)}
               </div>
               <div className="text-sm text-[var(--color-ink-muted)] mt-1 tabular">
                 {money(active[0].balance, active[0].currency)}
@@ -104,9 +104,9 @@ export default async function ExpensesPage() {
                         <Link
                           href={accountUrl(a)}
                           className="text-slate-900 hover:text-[var(--color-brand-accent)] font-medium"
-                          title={friendlyAccountName(a.erpnext_name)}
+                          title={friendlyAccountName(a.erpnext_name, user.erpnext_company_abbr)}
                         >
-                          {friendlyAccountName(a.erpnext_name) || a.account_name}
+                          {friendlyAccountName(a.erpnext_name, user.erpnext_company_abbr) || a.account_name}
                         </Link>
                       </div>
                     </td>

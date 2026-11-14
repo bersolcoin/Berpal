@@ -39,7 +39,7 @@ export default async function AccountsPage() {
           if (accounts.length === 0) return null;
           return (
             <Card key={rt} title={<span className={`font-semibold ${ROOT_TONE[rt]}`}>{rt}</span>}>
-              <AccountTree accounts={accounts} />
+              <AccountTree accounts={accounts} abbr={user.erpnext_company_abbr} />
             </Card>
           );
         })}
@@ -48,7 +48,7 @@ export default async function AccountsPage() {
   );
 }
 
-function AccountTree({ accounts }) {
+function AccountTree({ accounts, abbr }) {
   const byParent = new Map();
   for (const a of accounts) {
     const p = a.parent_account || null;
@@ -61,13 +61,13 @@ function AccountTree({ accounts }) {
   return (
     <ul className="text-sm space-y-0.5">
       {roots.map((r) => (
-        <Node key={r.erpnext_name} node={r} byParent={byParent} depth={0} />
+        <Node key={r.erpnext_name} node={r} byParent={byParent} depth={0} abbr={abbr} />
       ))}
     </ul>
   );
 }
 
-function Node({ node, byParent, depth }) {
+function Node({ node, byParent, depth, abbr }) {
   const children = byParent.get(node.erpnext_name) || [];
   return (
     <li>
@@ -78,13 +78,13 @@ function Node({ node, byParent, depth }) {
         style={{ paddingLeft: depth * 16 }}
       >
         {node.is_group ? (
-          <span>{friendlyAccountName(node.erpnext_name)}</span>
+          <span>{friendlyAccountName(node.erpnext_name, abbr)}</span>
         ) : (
           <Link
             href={accountUrl(node)}
             className="hover:text-[var(--color-brand-accent)] flex items-center gap-2"
           >
-            <span>{friendlyAccountName(node.erpnext_name)}</span>
+            <span>{friendlyAccountName(node.erpnext_name, abbr)}</span>
             {node.currency && (
               <span className="text-[10px] text-[var(--color-ink-muted)] font-normal">{node.currency}</span>
             )}
@@ -97,7 +97,7 @@ function Node({ node, byParent, depth }) {
       {children.length > 0 && (
         <ul>
           {children.map((c) => (
-            <Node key={c.erpnext_name} node={c} byParent={byParent} depth={depth + 1} />
+            <Node key={c.erpnext_name} node={c} byParent={byParent} depth={depth + 1} abbr={abbr} />
           ))}
         </ul>
       )}

@@ -8,7 +8,7 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { money, date, friendlyPartyName } from '../_components/format';
+import { money, date } from '../_components/format';
 
 export default function InboxItem({ link }) {
   const router = useRouter();
@@ -55,7 +55,7 @@ export default function InboxItem({ link }) {
   }
 
   const sellerLabel =
-    friendlyPartyName(link.seller.company) || link.seller.name || 'A Berpal user';
+    link.seller.company || link.seller.name || 'A Berpal user';
   const items = Array.isArray(link.items) ? link.items : [];
 
   return (

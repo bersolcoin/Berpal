@@ -11,7 +11,7 @@
 import { cache } from 'react';
 import { redirect } from 'next/navigation';
 import { getSession } from '../../../src/auth/session';
-import { query } from '../../../src/db';
+const { loadActiveBusiness } = require('../../../src/auth/business');
 const erpnext = require('../../../src/erpnext');
 
 export const getAppContext = cache(async () => {
@@ -19,28 +19,14 @@ export const getAppContext = cache(async () => {
   if (!sess.phone) redirect('/login');
   if (!sess.user_id || !sess.onboarded) redirect('/onboarding');
 
-  const r = await query(
-    `SELECT id, phone, email, display_name, default_currency, country,
-            erpnext_company, erpnext_company_abbr,
-            erpnext_api_key, erpnext_api_secret,
-            business_type, entity_type, nature_of_business, tax_id,
-            address_line1, address_line2, city, state_province, postal_code
-       FROM users WHERE id = $1`,
-    [sess.user_id]
-  );
-  const user = r.rows[0];
-  if (!user) redirect('/login');
-
-  // The user's session cookie may say "onboarded=true" but the DB row
-  // could've been wiped (admin ran reset-user-onboarding.js, ERPNext
-  // creds rotated, etc). If there's no ERPNext binding, send them to
-  // /onboarding instead of crashing inside erpnext.forUser. Note: can't
-  // sess.save() here — Next 15+ blocks cookie writes from server
-  // components. /onboarding does its own DB re-check so the stale
-  // cookie is harmless; /api/onboarding's submit overwrites it.
-  if (!user.erpnext_company || !user.erpnext_api_key || !user.erpnext_api_secret) {
-    redirect('/onboarding');
-  }
+  // `user` = the active business (users row). Only loads when the signed-in
+  // person (sess.phone) is a member of it and it has an ERPNext binding.
+  // Otherwise — wiped business, removed membership, rotated creds — send
+  // them to /onboarding, which re-checks and offers their businesses /
+  // setting one up. (Can't sess.save() here: Next 15+ blocks cookie writes
+  // from server components.)
+  const user = await loadActiveBusiness(sess.phone, sess.user_id);
+  if (!user) redirect('/onboarding');
 
   const erp = erpnext.forUser(user);
   return { user, erp };

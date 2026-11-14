@@ -17,4 +17,20 @@ export async function register() {
     // Don't throw — let the server boot and surface a clear error on first
     // request instead of crashing silently here.
   }
+
+  // Install/refresh ERPNext Custom Fields for Item industry attributes.
+  // Idempotent — skips per-field when they already exist. Failures here
+  // are non-fatal: a missing Custom Field manifests later as a clear
+  // ERPNext write error, not a boot failure.
+  try {
+    const { installItemCustomFields } = require('./src/erp-sync/item-custom-fields');
+    const { ensureAllowNegativeStock } = require('./src/erp-sync/stock');
+    const { getAdminClient } = require('./src/erp-admin');
+    const adminErp = getAdminClient();
+    await installItemCustomFields(adminErp);
+    // Allow negative stock so first-sale-of-new-item flows don't block.
+    await ensureAllowNegativeStock(adminErp);
+  } catch (err) {
+    console.error('[instrumentation] boot hooks failed:', err.message);
+  }
 }

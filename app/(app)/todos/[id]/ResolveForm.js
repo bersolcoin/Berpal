@@ -13,6 +13,7 @@
  * back to /todos (the row will be gone from the list).
  */
 
+import { friendlyItemCode } from '../../_components/format';
 import { useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Plus, Trash } from '@phosphor-icons/react';
@@ -48,7 +49,7 @@ function fmt(n) {
   return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
 }
 
-export default function ResolveForm({ todoId, kind, payload, wallets, suppliers = [], defaultCurrency, reportingCurrency }) {
+export default function ResolveForm({ todoId, kind, payload, wallets, suppliers = [], defaultCurrency, reportingCurrency, abbr = null }) {
   const router = useRouter();
 
   const [branch, setBranch] = useState('');
@@ -227,7 +228,7 @@ export default function ResolveForm({ todoId, kind, payload, wallets, suppliers 
         <div className="text-xs text-slate-500 grid grid-cols-2 sm:grid-cols-4 gap-3 pb-3 border-b border-slate-100">
           <div>
             <div className="uppercase tracking-wide text-[10px]">Item</div>
-            <div className="text-sm text-slate-800 truncate">{payload.item_name || payload.item_code || '—'}</div>
+            <div className="text-sm text-slate-800 truncate">{payload.item_name || friendlyItemCode(payload.item_code, abbr) || '—'}</div>
           </div>
           <div>
             <div className="uppercase tracking-wide text-[10px]">Sold to</div>

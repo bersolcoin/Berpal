@@ -43,7 +43,7 @@ export default function DeleteButton({ doctype, name }) {
       <button
         type="button"
         onClick={() => setConfirming(true)}
-        className="inline-flex items-center gap-1.5 text-sm text-red-700 hover:text-red-900 hover:bg-red-50 px-3 py-1.5 rounded-md border border-red-200 transition"
+        className="inline-flex items-center gap-1.5 h-10 px-3 text-sm text-red-700 hover:text-red-900 hover:bg-red-50 rounded-lg border border-red-200 bg-white transition"
       >
         <Trash size={14} weight="regular" />
         Delete

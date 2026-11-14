@@ -12,6 +12,7 @@ import Empty from '../_components/Empty';
 import TransactionsTable from '../_components/TransactionsTable';
 import Pagination from '../_components/Pagination';
 import TransactionFilters from './TransactionFilters';
+import NewTransactionMenu from './NewTransactionMenu';
 
 export const dynamic = 'force-dynamic';
 
@@ -57,6 +58,7 @@ export default async function TransactionsPage({ searchParams }) {
       <PageHeader
         title="Transactions"
         subtitle="All invoices, purchases, payments and journal entries — newest first."
+        right={<NewTransactionMenu />}
       />
 
       <TransactionFilters />
@@ -74,7 +76,7 @@ export default async function TransactionsPage({ searchParams }) {
             }
           />
         ) : (
-          <TransactionsTable rows={pageResult.rows} defaultCurrency={user.default_currency} />
+          <TransactionsTable rows={pageResult.rows} defaultCurrency={user.default_currency} abbr={user.erpnext_company_abbr} />
         )}
 
         <Pagination

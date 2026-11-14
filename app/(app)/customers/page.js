@@ -19,7 +19,7 @@ export default async function CustomersPage() {
 
   return (
     <>
-      <PageHeader
+      <PageHeader back="/contacts" backLabel="Back to Contacts"
         title="Customers"
         subtitle="People who owe you money. Customers with open invoices appear first."
       />

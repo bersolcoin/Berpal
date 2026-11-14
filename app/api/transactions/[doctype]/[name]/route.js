@@ -64,7 +64,7 @@ export async function DELETE(_request, { params }) {
   // cancellation hooks that handle GL Entry cleanup).
   if (doc.docstatus === 1) {
     try {
-      await erp.callMethod('frappe.client.cancel', { doctype, name });
+      await erp.callMethodPost('frappe.client.cancel', { doctype, name });
     } catch (err) {
       console.error(`[txn-delete] cancel failed for ${doctype}/${name}:`, err.message);
       return Response.json(
@@ -78,6 +78,14 @@ export async function DELETE(_request, { params }) {
   try {
     await erp.deleteResource(doctype, name);
   } catch (err) {
+    // ERPNext v16 keeps a cancelled voucher's (reversed) GL Entries as an
+    // audit trail and refuses to delete the voucher itself. Cancelled is
+    // the end state then — its effect on the books is gone and lists hide
+    // docstatus=2 — so report success.
+    if (/LinkExistsError/.test(err.message) && /GL Entry/.test(err.message)) {
+      console.log(`[txn-delete] user_id=${sess.user_id} cancelled ${doctype}/${name} (kept as cancelled — GL audit trail)`);
+      return Response.json({ ok: true, cancelled: true });
+    }
     console.error(`[txn-delete] delete failed for ${doctype}/${name}:`, err.message);
     return Response.json(
       { ok: false, error: `Could not delete: ${err.message}` },

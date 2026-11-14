@@ -8,7 +8,7 @@
  * (so users can't navigate to /inventory/<other-tenant-item-code> directly).
  */
 
-const { getCompanyItemGroupName } = require('../erp-sync/item-group');
+const { isTenantItemGroup } = require('../erp-sync/item-group');
 
 async function getItemDetail(user, erp, { itemCode } = {}) {
   if (!itemCode) throw new Error('itemCode required');
@@ -23,19 +23,19 @@ async function getItemDetail(user, erp, { itemCode } = {}) {
   }
 
   // Soft tenant boundary: refuse items outside the user's group.
-  const expectedGroup = getCompanyItemGroupName(user?.erpnext_company_abbr);
-  if (expectedGroup && item.item_group !== expectedGroup) {
+  const abbr = user?.erpnext_company_abbr;
+  if (abbr && !isTenantItemGroup(abbr, item.item_group)) {
     return null;
   }
 
   const isStock = !!item.is_stock_item;
 
-  const [bins, movements, salesAppearances, purchaseAppearances] = await Promise.all([
+  const [bins, movements, salesAppearances, purchaseAppearances, prices] = await Promise.all([
     isStock
       ? erp
           .listResource('Bin', {
             filters: [['item_code', '=', itemCode]],
-            fields: ['warehouse', 'actual_qty', 'stock_uom', 'projected_qty', 'reserved_qty', 'ordered_qty'],
+            fields: ['warehouse', 'actual_qty', 'stock_uom', 'projected_qty', 'reserved_qty', 'ordered_qty', 'stock_value'],
             limit: 100,
           })
           .then((r) => r.data || [])
@@ -79,13 +79,35 @@ async function getItemDetail(user, erp, { itemCode } = {}) {
       })
       .then((r) => r.data || [])
       .catch(() => []),
+    erp
+      .listResource('Item Price', {
+        filters: [['item_code', '=', itemCode], ['selling', '=', 1]],
+        fields: ['price_list', 'price_list_rate', 'currency'],
+        limit: 10,
+      })
+      .then((r) => r.data || [])
+      .catch(() => []),
   ]);
 
   const totalStock = isStock
     ? bins.reduce((s, b) => s + (Number(b.actual_qty) || 0), 0)
     : null;
 
+  const stockValue = bins.reduce((s, b) => s + (Number(b.stock_value) || 0), 0);
+  let media = {};
+  try {
+    media = item.media ? JSON.parse(item.media) : {};
+  } catch {
+    /* ignore malformed media JSON */
+  }
+
   return {
+    // Full Item doc — catalog attributes (gem_type, weight_ct, shape…) live here.
+    doc: item,
+    media,
+    stock_value: stockValue,
+    cost_rate: totalStock ? stockValue / totalStock : 0,
+    selling_prices: prices.map((p) => ({ price_list: p.price_list, rate: Number(p.price_list_rate) || 0, currency: p.currency })),
     erpnext_name: item.name,
     item_code: item.item_code,
     item_name: item.item_name,

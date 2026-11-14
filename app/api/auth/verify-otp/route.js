@@ -1,13 +1,14 @@
 /**
  * POST /api/auth/verify-otp
  * Body: { phone, code }
- * On success: sets a session cookie; returns whether the user is provisioned
- * (existing user → ready) or new (→ /onboarding).
+ * On success: sets a session cookie (the phone = the signed-in person) and
+ * opens their last-used business; a person with no business yet goes to
+ * /onboarding.
  */
 
 const { verifyOtp } = require('../../../../src/auth/otp');
 const { getSession } = require('../../../../src/auth/session');
-const { query } = require('../../../../src/db');
+const { ensurePerson, pickBusiness } = require('../../../../src/auth/business');
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -40,25 +41,21 @@ export async function POST(request) {
     return Response.json(result, { status: 401 });
   }
 
-  // Look up user — they may or may not be provisioned yet.
-  const u = await query(
-    `SELECT id, phone, display_name, erpnext_company FROM users WHERE phone = $1`,
-    [phone]
-  );
-  const userRow = u.rows[0] || null;
+  // The person (created on first sign-in) and the business to open.
+  const person = await ensurePerson(phone, { login: true });
+  const businessId = await pickBusiness(phone);
 
-  // Set session. If user is provisioned, link to their id. If not yet, stash
-  // the phone so the onboarding endpoint can complete provisioning under it.
-  // For un-onboarded users, also stamp onboarding_started_at — the
-  // /onboarding page enforces a 30-minute window before forcing re-login.
+  // Set session. With a business: open it. Without: onboarding, which
+  // provisions under this phone; stamp onboarding_started_at — /onboarding
+  // enforces a 30-minute window before forcing re-login.
   const sess = await getSession();
   sess.phone = phone;
-  if (userRow && userRow.erpnext_company) {
-    sess.user_id = userRow.id;
+  if (businessId) {
+    sess.user_id = businessId;
     sess.onboarded = true;
     delete sess.onboarding_started_at;
   } else {
-    sess.user_id = userRow ? userRow.id : null;
+    sess.user_id = null;
     sess.onboarded = false;
     sess.onboarding_started_at = new Date().toISOString();
   }
@@ -66,7 +63,7 @@ export async function POST(request) {
 
   return Response.json({
     ok: true,
-    onboarded: !!(userRow && userRow.erpnext_company),
-    display_name: userRow?.display_name || null,
+    onboarded: !!businessId,
+    display_name: person?.display_name || null,
   });
 }

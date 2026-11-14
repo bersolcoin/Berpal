@@ -120,6 +120,14 @@ class ErpNextClient {
     return this._fetch('GET', `/api/method/${methodPath}${qs ? '?' + qs : ''}`);
   }
 
+  /**
+   * POST form of callMethod — required for methods that mutate (Frappe
+   * rejects e.g. frappe.client.cancel over GET with "Not permitted").
+   */
+  callMethodPost(methodPath, args = {}) {
+    return this._fetch('POST', `/api/method/${methodPath}`, args);
+  }
+
   // ── Convenience wrappers (most-used doctypes) ──────────────────────
 
   getMe() {
@@ -174,13 +182,27 @@ class ErpNextClient {
     return this.createResource('Account', payload);
   }
 
-  /** Get the balance on an Account as of a given date (default today). */
-  getAccountBalance(accountName, date = null) {
-    return this.callMethod('erpnext.accounts.utils.get_balance_on', {
-      account: accountName,
-      date: date || new Date().toISOString().slice(0, 10),
-      company: this.company,
+  /**
+   * Balance (debit − credit, in the account's own currency) on an Account as
+   * of a date (default today). Summed from GL Entry because ERPNext v16 no
+   * longer whitelists erpnext.accounts.utils.get_balance_on over REST.
+   * v16 aggregate syntax: fields [{ SUM: <field>, as: <alias> }].
+   */
+  async getAccountBalance(accountName, date = null) {
+    const r = await this.listResource('GL Entry', {
+      filters: [
+        ['account', '=', accountName],
+        ['is_cancelled', '=', 0],
+        ['posting_date', '<=', date || new Date().toISOString().slice(0, 10)],
+      ],
+      fields: [
+        { SUM: 'debit_in_account_currency', as: 'dr' },
+        { SUM: 'credit_in_account_currency', as: 'cr' },
+      ],
+      limit: 0,
     });
+    const row = r.data?.[0] || {};
+    return (Number(row.dr) || 0) - (Number(row.cr) || 0);
   }
 
   // Invoices / Payments / Journal — created later as we wire each tool

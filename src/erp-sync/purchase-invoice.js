@@ -16,13 +16,14 @@
  */
 
 const { resolveOrCreateSupplier } = require('./supplier');
-const { ensureGenericPurchaseItem } = require('./item');
+const { ensureGenericPurchaseItem, resolveItem } = require('./item');
 const { resolveErpAccount } = require('./account');
 const { resolvePartyAccount } = require('./party-account');
 const { ts } = require('../log');
 const { query } = require('../db');
 const { proposeLink } = require('../links/linked-transactions');
 const paymentEntry = require('./payment-entry');
+const { getDefaultWarehouseForUser } = require('./stock');
 
 async function save(user, erp, draft) {
   if (!draft.counterparty_name) {
@@ -34,7 +35,40 @@ async function save(user, erp, draft) {
     email: draft.counterparty_email,
   });
 
-  const itemCode = await ensureGenericPurchaseItem(user, erp);
+  // Build PI line items — same pattern as sales-invoice.js. For
+  // product/both: resolve real per-SKU Items (NEW_ITEM/AMBIGUOUS_ITEM
+  // bubble up). Service or legacy single-line: GEN-PURCHASE fallback.
+  const bt = user.business_type;
+  const requireRealItems = bt === 'product' || bt === 'both';
+  let piLineItems;
+  if (Array.isArray(draft.items) && draft.items.length > 0) {
+    piLineItems = [];
+    for (const line of draft.items) {
+      if (!line?.item_code) {
+        return { ok: false, error: 'item line missing item_code' };
+      }
+      const hit = await resolveItem(user, erp, {
+        code: line.item_code,
+        description: line.description || null,
+      });
+      piLineItems.push({
+        resolved_item: hit.erpnext_name,
+        qty: Number(line.qty) || 1,
+        rate: Number(line.rate) || 0,
+        description: line.description || hit.item_name || line.item_code,
+      });
+    }
+  } else if (requireRealItems) {
+    return { ok: false, error: 'product/both business_type requires draft.items[]' };
+  } else {
+    const genericCode = await ensureGenericPurchaseItem(user, erp);
+    piLineItems = [{
+      resolved_item: genericCode,
+      qty: 1,
+      rate: Number(draft.amount) || 0,
+      description: draft.description || `${supplierName} bill`,
+    }];
+  }
 
   // Resolve expense account from category_code (5900 → 5223 - Misc Expenses - TTC etc.)
   const expenseAccount = await resolveErpAccount(
@@ -53,6 +87,13 @@ async function save(user, erp, draft) {
   }
   if (!dueDate) dueDate = postingDate;
 
+  // Product/both tenants buy stock Items: receive them into the tenant's
+  // Stores warehouse on the same document (update_stock), so /inventory
+  // reflects the purchase. Stock lines then post to the warehouse's stock
+  // account via perpetual inventory — no expense_account on those lines.
+  const warehouse = requireRealItems ? getDefaultWarehouseForUser(user) : null;
+  const updateStock = !!(warehouse && Array.isArray(draft.items) && draft.items.length > 0);
+
   const billPayload = {
     supplier: supplierName,
     posting_date: postingDate,
@@ -60,20 +101,21 @@ async function save(user, erp, draft) {
     bill_no: draft.invoice_number || undefined,
     bill_date: draft.invoice_number ? postingDate : undefined,
     currency: draft.currency,
-    items: [
-      {
-        item_code: itemCode,
-        qty: 1,
-        rate: draft.amount,
-        description: draft.description || `${supplierName} bill`,
-        // delivered_by_supplier=0 sidesteps an unguarded getattr in
-        // erpnext.controllers.accounts_controller.is_drop_ship which trips
-        // on some ERPNext versions. Safe to send; ERPNext ignores unknown
-        // fields when they ARE recognized.
-        delivered_by_supplier: 0,
-        ...(expenseAccount ? { expense_account: expenseAccount } : {}),
-      },
-    ],
+    items: piLineItems.map((l) => ({
+      item_code: l.resolved_item,
+      qty: l.qty,
+      rate: l.rate,
+      description: l.description,
+      // delivered_by_supplier=0 sidesteps an unguarded getattr in
+      // erpnext.controllers.accounts_controller.is_drop_ship which trips
+      // on some ERPNext versions. Safe to send.
+      delivered_by_supplier: 0,
+      ...(updateStock
+        ? { warehouse }
+        : expenseAccount ? { expense_account: expenseAccount } : {}),
+    })),
+    ...(updateStock ? { update_stock: 1, set_warehouse: warehouse } : {}),
+    ...(draft.description ? { remarks: draft.description } : {}),
     docstatus: 1, // submit on create
   };
 
@@ -158,6 +200,7 @@ async function save(user, erp, draft) {
         counterparty_name: draft.counterparty_name,
         payment_account_code: draft.payment_account_code,
         wallet_name: draft.wallet_name || null,
+        wallet_account: draft.wallet_account || null,
         parent_invoice_ref: erpName,
         transaction_date: draft.transaction_date,
         payment_reference: draft.payment_reference || null,

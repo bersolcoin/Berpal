@@ -10,6 +10,7 @@ const { validateDraft: validateDraftServer } = require('./erp-sync/validate');
 const { resolveOrCreateCustomer } = require('./erp-sync/customer');
 const { resolveOrCreateSupplier } = require('./erp-sync/supplier');
 const { resolveWalletAccount } = require('./erp-sync/wallet');
+const { resolveItem, createItem, lookupItemByAttributes } = require('./erp-sync/item');
 const { resolveErpAccount } = require('./erp-sync/account');
 const { recordOpeningBalance } = require('./erp-sync/opening-balance');
 const { linkCounterparty } = require('./links/counterparty-match');
@@ -150,7 +151,22 @@ const TOOLS = [
           },
           description: {
             type: 'string',
-            description: 'Free-text memo describing what the transaction was for.',
+            description: 'Free-text memo describing what the transaction was for. For cash transactions and single-line invoices without per-item detail. For multi-line invoices use items[] instead.',
+          },
+          items: {
+            type: 'array',
+            description: 'PRODUCT/STOCK transactions (invoice_issued / bill_received for product/both business_type) — one entry per line. Single-item sales should also use this array (length=1). For each item supply item_code (user\'s SKU, verbatim), qty (count or weight depending on the item\'s unit_type — server reconciles), rate (price per unit), and weight_ct when the user mentions weight on a per-piece sale (e.g. "1.05ct paraiba pa2293 to Mike for 1000$" → items=[{item_code:"pa2293", qty:1, rate:1000, weight_ct:1.05}]). Multi-line example: "sold 1.05ct paraiba pa2293 and 0.8ct ruby rb007 to Mike total 1500$" → items=[{item_code:"pa2293", qty:1, rate:1000, weight_ct:1.05},{item_code:"rb007", qty:1, rate:500, weight_ct:0.8}]. When user gives only a single total without per-line rates, distribute reasonably or ask. amount (top-level) should equal sum(qty*rate); the server validates.',
+            items: {
+              type: 'object',
+              properties: {
+                item_code: { type: 'string', description: 'User\'s SKU verbatim (e.g. "pa2293"). REQUIRED for product/both business_type sales.' },
+                qty: { type: 'number', description: 'For piece-type items: count of stones (usually 1 per line). For weight-type items: total carats. Default 1 if user said "a stone" / didn\'t mention qty.' },
+                rate: { type: 'number', description: 'Price per qty unit. For a "sold pa2293 for $1000" with qty=1 → rate=1000.' },
+                weight_ct: { type: 'number', description: 'Carat weight of the stone on this line. Capture when the user mentions it ("1.05ct"); written to the SI line for receipts/reports.' },
+                description: { type: 'string', description: 'Optional line memo.' },
+              },
+              required: ['item_code'],
+            },
           },
           tax_amount: { type: 'number' },
           tax_rate: { type: 'number', description: 'Tax rate as a percentage, e.g. 7 for 7%.' },
@@ -436,6 +452,83 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'create_item',
+      description:
+        'STANDALONE: create a new Item (product/service) in ERPNext WITHOUT logging a transaction. Use when (a) the user explicitly asks ("add item pa2293", "create new product Sapphire 1ct"), OR (b) the user has provided enough detail to bring a previously-unknown item into existence so the next save_transaction can reference it (e.g. after a save_transaction returned new_item error). is_stock_item and stock_uom are decided server-side from business_type and unit_type — do NOT pass uom unless override is intentional. Returns the created item_code. Industry-specific attributes (gem_type, weight_ct, color, origin, etc.) go in the `attributes` object — the server tells you which are required for this user\'s industry.',
+      parameters: {
+        type: 'object',
+        required: ['item_code'],
+        properties: {
+          item_code: {
+            type: 'string',
+            description: 'User\'s reference code/SKU — typed verbatim ("pa2293", "rb-007"). The server suffixes per tenant.',
+          },
+          item_name: {
+            type: 'string',
+            description: 'Optional friendly name. Defaults to item_code if not provided.',
+          },
+          description: {
+            type: 'string',
+            description: 'Optional longer description. Default: item_name.',
+          },
+          unit_type: {
+            type: 'string',
+            enum: ['piece', 'weight'],
+            description: 'How this item is sold/inventoried. "piece" = one stock unit per physical thing (stock_uom=Nos; each gem-stone or each garment). "weight" = sold by weight (stock_uom=Ct for gems, Kg for spices, etc.); qty on a sale line equals total weight sold. Default is "piece" for single-item cases; ASK when ambiguous (parcels, bulk).',
+          },
+          uom: {
+            type: 'string',
+            description: 'Optional override of the unit-of-measure. Server picks "Nos" for unit_type=piece, "Ct" for unit_type=weight (gemstone industry). Only set if user explicitly says something else ("Kg", "Lt", "Hour").',
+          },
+          attributes: {
+            type: 'object',
+            description: 'Industry-specific fields. For gemstones: gem_type ("Sapphire"|"Ruby"|"Emerald"|"Diamond"|"Paraiba"|"Spinel"|"Tourmaline"|"Tanzanite"|"Aquamarine"|"Other"), weight_ct (number — required for piece-type), color (string), origin (string), shape ("Round"|"Oval"|"Cushion"|"Pear"|"Princess"|"Emerald Cut"|"Heart"|"Marquise"|"Rough"|"Other"), treatment ("Heated"|"Unheated"|"Oiled"|"Diffused"|"None"|"Unknown"). The server tells you exactly which are required when it returns needs_user_input.',
+            properties: {
+              gem_type: { type: 'string' },
+              weight_ct: { type: 'number' },
+              color: { type: 'string' },
+              origin: { type: 'string' },
+              shape: { type: 'string' },
+              treatment: { type: 'string' },
+            },
+          },
+          opening_qty: {
+            type: 'number',
+            description: 'For stock items only: how many of this item the user has on hand RIGHT NOW. For unit_type=piece, this is a count. For unit_type=weight, this is total weight on hand. Pass 0 (or omit + opening_qty_skipped=true) if user says "none"/"skip"/"later". When > 0 and the item is stock-tracked, the server posts a Stock Reconciliation.',
+          },
+          opening_qty_skipped: {
+            type: 'boolean',
+            description: 'Set true when user explicitly says skip/none/later for the opening-qty ask.',
+          },
+          unit_cost_basis: {
+            type: 'number',
+            description: 'Optional. When opening_qty > 0, the valuation rate (cost per unit) for the Stock Reconciliation. Skip if user doesn\'t know — server defaults to 0 and the unknown_item_purchase todo handles cost later.',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'lookup_item',
+      description:
+        'STANDALONE: search the user\'s Item catalog. Use when (a) the user asks about an item ("do I have any pa2293?", "what items do I sell?"), or (b) before a save_transaction when you\'re unsure if a referenced SKU exists. Returns 0 / 1 / many matches; on many, ASK the user which one before proceeding.',
+      parameters: {
+        type: 'object',
+        required: ['search_term'],
+        properties: {
+          search_term: {
+            type: 'string',
+            description: 'What to search for — item code or name fragment. Free-form ("pa2293", "sapphire", "ruby 1ct").',
+          },
+        },
+      },
+    },
+  },
 ];
 
 // Static categorization hint — replaces the old query against the dropped chart_of_accounts table.
@@ -505,6 +598,17 @@ WRITES (state-changing):
   Extract: name, party_type ("Customer" | "Supplier" | "Both"), phone (E.164), email, default_currency.
   vCard arrives standalone → still use this function.
 
+• create_item — user wants to ADD a product/item to their catalog. Use this when:
+  (a) user explicitly asks ("add item pa2293", "create new product Sapphire 1ct", "register new SKU"), OR
+  (b) a prior save_transaction returned new_item error (item didn't exist) — gather the missing details from the user, then call this, then re-try save_transaction.
+  Extract: item_code (SKU verbatim), item_name, description, uom (default "Nos"; use "Ct" for carats), opening_qty (how many on hand RIGHT NOW), unit_cost_basis (optional). is_stock_item is decided server-side — never pass it.
+  Service-business users get a record-keeping item; product/both users get stock-tracked.
+
+• lookup_item — search the user's item catalog. Use when:
+  (a) user asks about items ("do I have pa2293?", "what items do I sell?", "search 'sapphire'"), OR
+  (b) before save_transaction when you're unsure if a referenced SKU exists.
+  Returns count + matches. On 0 → call create_item (after asking the user for details). On many → list candidates and ask the user which one.
+
 • update_draft — user is DESCRIBING a transaction. Stages fields onto a draft. Cover:
 
   KEY DECISION — named counterparty changes the type:
@@ -518,6 +622,20 @@ WRITES (state-changing):
   - Payment received (settling a PRIOR invoice): "Acme paid me 500", "received 500 from Acme for the invoice" → transaction_type='payment', direction='income'. Use query_open_invoices first to find which SI to settle.
   - Payment made (settling a PRIOR bill): "I paid Acme 500", "sent Acme the 500 for the bill" → transaction_type='payment', direction='expense'. query_open_invoices first.
   - Rate override / corrections: any time the user adjusts a field on the current draft.
+
+  MULTI-ITEM SALES & PURCHASES (product/both business_type only):
+    For invoice_issued / bill_received transactions involving real SKUs, populate the items[] array — one entry per stone/lot/line. Single-line sales also use items[] (length=1). Examples:
+    - "sold 1.05ct paraiba pa2293 to Mike for 1000$" → items=[{item_code:"pa2293", qty:1, rate:1000, weight_ct:1.05}], amount=1000.
+    - "sold 1.05ct paraiba pa2293 AND 0.8ct ruby rb007 to Mike for 1500$ net 30" → items=[{item_code:"pa2293", qty:1, rate:?, weight_ct:1.05},{item_code:"rb007", qty:1, rate:?, weight_ct:0.8}], amount=1500. Per-line rates may be unknown; set them when the user gives them per-line, otherwise leave qty=1 and let the user's total drive amount.
+    - "bought parcel pa-rough100 50ct for 8000$ from Acme paid cash" → items=[{item_code:"pa-rough100", qty:50, rate:160}], amount=8000.
+    - "sold pa2293 to Mike for 1000$" (no weight in message) → items=[{item_code:"pa2293", qty:1, rate:1000}]. Don't invent a weight_ct — the Item carries it.
+    SKU extraction rules: a lowercase/alphanumeric short token next to a count or weight is usually the SKU ("pa2293", "rb007", "pa-rough100"). DO NOT invent SKUs.
+
+    NO-SKU CASE — disambiguate before update_draft: if the user describes an item by attributes only ("sold 1.05ct paraiba to Mike", "sold a 0.8ct ruby"), DO NOT pass that description as an item_code. Instead:
+      1. Call lookup_item({ search_term: "<the attribute description verbatim>" }) FIRST. The server parses weight + gem_type and searches by Item Custom Fields, returning candidates.
+      2. If count=1: use that item_code in items[] and proceed.
+      3. If count>1: list the matches to the user ("Is this pa2293 or pa2294?") and wait for their pick before update_draft.
+      4. If count=0: ask the user for the SKU. If they say "new" / "add it" / "create one", trigger create_item with the parsed attributes pre-populated.
   Extract whatever fields are in the message; the server's validation result tells you what's still needed.
 
 • request_confirmation — call ONLY when an update_draft response shows ready_to_confirm=true. The server gates this; don't decide on your own.
@@ -659,6 +777,7 @@ SUCCESS REPLIES — ONLY after a function returned ok:true:
 • Cash JE saved:                   "Saved ✓\\nRef: <erpnext_name>"
 • Wallet created:                  "Added <wallet_name> <currency> <type> ✓" (+ "(opening balance N CCY)" if a JE was booked)
 • Counterparty created:            "Added <name> as a <currency> <party_type> ✓ (<phone if any>)"
+• Item created:                    "Added <item_code> ✓" (+ "(opening qty N <uom>)" if a Stock Reconciliation was booked)
 
 CHITCHAT (no function called):
 • Greeting → "Hey! I help log transactions and answer questions about your books. What would you like to do?"
@@ -795,6 +914,7 @@ function validateDraft(draft) {
 const STANDALONE_TOOLS_WITH_PENDING = {
   create_wallet: { identifier: 'wallet_name' },
   create_counterparty: { identifier: 'name' },
+  create_item: { identifier: 'item_code' },
 };
 
 /**
@@ -1233,6 +1353,30 @@ async function _runTool(toolName, args, ctx) {
               search_term: ctx.draft.counterparty_name || '',
               candidates: err.candidates.map((c) => c.name),
             },
+          };
+        }
+        if (err.code === 'AMBIGUOUS_ITEM') {
+          return {
+            ok: false,
+            error: err.message,
+            ambiguous_item: {
+              candidates: err.candidates,
+            },
+          };
+        }
+        if (err.code === 'NEW_ITEM') {
+          // The user referenced an item that doesn't exist yet. Ask the LLM
+          // to call create_item with the user-supplied code/description
+          // plus any details still needed for the industry.
+          return {
+            ok: false,
+            error: err.message,
+            new_item: {
+              suggested_code: err.suggested_code,
+              suggested_description: err.suggested_description,
+            },
+            instruction:
+              'The item does not exist yet. Ask the user for the missing details (gem type, weight, etc.), then call create_item with item_code + attributes, then re-attempt save_transaction.',
           };
         }
         return { ok: false, error: `Save failed: ${err.message}` };
@@ -1701,6 +1845,216 @@ async function _runTool(toolName, args, ctx) {
       }
     }
 
+    case 'lookup_item': {
+      const term = args?.search_term;
+      if (!term) return { ok: false, error: 'lookup_item needs search_term' };
+      try {
+        const erp = erpnext.forUser(ctx.user);
+
+        // First pass: attribute-aware search (parses weight + gem_type
+        // out of the term and queries by Item Custom Fields). Catches the
+        // "1.05ct paraiba" case where there's no SKU but the user has
+        // stated identifying attributes.
+        const attrHit = await lookupItemByAttributes(ctx.user, erp, term);
+        if (attrHit.count > 0) {
+          console.log(`• [conversation] [${ts()}] tool=lookup_item term="${term}" parsed=${JSON.stringify(attrHit.parsed)} → ${attrHit.count} attr match(es)`);
+          if (attrHit.count === 1) {
+            return { ok: true, found: true, count: 1, item: attrHit.candidates[0], parsed: attrHit.parsed };
+          }
+          return { ok: true, found: true, count: attrHit.count, candidates: attrHit.candidates, parsed: attrHit.parsed };
+        }
+
+        // Fallback: exact / code+name fuzzy (resolveItem).
+        const hit = await resolveItem(ctx.user, erp, { code: term, description: term });
+        console.log(`• [conversation] [${ts()}] tool=lookup_item term="${term}" → ${hit.erpnext_name} (code/name match)`);
+        return { ok: true, found: true, count: 1, item: hit };
+      } catch (err) {
+        if (err.code === 'AMBIGUOUS_ITEM') {
+          console.log(`• [conversation] [${ts()}] tool=lookup_item term="${term}" → ${err.candidates.length} matches`);
+          return {
+            ok: true,
+            found: true,
+            count: err.candidates.length,
+            candidates: err.candidates,
+          };
+        }
+        if (err.code === 'NEW_ITEM') {
+          console.log(`• [conversation] [${ts()}] tool=lookup_item term="${term}" → no match`);
+          return { ok: true, found: false, count: 0 };
+        }
+        console.error('[conversation] lookup_item error:', err.message);
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case 'create_item': {
+      try {
+        const erp = erpnext.forUser(ctx.user);
+        const code = args?.item_code ? String(args.item_code).trim() : null;
+        const itemName = args?.item_name ? String(args.item_name).trim() : null;
+        const description = args?.description ? String(args.description).trim() : null;
+        const unitTypeRaw = args?.unit_type ? String(args.unit_type).trim().toLowerCase() : null;
+        const attributes = (args?.attributes && typeof args.attributes === 'object') ? args.attributes : {};
+        const openingQty =
+          typeof args?.opening_qty === 'number' ? args.opening_qty : null;
+        const openingSkipped = args?.opening_qty_skipped === true;
+        const unitCostBasis =
+          typeof args?.unit_cost_basis === 'number' ? args.unit_cost_basis : null;
+
+        // is_stock_item from business_type (server-decides; not user-controllable).
+        // product / both → stock-tracked; service → record-keeping only.
+        const bt = ctx.user.business_type;
+        const isStockItem = bt === 'product' || bt === 'both';
+
+        // Load industry attribute schema (gemstones, …). Empty for users
+        // without a configured industry — they get the legacy minimal path.
+        const { loadIndustrySchema } = require('./erp-sync/item-custom-fields');
+        const industry = ctx.user.industry || null;
+        const schema = industry ? await loadIndustrySchema(industry) : [];
+
+        // Unit-type → stock_uom. piece = Nos. weight = Ct for gems (and
+        // any industry whose "weight" semantic is carats; we'll add a
+        // per-industry default UoM later when needed). Explicit args.uom
+        // overrides if provided.
+        let unitType = unitTypeRaw;
+        const uom =
+          (args?.uom && String(args.uom).trim()) ||
+          (unitType === 'weight' && industry === 'gemstones' ? 'Ct' : 'Nos');
+
+        // Batch missing — code, unit_type (when ambiguous), industry-required
+        // attributes, opening_qty.
+        const missing = [];
+        if (!code) {
+          missing.push({
+            field: 'item_code',
+            short: 'the SKU/code',
+            full: 'What\'s the code for this item? (e.g. "pa2293")',
+          });
+        }
+        // unit_type prompt: only when the industry has weight-vs-piece
+        // semantics (gemstones for now). Default to 'piece' if the user
+        // already told us a weight_ct AND opening_qty<=1 — that pattern
+        // signals "one stone with this weight" not "a parcel".
+        if (!unitType && isStockItem && industry === 'gemstones') {
+          const hasWeight = typeof attributes.weight_ct === 'number' && attributes.weight_ct > 0;
+          if (hasWeight && (openingQty === null || openingQty <= 1)) {
+            unitType = 'piece';
+          } else {
+            missing.push({
+              field: 'unit_type',
+              short: 'whether it\'s a single stone or a parcel sold by weight',
+              full: `Is ${code || 'this item'} a single stone (sold per piece) or a parcel sold by weight? Reply "piece" or "weight".`,
+            });
+          }
+        }
+        // Industry-required attributes. weight_ct is only required for
+        // piece-type — for weight-type the line qty IS the weight, no
+        // separate attr needed.
+        for (const def of schema) {
+          if (!def.required) continue;
+          if (def.field_key === 'weight_ct' && unitType === 'weight') continue;
+          const v = attributes[def.field_key];
+          const isMissing =
+            v === undefined || v === null || v === '' ||
+            (def.field_type === 'float' && (typeof v !== 'number' || Number.isNaN(v)));
+          if (!isMissing) continue;
+          let askFull;
+          if (def.field_type === 'select' && Array.isArray(def.options)) {
+            askFull = `What's the ${def.field_label.toLowerCase()} for ${code || 'this item'}? (e.g. ${def.options.slice(0, 4).join(', ')})`;
+          } else if (def.field_type === 'float') {
+            askFull = `What's the ${def.field_label.toLowerCase()} for ${code || 'this item'}?`;
+          } else {
+            askFull = `What's the ${def.field_label.toLowerCase()} for ${code || 'this item'}?`;
+          }
+          missing.push({
+            field: def.field_key,
+            short: def.field_label.toLowerCase(),
+            full: askFull,
+          });
+        }
+        // opening_qty — for piece-type single stones we can default to 1;
+        // for weight-type and ambiguous cases, ask.
+        if (isStockItem && openingQty === null && !openingSkipped) {
+          if (unitType === 'piece' && typeof attributes.weight_ct === 'number') {
+            // Single stone implied — default opening to 1, no ask.
+          } else {
+            missing.push({
+              field: 'opening_qty',
+              short: 'how much you have on hand now (or "skip" / "0" if none yet)',
+              full: `How ${unitType === 'weight' ? 'many carats' : 'many'} of ${code || 'this item'} do you have on hand right now? Reply 0 or "skip" if none yet.`,
+            });
+          }
+        }
+        if (missing.length > 0) {
+          let batched;
+          if (missing.length === 1) {
+            batched = missing[0].full;
+          } else {
+            const last = missing[missing.length - 1].short;
+            const head = missing.slice(0, -1).map((m) => m.short).join(', ');
+            batched = `Sure — I just need ${head} and ${last}.`;
+          }
+          return {
+            ok: false,
+            error: `create_item needs: ${missing.map((m) => m.field).join(', ')}`,
+            needs_user_input: {
+              missing_fields: missing.map((m) => m.field),
+              ask_user: batched,
+            },
+          };
+        }
+
+        // Default opening_qty for piece-type single stones.
+        const finalOpeningQty =
+          openingQty !== null ? openingQty :
+          (unitType === 'piece' && typeof attributes.weight_ct === 'number') ? 1 :
+          null;
+
+        const created = await createItem(ctx.user, erp, {
+          code,
+          name: itemName,
+          description,
+          uom,
+          isStockItem,
+          attributes,
+        });
+        console.log(`• [conversation] [${ts()}] tool=create_item code="${code}" unit_type=${unitType || 'n/a'} stock=${isStockItem ? 1 : 0} uom=${uom} opening_qty=${finalOpeningQty ?? 'skip'} → ${created.erpnext_name}`);
+
+        // Opening stock reconciliation — post the starting on-hand qty
+        // + valuation rate. Non-fatal if it fails: the Item already
+        // exists and the user can backfill via the unknown_item_purchase
+        // todo (whose open_stock branch also posts an SR).
+        let openingStockEntry = null;
+        if (isStockItem && finalOpeningQty && finalOpeningQty > 0) {
+          try {
+            const { postOpeningStockReconciliation } = require('./erp-sync/stock');
+            openingStockEntry = await postOpeningStockReconciliation(ctx.user, erp, {
+              itemCode: created.item_code,
+              qty: finalOpeningQty,
+              valuationRate: unitCostBasis || 0,
+            });
+          } catch (srErr) {
+            console.warn(`• [item] [${ts()}]   opening SR failed for ${created.item_code}: ${srErr.message}`);
+          }
+        }
+
+        return {
+          ok: true,
+          erpnext_name: created.erpnext_name,
+          item_code: created.item_code,
+          is_stock_item: isStockItem,
+          unit_type: unitType || null,
+          uom,
+          opening_qty: finalOpeningQty || 0,
+          opening_stock_entry: openingStockEntry,
+          attributes: attributes,
+        };
+      } catch (err) {
+        console.error('[conversation] create_item error:', err.message);
+        return { ok: false, error: err.message };
+      }
+    }
+
     default:
       return { ok: false, error: `Unknown tool: ${toolName}` };
   }
@@ -1755,6 +2109,10 @@ async function handle(user, userMessage) {
     /\b(add|create|new|save)\b/.test(lc) &&
     /\b(contact|customer|supplier|buyer|vendor|client)\b/.test(lc) &&
     !/\b(invoice|bill|payment|sale|sold|bought)\b/.test(lc);
+  const isCreateItemIntent =
+    /\b(add|create|new|register)\b/.test(lc) &&
+    /\b(item|product|sku|stone|gem|stock\s*item)\b/.test(lc) &&
+    !/\b(sold|bought|paid|invoice|bill|sale)\b/.test(lc);
   // Confirm/cancel replies while a confirmation card is on screen — the LLM
   // has been re-calling request_confirmation instead of save_transaction
   // here, so force the right tool.
@@ -1783,6 +2141,8 @@ async function handle(user, userMessage) {
           toolChoice = { type: 'function', function: { name: 'create_wallet' } };
         } else if (isCreateCounterpartyIntent) {
           toolChoice = { type: 'function', function: { name: 'create_counterparty' } };
+        } else if (isCreateItemIntent) {
+          toolChoice = { type: 'function', function: { name: 'create_item' } };
         }
       }
 
@@ -1886,7 +2246,7 @@ async function handle(user, userMessage) {
   // when the user message was clearly a create/save intent AND zero
   // success-bearing tools ran.)
   const succeeded = ctx.toolsSucceeded;
-  const writeTools = ['save_transaction', 'create_counterparty', 'create_wallet'];
+  const writeTools = ['save_transaction', 'create_counterparty', 'create_wallet', 'create_item'];
   const writeSucceeded = writeTools.some((t) => succeeded.has(t));
   const claimsSuccess = /\b(added|created|saved|posted|booked|done)\b/i.test(finalText);
   if (claimsSuccess && !writeSucceeded && !ctx.confirmationRequested && !ctx.saved) {
